@@ -543,19 +543,19 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let hooks = Arc::new(WalIoHooks::new());
         hooks.hold_admission();
+        let first = batch("tenant-a", b"one");
+        let second = batch("tenant-a", b"two");
+        let third = batch("tenant-a", b"three");
+        let expected_queued = cost(&first) + cost(&second) + cost(&third);
         let mut config = test_config(dir.path());
+        config.group_commit_bytes = expected_queued;
         config.group_commit_deadline = Duration::from_secs(60);
-        config.group_commit_bytes = 1024 * 1024;
         let wal = AsyncWal::open_with_hooks(config, Arc::clone(&hooks)).expect("open");
 
         timeout(TEST_TIMEOUT, hooks.admission_started().notified())
             .await
             .expect("writer did not pause");
 
-        let first = batch("tenant-a", b"one");
-        let second = batch("tenant-a", b"two");
-        let third = batch("tenant-a", b"three");
-        let expected_queued = cost(&first) + cost(&second) + cost(&third);
         let tasks: Vec<_> = [first, second, third]
             .into_iter()
             .map(|item| {
@@ -569,7 +569,13 @@ mod tests {
 
         let mut receipts = Vec::new();
         for task in tasks {
-            receipts.push(task.await.expect("join").expect("submit"));
+            receipts.push(
+                timeout(TEST_TIMEOUT, task)
+                    .await
+                    .expect("group did not commit on the byte limit")
+                    .expect("join")
+                    .expect("submit"),
+            );
         }
         assert_eq!(hooks.sync_count(), 1);
         receipts.sort_by_key(|receipt| receipt.sequence);
