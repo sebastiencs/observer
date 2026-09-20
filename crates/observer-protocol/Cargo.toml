@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+opentelemetry-proto.workspace = true
 
 [lints]
 workspace = true

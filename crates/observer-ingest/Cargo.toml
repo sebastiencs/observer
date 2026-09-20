@@ -6,8 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+bytes.workspace = true
 observer-protocol = { path = "../observer-protocol" }
 observer-wal = { path = "../observer-wal" }
+prost.workspace = true
+tonic.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+tokio-stream = { workspace = true, features = ["net"] }
 
 [lints]
 workspace = true
