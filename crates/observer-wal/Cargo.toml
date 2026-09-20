@@ -5,13 +5,20 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+test-util = []
+
 [dependencies]
 bytes.workspace = true
 crc32c.workspace = true
 observer-protocol = { path = "../observer-protocol" }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tonic.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [lints]
 workspace = true

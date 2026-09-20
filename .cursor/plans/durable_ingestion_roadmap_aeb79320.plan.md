@@ -22,7 +22,7 @@ todos:
     status: completed
   - id: async-wal
     content: Add byte-bounded async admission and group commit, then integrate it with OTLP logs.
-    status: pending
+    status: completed
   - id: runtime-surface
     content: Add OTLP/HTTP, tenant authentication, and observerd lifecycle after durable ingestion works.
     status: pending

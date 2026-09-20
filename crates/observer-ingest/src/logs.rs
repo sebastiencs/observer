@@ -10,7 +10,7 @@ use observer_protocol::otlp::{
 use prost::Message;
 use tonic::{Request, Response, Status};
 
-use observer_protocol::{AcceptedBatch, IngestSink, Signal};
+use observer_protocol::{AcceptedBatch, AppendErrorKind, IngestSink, Signal};
 
 /// OTLP/gRPC logs ingestion service.
 #[derive(Debug)]
@@ -64,7 +64,12 @@ where
         self.sink
             .append(batch)
             .await
-            .map_err(|error| Status::unavailable(error.to_string()))?;
+            .map_err(|error| match error.kind() {
+                AppendErrorKind::InvalidArgument => Status::invalid_argument(error.to_string()),
+                AppendErrorKind::ResourceExhausted => Status::resource_exhausted(error.to_string()),
+                AppendErrorKind::Unavailable => Status::unavailable(error.to_string()),
+                AppendErrorKind::Internal => Status::internal(error.to_string()),
+            })?;
 
         Ok(Response::new(ExportLogsServiceResponse {
             partial_success: None,

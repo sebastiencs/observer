@@ -13,6 +13,8 @@ prost.workspace = true
 tonic.workspace = true
 
 [dev-dependencies]
+observer-wal = { path = "../observer-wal", features = ["test-util"] }
+tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-stream = { workspace = true, features = ["net"] }
 

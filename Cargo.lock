@@ -425,6 +425,7 @@ dependencies = [
  "observer-protocol",
  "observer-wal",
  "prost",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -447,6 +448,8 @@ dependencies = [
  "crc32c",
  "observer-protocol",
  "tempfile",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]

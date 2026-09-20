@@ -3,4 +3,4 @@
 mod logs;
 
 pub use logs::LogsIngestService;
-pub use observer_protocol::{AcceptedBatch, AppendError, IngestSink, Signal};
+pub use observer_protocol::{AcceptedBatch, AppendError, AppendErrorKind, IngestSink, Signal};

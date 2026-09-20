@@ -2,7 +2,7 @@ use crate::WalError;
 
 pub(crate) const SEGMENT_MAGIC: &[u8; 8] = b"OBS-WAL1";
 pub(crate) const SEGMENT_FORMAT_VERSION: u16 = 1;
-pub(crate) const SEGMENT_HEADER_SIZE: usize = 44;
+pub const SEGMENT_HEADER_SIZE: usize = 44;
 pub(crate) const LANE_ID: u32 = 0;
 pub(crate) const LANE_DIR_NAME: &str = "lane-0000";
 

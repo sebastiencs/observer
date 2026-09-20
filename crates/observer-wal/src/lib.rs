@@ -1,14 +1,20 @@
 //! Durable, local write-ahead log primitives.
 
+mod async_wal;
 mod codec;
 mod error;
 mod frame;
+#[cfg(any(test, feature = "test-util"))]
+mod io_hooks;
 mod recovery;
 mod segment;
 mod wal;
 
-pub use codec::{decode, encode};
+pub use async_wal::{AsyncWal, WalWriterConfig};
+pub use codec::{decode, encode, encoded_frame_size};
 pub use error::{FrameError, WalError};
 pub use frame::{FORMAT_VERSION, Frame, FrameSignal, MAX_PAYLOAD_LEN, MAX_TENANT_LEN};
-pub use segment::SegmentHeader;
+#[cfg(any(test, feature = "test-util"))]
+pub use io_hooks::WalIoHooks;
+pub use segment::{SEGMENT_HEADER_SIZE, SegmentHeader};
 pub use wal::{Receipt, Wal, WalConfig};

@@ -71,6 +71,8 @@ pub struct Wal {
     sync_fault: Option<io::ErrorKind>,
     #[cfg(test)]
     rotate_fault: Option<RotateFault>,
+    #[cfg(any(test, feature = "test-util"))]
+    io_hooks: Option<std::sync::Arc<crate::io_hooks::WalIoHooks>>,
 }
 
 impl Wal {
@@ -154,6 +156,8 @@ impl Wal {
             sync_fault: None,
             #[cfg(test)]
             rotate_fault: None,
+            #[cfg(any(test, feature = "test-util"))]
+            io_hooks: None,
         })
     }
 
@@ -173,6 +177,40 @@ impl Wal {
     }
 
     pub fn append(&mut self, batch: AcceptedBatch) -> Result<Receipt, WalError> {
+        let receipt = self.write(batch)?;
+        self.sync_data()?;
+        Ok(receipt)
+    }
+
+    /// Write every batch, then `sync_data` once. No receipt is returned unless
+    /// the group sync succeeds.
+    pub fn append_group<I>(&mut self, batches: I) -> Result<Vec<Receipt>, WalError>
+    where
+        I: IntoIterator<Item = AcceptedBatch>,
+    {
+        let mut receipts = Vec::new();
+        for batch in batches {
+            receipts.push(self.write(batch)?);
+        }
+        if !receipts.is_empty() {
+            self.sync_data()?;
+        }
+        Ok(receipts)
+    }
+
+    pub fn sync(&mut self) -> Result<(), WalError> {
+        if self.failed {
+            return Err(WalError::Failed);
+        }
+        self.sync_data()
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) fn set_io_hooks(&mut self, hooks: std::sync::Arc<crate::io_hooks::WalIoHooks>) {
+        self.io_hooks = Some(hooks);
+    }
+
+    fn write(&mut self, batch: AcceptedBatch) -> Result<Receipt, WalError> {
         if self.failed {
             return Err(WalError::Failed);
         }
@@ -198,7 +236,6 @@ impl Wal {
 
         let offset = self.next_offset;
         self.write_complete(&encoded)?;
-        self.sync_data()?;
 
         self.next_sequence = self
             .next_sequence
@@ -214,13 +251,6 @@ impl Wal {
             segment_id: self.header.segment_id,
             offset,
         })
-    }
-
-    pub fn sync(&mut self) -> Result<(), WalError> {
-        if self.failed {
-            return Err(WalError::Failed);
-        }
-        self.sync_data()
     }
 
     fn write_complete(&mut self, buf: &[u8]) -> Result<(), WalError> {
@@ -256,6 +286,13 @@ impl Wal {
     }
 
     fn sync_data(&mut self) -> Result<(), WalError> {
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(hooks) = &self.io_hooks
+            && let Err(error) = hooks.on_sync()
+        {
+            self.failed = true;
+            return Err(error);
+        }
         #[cfg(test)]
         if let Some(kind) = self.sync_fault.take() {
             self.failed = true;
@@ -554,6 +591,30 @@ mod tests {
         assert_eq!(
             crate::segment::decode_header(&on_disk).expect("header"),
             *wal.header()
+        );
+    }
+
+    #[test]
+    fn append_group_writes_all_frames_then_syncs_once() {
+        let (_dir, config) = temp_config();
+        let hooks = std::sync::Arc::new(crate::WalIoHooks::new());
+        let mut wal = Wal::open(config).expect("open");
+        wal.set_io_hooks(std::sync::Arc::clone(&hooks));
+
+        let receipts = wal
+            .append_group([batch("tenant-a", b"one"), batch("tenant-a", b"two")])
+            .expect("group");
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0].sequence, 0);
+        assert_eq!(receipts[1].sequence, 1);
+        assert_eq!(hooks.sync_count(), 1);
+        assert_eq!(
+            frame_at(wal.path(), receipts[0].offset).payload.as_ref(),
+            b"one"
+        );
+        assert_eq!(
+            frame_at(wal.path(), receipts[1].offset).payload.as_ref(),
+            b"two"
         );
     }
 

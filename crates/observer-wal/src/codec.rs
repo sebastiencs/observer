@@ -50,6 +50,11 @@ fn frame_len(total_length: u32) -> Result<usize, FrameError> {
         .ok_or(FrameError::InvalidLength)
 }
 
+/// Encoded size of a frame with the given tenant and payload lengths.
+pub fn encoded_frame_size(tenant_len: usize, payload_len: usize) -> Result<usize, FrameError> {
+    frame_len(expected_total_length(tenant_len, payload_len)?)
+}
+
 /// Encode `frame` as a complete checksummed WAL record.
 pub fn encode(frame: &Frame) -> Result<Vec<u8>, FrameError> {
     let tenant = frame.tenant_id.as_bytes();
@@ -239,6 +244,16 @@ mod tests {
         let payload_end = buf.len() - CRC_SIZE;
         let crc = crc32c::crc32c(&buf[LENGTH_SIZE..payload_end]);
         buf[payload_end..].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    #[test]
+    fn encoded_frame_size_matches_encode() {
+        let frame = sample_frame();
+        let encoded = encode(&frame).expect("encode");
+        assert_eq!(
+            encoded_frame_size(frame.tenant_id.len(), frame.payload.len()).expect("size"),
+            encoded.len()
+        );
     }
 
     #[test]
