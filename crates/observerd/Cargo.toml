@@ -6,7 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+axum.workspace = true
 observer-ingest = { path = "../observer-ingest" }
+observer-wal = { path = "../observer-wal" }
+serde.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+tokio-stream = { workspace = true, features = ["net"] }
+toml.workspace = true
+tonic.workspace = true
 
 [lints]
 workspace = true

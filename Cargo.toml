@@ -20,7 +20,9 @@ crc32c = "0.6"
 opentelemetry-proto = { version = "0.33.0", default-features = false, features = ["gen-tonic", "logs"] }
 prost = "0.14.4"
 reqwest = { version = "0.12", default-features = false }
+serde = { version = "1", features = ["derive"] }
 tokio = "1.53.1"
+toml = "0.8"
 tokio-stream = "0.1"
 tonic = "0.14.6"
 

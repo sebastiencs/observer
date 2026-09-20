@@ -218,6 +218,12 @@ impl AsyncWal {
             .max_queued_bytes
             .saturating_sub(self.shared.permits.available_permits())
     }
+
+    /// True after a write, sync, or writer-task failure.
+    #[must_use]
+    pub fn is_failed(&self) -> bool {
+        self.shared.failed.load(Ordering::SeqCst)
+    }
 }
 
 #[tonic::async_trait]
@@ -596,6 +602,7 @@ mod tests {
         let mut config = test_config(dir.path());
         config.max_queued_bytes = 1024;
         let wal = AsyncWal::open_with_hooks(config, Arc::clone(&hooks)).expect("open");
+        assert!(!wal.is_failed());
         assert_eq!(wal.queued_bytes(), 0);
 
         wal.submit(batch("tenant-a", b"one"))
@@ -621,6 +628,7 @@ mod tests {
             .await
             .expect_err("sync fail");
         assert_eq!(error.kind(), AppendErrorKind::Unavailable);
+        assert!(wal.is_failed());
         assert_eq!(wal.queued_bytes(), 0);
     }
 
