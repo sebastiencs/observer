@@ -1,4 +1,4 @@
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, io};
 
 /// Errors produced while encoding or decoding a WAL frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,3 +70,90 @@ impl fmt::Display for FrameError {
 }
 
 impl Error for FrameError {}
+
+/// Errors from WAL directory, segment, and append operations.
+#[derive(Debug)]
+pub enum WalError {
+    /// A previous write or sync failed; the WAL must be reopened.
+    Failed,
+    Frame(FrameError),
+    Io(io::Error),
+    ShortWrite {
+        written: usize,
+        expected: usize,
+    },
+    EntryTooLarge {
+        size: usize,
+        max: usize,
+    },
+    IncompleteSegment,
+    InvalidSegmentHeader(&'static str),
+    UnsupportedSegmentVersion {
+        version: u16,
+    },
+    UnexpectedLane {
+        lane_id: u32,
+    },
+    InvalidConfig(&'static str),
+}
+
+#[cfg(test)]
+impl WalError {
+    pub(crate) fn io(kind: io::ErrorKind, message: impl Into<String>) -> Self {
+        Self::Io(io::Error::new(kind, message.into()))
+    }
+}
+
+impl fmt::Display for WalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Failed => formatter.write_str("WAL is in a failed state and must be reopened"),
+            Self::Frame(error) => write!(formatter, "{error}"),
+            Self::Io(error) => write!(formatter, "WAL I/O error: {error}"),
+            Self::ShortWrite { written, expected } => {
+                write!(
+                    formatter,
+                    "short WAL write: wrote {written} of {expected} bytes"
+                )
+            }
+            Self::EntryTooLarge { size, max } => {
+                write!(formatter, "WAL entry is too large ({size} > {max} bytes)")
+            }
+            Self::IncompleteSegment => {
+                formatter.write_str("WAL segment ends with an incomplete frame")
+            }
+            Self::InvalidSegmentHeader(reason) => {
+                write!(formatter, "invalid WAL segment header: {reason}")
+            }
+            Self::UnsupportedSegmentVersion { version } => {
+                write!(formatter, "unsupported WAL segment version {version}")
+            }
+            Self::UnexpectedLane { lane_id } => {
+                write!(formatter, "unexpected WAL lane id {lane_id}")
+            }
+            Self::InvalidConfig(reason) => write!(formatter, "invalid WAL config: {reason}"),
+        }
+    }
+}
+
+impl Error for WalError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Frame(error) => Some(error),
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<FrameError> for WalError {
+    fn from(error: FrameError) -> Self {
+        Self::Frame(error)
+    }
+}
+
+impl From<io::Error> for WalError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}

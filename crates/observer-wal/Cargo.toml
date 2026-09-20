@@ -8,6 +8,10 @@ license.workspace = true
 [dependencies]
 bytes.workspace = true
 crc32c.workspace = true
+observer-protocol = { path = "../observer-protocol" }
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true
