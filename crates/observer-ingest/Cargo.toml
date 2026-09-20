@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+axum.workspace = true
 bytes.workspace = true
 observer-protocol = { path = "../observer-protocol" }
 observer-wal = { path = "../observer-wal" }
@@ -14,8 +15,9 @@ tonic.workspace = true
 
 [dev-dependencies]
 observer-wal = { path = "../observer-wal", features = ["test-util"] }
+reqwest.workspace = true
 tempfile = "3"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-stream = { workspace = true, features = ["net"] }
 
 [lints]
