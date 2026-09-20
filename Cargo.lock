@@ -386,7 +386,9 @@ dependencies = [
 name = "observer-protocol"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "opentelemetry-proto",
+ "tonic",
 ]
 
 [[package]]

@@ -10,7 +10,7 @@ use observer_protocol::otlp::{
 use prost::Message;
 use tonic::{Request, Response, Status};
 
-use crate::{AcceptedBatch, IngestSink, Signal};
+use observer_protocol::{AcceptedBatch, IngestSink, Signal};
 
 /// OTLP/gRPC logs ingestion service.
 #[derive(Debug)]
