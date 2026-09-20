@@ -1285,4 +1285,54 @@ mod tests {
         assert_eq!(next.sequence, 1);
         assert_eq!(next.segment_id, 1);
     }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(24))]
+
+        #[test]
+        fn append_then_reopen_recovers_every_batch(
+            batches in proptest::collection::vec(
+                (
+                    "\\PC{1,16}",
+                    proptest::collection::vec(proptest::prelude::any::<u8>(), 0..48),
+                    proptest::prelude::any::<u64>(),
+                ),
+                1..6,
+            )
+        ) {
+            let (_dir, config) = temp_config();
+            let mut wal = Wal::open(config.clone()).expect("open");
+            let mut receipts = Vec::new();
+            for (tenant, payload, received_at) in &batches {
+                receipts.push(
+                    wal.append(AcceptedBatch {
+                        tenant_id: tenant.clone(),
+                        signal: Signal::Logs,
+                        received_at_unix_nanos: *received_at,
+                        payload: Bytes::copy_from_slice(payload),
+                    })
+                    .expect("append"),
+                );
+            }
+            let path = wal.path().to_owned();
+            drop(wal);
+
+            for (index, ((tenant, payload, received_at), receipt)) in
+                batches.iter().zip(&receipts).enumerate()
+            {
+                proptest::prop_assert_eq!(receipt.sequence, index as u64);
+                let frame = frame_at(&path, receipt.offset);
+                proptest::prop_assert_eq!(frame.sequence, index as u64);
+                proptest::prop_assert_eq!(&frame.tenant_id, tenant);
+                proptest::prop_assert_eq!(frame.received_at_unix_nanos, *received_at);
+                proptest::prop_assert_eq!(frame.payload.as_ref(), payload.as_slice());
+            }
+
+            let mut wal = Wal::open(config).expect("reopen");
+            let next = wal
+                .append(batch("reopen-probe", b"next"))
+                .expect("append after reopen");
+            proptest::prop_assert_eq!(next.sequence, batches.len() as u64);
+        }
+    }
 }

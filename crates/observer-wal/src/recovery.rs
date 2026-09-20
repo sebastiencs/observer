@@ -374,3 +374,125 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use crate::{
+        Frame, FrameSignal, encode,
+        segment::{LANE_ID, SegmentHeader, encode_header},
+    };
+    use bytes::Bytes;
+    use proptest::prelude::*;
+
+    fn frame_body() -> impl Strategy<Value = Frame> {
+        (
+            prop::collection::vec(any::<u8>(), 0..24),
+            "\\PC{0,16}",
+            any::<u64>(),
+        )
+            .prop_map(|(payload, tenant_id, received_at_unix_nanos)| Frame {
+                sequence: 0,
+                signal: FrameSignal::Logs,
+                received_at_unix_nanos,
+                tenant_id,
+                payload: Bytes::from(payload),
+            })
+    }
+
+    fn frames_strategy() -> impl Strategy<Value = Vec<Frame>> {
+        (0_u64..1024, prop::collection::vec(frame_body(), 1..5)).prop_map(|(first, mut frames)| {
+            for (index, frame) in frames.iter_mut().enumerate() {
+                frame.sequence = first + index as u64;
+            }
+            frames
+        })
+    }
+
+    fn header_and(frames: &[Frame]) -> Vec<u8> {
+        let first_sequence = frames.first().map(|frame| frame.sequence).unwrap_or(0);
+        let mut bytes = encode_header(&SegmentHeader {
+            lane_id: LANE_ID,
+            segment_id: 0,
+            first_sequence,
+            created_at_unix_nanos: 1,
+        })
+        .to_vec();
+        for frame in frames {
+            bytes.extend_from_slice(&encode(frame).expect("encode"));
+        }
+        bytes
+    }
+
+    proptest! {
+        #[test]
+        fn clean_scan_recovers_every_frame(frames in frames_strategy()) {
+            let first = frames[0].sequence;
+            let bytes = header_and(&frames);
+            let recovered = scan_open_segment(&bytes, first).expect("scan");
+            prop_assert!(!recovered.truncated);
+            prop_assert_eq!(recovered.next_sequence, first + frames.len() as u64);
+            prop_assert_eq!(
+                recovered.valid_end,
+                u64::try_from(bytes.len()).expect("len")
+            );
+            prop_assert_eq!(
+                scan_sealed_segment(&bytes, first).expect("sealed"),
+                recovered
+            );
+        }
+
+        #[test]
+        fn torn_open_tail_truncates_to_last_complete_frame(
+            frames in frames_strategy(),
+            drop in 1_usize..=32,
+        ) {
+            let first = frames[0].sequence;
+            let complete = header_and(&frames);
+            let last_len = encode(frames.last().expect("frame")).expect("encode").len();
+            let drop = drop.min(last_len);
+            let mut bytes = complete.clone();
+            bytes.truncate(bytes.len() - drop);
+            let recovered = scan_open_segment(&bytes, first).expect("open torn tail");
+            prop_assert!(recovered.truncated);
+            prop_assert_eq!(
+                recovered.next_sequence,
+                first + (frames.len() as u64).saturating_sub(1)
+            );
+            prop_assert_eq!(
+                recovered.valid_end,
+                u64::try_from(complete.len() - last_len).expect("len")
+            );
+            prop_assert!(matches!(
+                scan_sealed_segment(&bytes, first),
+                Err(WalError::IncompleteSegment)
+            ));
+        }
+
+        #[test]
+        fn parse_round_trips_generated_segment_names(id in any::<u64>(), open in any::<bool>()) {
+            let name = if open {
+                format!("{id:020}.open")
+            } else {
+                format!("{id:020}.wal")
+            };
+            let kind = if open {
+                SegmentKind::Open
+            } else {
+                SegmentKind::Sealed
+            };
+            prop_assert_eq!(parse_segment_name(&name), Some((id, kind)));
+        }
+
+        #[test]
+        fn parse_rejects_names_that_are_not_segment_files(name in "\\PC{0,40}") {
+            if let Some((id, kind)) = parse_segment_name(&name) {
+                let expected = match kind {
+                    SegmentKind::Open => format!("{id:020}.open"),
+                    SegmentKind::Sealed => format!("{id:020}.wal"),
+                };
+                prop_assert_eq!(name, expected);
+            }
+        }
+    }
+}

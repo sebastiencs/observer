@@ -137,3 +137,53 @@ admin = "127.0.0.1:8080"
         assert!(rendered.contains("tenant-a"));
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+    use std::net::SocketAddrV4;
+
+    fn token() -> impl Strategy<Value = String> {
+        "tok-[A-Za-z0-9._~-]{1,12}"
+    }
+
+    fn tenant() -> impl Strategy<Value = String> {
+        "ten-[A-Za-z0-9-]{1,12}"
+    }
+
+    proptest! {
+        #[test]
+        fn parse_round_trips_generated_toml(
+            suffix in "[A-Za-z0-9]{1,12}",
+            grpc in any::<SocketAddrV4>(),
+            http in any::<SocketAddrV4>(),
+            admin in any::<SocketAddrV4>(),
+            tokens in prop::collection::hash_map(token(), tenant(), 1..6),
+        ) {
+            let mut body = format!(
+                "wal_directory = \"/tmp/observer-{suffix}\"\n\n[listen]\ngrpc = \"{grpc}\"\nhttp = \"{http}\"\nadmin = \"{admin}\"\n\n[tokens]\n"
+            );
+            for (token, tenant) in &tokens {
+                body.push_str(&format!("\"{token}\" = \"{tenant}\"\n"));
+            }
+
+            let config = Config::parse(&body).expect("parse");
+            prop_assert_eq!(
+                config.wal_directory,
+                PathBuf::from(format!("/tmp/observer-{suffix}"))
+            );
+            prop_assert_eq!(config.listen.grpc, SocketAddr::V4(grpc));
+            prop_assert_eq!(config.listen.http, SocketAddr::V4(http));
+            prop_assert_eq!(config.listen.admin, SocketAddr::V4(admin));
+            for (token, tenant) in &tokens {
+                let header = format!("Bearer {token}");
+                let resolved = config
+                    .tokens
+                    .authenticate(Some(&header))
+                    .expect("bound token");
+                prop_assert_eq!(resolved, tenant.as_str());
+            }
+        }
+    }
+}

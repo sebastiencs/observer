@@ -15,6 +15,7 @@ tonic.workspace = true
 
 [dev-dependencies]
 observer-wal = { path = "../observer-wal", features = ["test-util"] }
+proptest.workspace = true
 reqwest.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }

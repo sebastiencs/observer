@@ -118,3 +118,53 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn header_round_trip(
+            segment_id in any::<u64>(),
+            first_sequence in any::<u64>(),
+            created_at_unix_nanos in any::<u64>(),
+        ) {
+            let header = SegmentHeader {
+                lane_id: LANE_ID,
+                segment_id,
+                first_sequence,
+                created_at_unix_nanos,
+            };
+            let encoded = encode_header(&header);
+            prop_assert_eq!(encoded.len(), SEGMENT_HEADER_SIZE);
+            prop_assert_eq!(decode_header(&encoded).expect("decode"), header);
+        }
+
+        #[test]
+        fn decode_header_never_panics(data in prop::collection::vec(any::<u8>(), 0..80)) {
+            let _ = decode_header(&data);
+        }
+
+        #[test]
+        fn flipping_any_header_byte_is_rejected(
+            segment_id in any::<u64>(),
+            first_sequence in any::<u64>(),
+            created_at_unix_nanos in any::<u64>(),
+            index in any::<prop::sample::Index>(),
+            xor in 1_u8..=255,
+        ) {
+            let header = SegmentHeader {
+                lane_id: LANE_ID,
+                segment_id,
+                first_sequence,
+                created_at_unix_nanos,
+            };
+            let mut encoded = encode_header(&header);
+            let i = index.index(encoded.len());
+            encoded[i] ^= xor;
+            prop_assert!(decode_header(&encoded).is_err());
+        }
+    }
+}

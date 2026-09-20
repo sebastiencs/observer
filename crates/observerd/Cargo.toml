@@ -15,5 +15,8 @@ tokio-stream = { workspace = true, features = ["net"] }
 toml.workspace = true
 tonic.workspace = true
 
+[dev-dependencies]
+proptest.workspace = true
+
 [lints]
 workspace = true

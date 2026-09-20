@@ -564,3 +564,117 @@ mod tests {
         assert_eq!(&with_trailing[consumed..], &[0xde, 0xad]);
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn signal_strategy() -> impl Strategy<Value = FrameSignal> {
+        prop_oneof![
+            Just(FrameSignal::Logs),
+            Just(FrameSignal::Traces),
+            Just(FrameSignal::Metrics),
+        ]
+    }
+
+    fn frame_strategy() -> impl Strategy<Value = Frame> {
+        (
+            any::<u64>(),
+            signal_strategy(),
+            any::<u64>(),
+            "\\PC{0,64}",
+            prop::collection::vec(any::<u8>(), 0..64),
+        )
+            .prop_map(
+                |(sequence, signal, received_at_unix_nanos, tenant_id, payload)| Frame {
+                    sequence,
+                    signal,
+                    received_at_unix_nanos,
+                    tenant_id,
+                    payload: Bytes::from(payload),
+                },
+            )
+    }
+
+    proptest! {
+        #[test]
+        fn encode_decode_round_trip(frame in frame_strategy()) {
+            let encoded = encode(&frame).expect("encode");
+            prop_assert_eq!(
+                encoded_frame_size(frame.tenant_id.len(), frame.payload.len()).ok(),
+                Some(encoded.len())
+            );
+            let (decoded, consumed) = decode(&encoded).expect("decode");
+            prop_assert_eq!(consumed, encoded.len());
+            prop_assert_eq!(decoded, frame);
+        }
+
+        #[test]
+        fn prefixes_of_a_valid_frame_are_incomplete(
+            frame in frame_strategy(),
+            cut in any::<prop::sample::Index>(),
+        ) {
+            let encoded = encode(&frame).expect("encode");
+            let len = cut.index(encoded.len());
+            prop_assert_eq!(decode(&encoded[..len]), Err(FrameError::Incomplete));
+        }
+
+        #[test]
+        fn trailing_bytes_are_not_consumed(
+            frame in frame_strategy(),
+            trailing in prop::collection::vec(any::<u8>(), 0..16),
+        ) {
+            let encoded = encode(&frame).expect("encode");
+            let mut with_trailing = encoded.clone();
+            with_trailing.extend_from_slice(&trailing);
+            let (decoded, consumed) = decode(&with_trailing).expect("decode");
+            prop_assert_eq!(decoded, frame);
+            prop_assert_eq!(consumed, encoded.len());
+            prop_assert_eq!(&with_trailing[consumed..], trailing.as_slice());
+        }
+
+        #[test]
+        fn concatenated_frames_decode_in_order(frames in prop::collection::vec(frame_strategy(), 1..5)) {
+            let mut bytes = Vec::new();
+            let mut lengths = Vec::new();
+            for frame in &frames {
+                let encoded = encode(frame).expect("encode");
+                lengths.push(encoded.len());
+                bytes.extend_from_slice(&encoded);
+            }
+
+            let mut offset = 0;
+            for (frame, length) in frames.iter().zip(lengths) {
+                let (decoded, consumed) = decode(&bytes[offset..]).expect("decode");
+                prop_assert_eq!(&decoded, frame);
+                prop_assert_eq!(consumed, length);
+                offset += consumed;
+            }
+            prop_assert_eq!(offset, bytes.len());
+        }
+
+        #[test]
+        fn flipping_any_byte_rejects_the_frame(
+            frame in frame_strategy(),
+            index in any::<prop::sample::Index>(),
+            xor in 1_u8..=255,
+        ) {
+            let mut encoded = encode(&frame).expect("encode");
+            let i = index.index(encoded.len());
+            encoded[i] ^= xor;
+            prop_assert!(decode(&encoded).is_err());
+        }
+
+        #[test]
+        fn decode_never_panics_and_success_reencodes(
+            data in prop::collection::vec(any::<u8>(), 0..128),
+        ) {
+            if let Ok((frame, consumed)) = decode(&data) {
+                prop_assert!(consumed <= data.len());
+                let encoded = encode(&frame).expect("re-encode accepted frame");
+                prop_assert_eq!(encoded.as_slice(), &data[..consumed]);
+            }
+        }
+    }
+}

@@ -188,3 +188,81 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn token() -> impl Strategy<Value = String> {
+        "tok-[A-Za-z0-9._~-]{1,20}"
+    }
+
+    fn tenant() -> impl Strategy<Value = String> {
+        "ten-[A-Za-z0-9-]{1,20}"
+    }
+
+    fn bindings() -> impl Strategy<Value = Vec<(String, String)>> {
+        prop::collection::hash_map(token(), tenant(), 1..8)
+            .prop_map(|map| map.into_iter().collect())
+    }
+
+    proptest! {
+        #[test]
+        fn authenticates_every_bound_token(bindings in bindings(), bearer in prop_oneof![
+            Just("Bearer"),
+            Just("bearer"),
+            Just("BEARER"),
+        ]) {
+            let tokens = TokenDirectory::new(bindings.clone()).expect("directory");
+            for (token, tenant) in &bindings {
+                let header = format!("{bearer} {token}");
+                let resolved = tokens.authenticate(Some(&header)).expect("bound token");
+                prop_assert_eq!(resolved, tenant.as_str());
+            }
+        }
+
+        #[test]
+        fn unknown_or_malformed_headers_are_unauthenticated(
+            bindings in bindings(),
+            unknown in token(),
+        ) {
+            prop_assume!(bindings.iter().all(|(token, _)| token != &unknown));
+            let tokens = TokenDirectory::new(bindings).expect("directory");
+            prop_assert_eq!(tokens.authenticate(None), Err(AuthError::Unauthenticated));
+            prop_assert_eq!(
+                tokens.authenticate(Some(&unknown)),
+                Err(AuthError::Unauthenticated)
+            );
+            prop_assert_eq!(
+                tokens.authenticate(Some(&format!("Basic {unknown}"))),
+                Err(AuthError::Unauthenticated)
+            );
+            prop_assert_eq!(
+                tokens.authenticate(Some(&format!("Bearer {unknown}"))),
+                Err(AuthError::Unauthenticated)
+            );
+            prop_assert_eq!(
+                tokens.authenticate(Some(&format!("Bearer {unknown} extra"))),
+                Err(AuthError::Unauthenticated)
+            );
+        }
+
+        #[test]
+        fn errors_and_debug_omit_tokens(bindings in bindings()) {
+            let tokens = TokenDirectory::new(bindings.clone()).expect("directory");
+            let rendered = format!(
+                "{} {:?}",
+                tokens
+                    .authenticate(Some("Bearer missing-token"))
+                    .expect_err("unknown"),
+                tokens
+            );
+            for (token, tenant) in &bindings {
+                prop_assert!(!rendered.contains(token));
+                prop_assert!(rendered.contains(tenant));
+            }
+            prop_assert!(!rendered.contains("missing-token"));
+        }
+    }
+}
