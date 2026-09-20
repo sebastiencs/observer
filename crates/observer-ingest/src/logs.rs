@@ -6,22 +6,22 @@ use observer_protocol::{
 };
 use tonic::{Request, Response, Status};
 
-use crate::accept::{IngestLogsError, ingest_logs};
+use crate::{
+    accept::{IngestLogsError, ingest_logs},
+    auth::{AuthError, TokenDirectory},
+};
 
 /// OTLP/gRPC logs ingestion service.
 #[derive(Debug)]
 pub struct LogsIngestService<S> {
     sink: Arc<S>,
-    tenant_id: String,
+    tokens: TokenDirectory,
 }
 
 impl<S> LogsIngestService<S> {
     #[must_use]
-    pub fn new(sink: Arc<S>, tenant_id: impl Into<String>) -> Self {
-        Self {
-            sink,
-            tenant_id: tenant_id.into(),
-        }
+    pub fn new(sink: Arc<S>, tokens: TokenDirectory) -> Self {
+        Self { sink, tokens }
     }
 }
 
@@ -44,11 +44,23 @@ where
         &self,
         request: Request<ExportLogsServiceRequest>,
     ) -> Result<Response<ExportLogsServiceResponse>, Status> {
-        ingest_logs(&*self.sink, self.tenant_id.clone(), request.into_inner())
+        let authorization = request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        let tenant_id = self
+            .tokens
+            .authenticate(authorization)
+            .map_err(status_from_auth)?;
+        ingest_logs(&*self.sink, tenant_id, request.into_inner())
             .await
             .map(Response::new)
             .map_err(status_from_ingest)
     }
+}
+
+fn status_from_auth(error: AuthError) -> Status {
+    Status::unauthenticated(error.to_string())
 }
 
 fn status_from_ingest(error: IngestLogsError) -> Status {

@@ -6,7 +6,7 @@ use axum::{
     extract::{DefaultBodyLimit, State},
     http::{
         HeaderMap, StatusCode,
-        header::{CONTENT_TYPE, HeaderValue},
+        header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue},
     },
     response::{IntoResponse, Response},
     routing::post,
@@ -14,14 +14,17 @@ use axum::{
 use observer_protocol::{AppendErrorKind, IngestSink, otlp::ExportLogsServiceRequest};
 use prost::Message;
 
-use crate::accept::{IngestLogsError, ingest_logs};
+use crate::{
+    accept::{IngestLogsError, ingest_logs},
+    auth::{AuthError, TokenDirectory},
+};
 
 const PROTOBUF_CONTENT_TYPE: &str = "application/x-protobuf";
 
 /// OTLP/HTTP logs ingestion service (`POST /v1/logs`).
 pub struct LogsHttpService<S> {
     sink: Arc<S>,
-    tenant_id: String,
+    tokens: TokenDirectory,
     max_body_bytes: usize,
 }
 
@@ -29,7 +32,7 @@ impl<S> Clone for LogsHttpService<S> {
     fn clone(&self) -> Self {
         Self {
             sink: Arc::clone(&self.sink),
-            tenant_id: self.tenant_id.clone(),
+            tokens: self.tokens.clone(),
             max_body_bytes: self.max_body_bytes,
         }
     }
@@ -39,7 +42,7 @@ impl<S> fmt::Debug for LogsHttpService<S> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("LogsHttpService")
-            .field("tenant_id", &self.tenant_id)
+            .field("tokens", &self.tokens)
             .field("max_body_bytes", &self.max_body_bytes)
             .finish_non_exhaustive()
     }
@@ -50,10 +53,10 @@ where
     S: IngestSink,
 {
     #[must_use]
-    pub fn new(sink: Arc<S>, tenant_id: impl Into<String>, max_body_bytes: usize) -> Self {
+    pub fn new(sink: Arc<S>, tokens: TokenDirectory, max_body_bytes: usize) -> Self {
         Self {
             sink,
-            tenant_id: tenant_id.into(),
+            tokens,
             max_body_bytes,
         }
     }
@@ -75,6 +78,14 @@ async fn export_logs<S>(
 where
     S: IngestSink,
 {
+    let authorization = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    let tenant_id = service
+        .tokens
+        .authenticate(authorization)
+        .map_err(HttpIngestError::from)?;
+
     if !is_protobuf_content_type(&headers) {
         return Err(HttpIngestError::UnsupportedMediaType);
     }
@@ -82,7 +93,7 @@ where
     let request =
         ExportLogsServiceRequest::decode(body).map_err(|_| HttpIngestError::InvalidProtobuf)?;
 
-    let response = ingest_logs(&*service.sink, service.tenant_id.clone(), request)
+    let response = ingest_logs(&*service.sink, tenant_id, request)
         .await
         .map_err(HttpIngestError::from)?;
 
@@ -116,10 +127,19 @@ impl IntoResponse for ProtobufBody {
 }
 
 enum HttpIngestError {
+    Unauthenticated,
     UnsupportedMediaType,
     InvalidProtobuf,
     Clock(&'static str),
     Append(observer_protocol::AppendError),
+}
+
+impl From<AuthError> for HttpIngestError {
+    fn from(error: AuthError) -> Self {
+        match error {
+            AuthError::Unauthenticated => Self::Unauthenticated,
+        }
+    }
 }
 
 impl From<IngestLogsError> for HttpIngestError {
@@ -134,6 +154,10 @@ impl From<IngestLogsError> for HttpIngestError {
 impl IntoResponse for HttpIngestError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
+            Self::Unauthenticated => (
+                StatusCode::UNAUTHORIZED,
+                AuthError::Unauthenticated.to_string(),
+            ),
             Self::UnsupportedMediaType => (
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "unsupported content type".to_owned(),

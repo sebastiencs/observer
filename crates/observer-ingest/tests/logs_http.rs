@@ -9,6 +9,7 @@ use std::{
 
 use observer_ingest::{
     AcceptedBatch, AppendError, IngestSink, LogsHttpService, LogsIngestService, Signal,
+    TokenDirectory,
 };
 use observer_protocol::otlp::{
     ExportLogsServiceRequest, ExportLogsServiceResponse, LogsServiceClient,
@@ -26,6 +27,12 @@ use tonic::transport::Server;
 
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+const BEARER: &str = "Bearer secret-a";
+const SECRET: &str = "secret-a";
+
+fn test_tokens() -> TokenDirectory {
+    TokenDirectory::new([(SECRET, "tenant-a")]).expect("tokens")
+}
 
 #[derive(Debug, Default)]
 struct RecordingSink {
@@ -94,7 +101,7 @@ where
         .expect("bind test listener");
     let address = listener.local_addr().expect("read listener address");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let router = LogsHttpService::new(sink, "tenant-a", max_body_bytes).into_router();
+    let router = LogsHttpService::new(sink, test_tokens(), max_body_bytes).into_router();
     let task = tokio::spawn(async move {
         axum::serve(listener, router)
             .with_graceful_shutdown(async {
@@ -120,7 +127,7 @@ where
         .expect("bind test listener");
     let address = listener.local_addr().expect("read listener address");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let service = LogsIngestService::new(sink, "tenant-a").into_server(MAX_MESSAGE_SIZE);
+    let service = LogsIngestService::new(sink, test_tokens()).into_server(MAX_MESSAGE_SIZE);
     let task = tokio::spawn(async move {
         Server::builder()
             .add_service(service)
@@ -145,13 +152,23 @@ fn empty_logs_request() -> ExportLogsServiceRequest {
 }
 
 async fn post_logs(address: SocketAddr, content_type: &str, body: Vec<u8>) -> reqwest::Response {
-    reqwest::Client::new()
+    post_logs_with_auth(address, Some(BEARER), content_type, body).await
+}
+
+async fn post_logs_with_auth(
+    address: SocketAddr,
+    authorization: Option<&str>,
+    content_type: &str,
+    body: Vec<u8>,
+) -> reqwest::Response {
+    let mut request = reqwest::Client::new()
         .post(format!("http://{address}/v1/logs"))
         .header(reqwest::header::CONTENT_TYPE, content_type)
-        .body(body)
-        .send()
-        .await
-        .expect("post logs")
+        .body(body);
+    if let Some(authorization) = authorization {
+        request = request.header(reqwest::header::AUTHORIZATION, authorization);
+    }
+    request.send().await.expect("post logs")
 }
 
 #[tokio::test]
@@ -214,7 +231,12 @@ async fn http_and_grpc_store_equivalent_payload_bytes() {
     let mut client = LogsServiceClient::connect(format!("http://{}", grpc.address))
         .await
         .expect("connect logs client");
-    client.export(request.clone()).await.expect("export logs");
+    let mut export = tonic::Request::new(request.clone());
+    export.metadata_mut().insert(
+        "authorization",
+        BEARER.parse().expect("authorization metadata"),
+    );
+    client.export(export).await.expect("export logs");
 
     {
         let batches = sink.batches.lock().expect("sink lock poisoned");
@@ -322,6 +344,31 @@ async fn waits_for_sink_before_acknowledging() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(sink.append_calls.load(Ordering::SeqCst), 1);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn missing_malformed_and_unknown_tokens_are_rejected_before_the_sink() {
+    let sink = Arc::new(RecordingSink::default());
+    let server = spawn_http(Arc::clone(&sink), MAX_MESSAGE_SIZE).await;
+    let body = empty_logs_request().encode_to_vec();
+
+    for authorization in [None, Some("Basic secret-a"), Some("Bearer unknown")] {
+        let response = post_logs_with_auth(
+            server.address,
+            authorization,
+            "application/x-protobuf",
+            body.clone(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let text = response.text().await.expect("body");
+        assert_eq!(text, "unauthenticated");
+        assert!(!text.contains(SECRET));
+        assert!(!text.contains("unknown"));
+    }
+    assert_eq!(sink.append_calls.load(Ordering::SeqCst), 0);
 
     server.shutdown().await;
 }

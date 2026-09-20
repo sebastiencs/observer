@@ -1,6 +1,6 @@
 use std::{fs, net::SocketAddr, sync::Arc, time::Duration};
 
-use observer_ingest::{IngestSink, LogsIngestService};
+use observer_ingest::{IngestSink, LogsIngestService, TokenDirectory};
 use observer_protocol::otlp::{ExportLogsServiceRequest, LogsServiceClient};
 use observer_wal::{
     AsyncWal, SEGMENT_HEADER_SIZE, WalIoHooks, WalWriterConfig, decode, encoded_frame_size,
@@ -8,10 +8,15 @@ use observer_wal::{
 use prost::Message;
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle, time::timeout};
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::{Code, transport::Server};
+use tonic::{Code, Request, transport::Server};
 
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+const BEARER: &str = "Bearer secret-a";
+
+fn test_tokens() -> TokenDirectory {
+    TokenDirectory::new([("secret-a", "tenant-a")]).expect("tokens")
+}
 
 struct TestServer {
     address: SocketAddr,
@@ -35,7 +40,7 @@ where
         .expect("bind test listener");
     let address = listener.local_addr().expect("read listener address");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let service = LogsIngestService::new(sink, "tenant-a").into_server(MAX_MESSAGE_SIZE);
+    let service = LogsIngestService::new(sink, test_tokens()).into_server(MAX_MESSAGE_SIZE);
     let task = tokio::spawn(async move {
         Server::builder()
             .add_service(service)
@@ -65,6 +70,15 @@ async fn connect(address: SocketAddr) -> LogsServiceClient<tonic::transport::Cha
         .expect("connect logs client")
 }
 
+fn authorized(body: ExportLogsServiceRequest) -> Request<ExportLogsServiceRequest> {
+    let mut request = Request::new(body);
+    request.metadata_mut().insert(
+        "authorization",
+        BEARER.parse().expect("authorization metadata"),
+    );
+    request
+}
+
 async fn wait_until(mut predicate: impl FnMut() -> bool) {
     timeout(TEST_TIMEOUT, async {
         while !predicate() {
@@ -84,7 +98,7 @@ async fn accepts_an_otlp_logs_request_against_a_real_wal() {
     let request = empty_logs_request();
 
     let response = client
-        .export(request.clone())
+        .export(authorized(request.clone()))
         .await
         .expect("export logs")
         .into_inner();
@@ -115,7 +129,7 @@ async fn does_not_acknowledge_when_wal_sync_fails() {
     let mut client = connect(server.address).await;
 
     let error = client
-        .export(empty_logs_request())
+        .export(authorized(empty_logs_request()))
         .await
         .expect_err("wal failure must fail export");
 
@@ -138,7 +152,7 @@ async fn waits_for_wal_sync_before_acknowledging() {
     let server = spawn_server(Arc::clone(&wal)).await;
     let mut client = connect(server.address).await;
 
-    let export = tokio::spawn(async move { client.export(empty_logs_request()).await });
+    let export = tokio::spawn(async move { client.export(authorized(empty_logs_request())).await });
 
     timeout(TEST_TIMEOUT, hooks.sync_started().notified())
         .await
@@ -180,13 +194,13 @@ async fn saturating_wal_admission_returns_resource_exhausted() {
     let first_address = server.address;
     let first = tokio::spawn(async move {
         let mut client = connect(first_address).await;
-        client.export(empty_logs_request()).await
+        client.export(authorized(empty_logs_request())).await
     });
     wait_until(|| wal.queued_bytes() > 0).await;
 
     let mut client = connect(server.address).await;
     let error = client
-        .export(empty_logs_request())
+        .export(authorized(empty_logs_request()))
         .await
         .expect_err("saturated admission");
     assert_eq!(error.code(), Code::ResourceExhausted);
