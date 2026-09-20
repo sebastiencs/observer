@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+bytes.workspace = true
+crc32c.workspace = true
 
 [lints]
 workspace = true
