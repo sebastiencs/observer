@@ -16,7 +16,14 @@ toml.workspace = true
 tonic.workspace = true
 
 [dev-dependencies]
+nix = { version = "0.30", default-features = false, features = ["signal"] }
+observer-protocol = { path = "../observer-protocol" }
+observer-wal = { path = "../observer-wal" }
 proptest.workspace = true
+prost.workspace = true
+reqwest.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread", "time"] }
 
 [lints]
 workspace = true
