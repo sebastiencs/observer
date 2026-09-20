@@ -19,7 +19,7 @@ pub struct WalIoHooks {
     hold_admission: AtomicBool,
     admission_waiting: AtomicBool,
     admission_started: Notify,
-    admission_release: Notify,
+    admission_release: (Mutex<bool>, Condvar),
 }
 
 impl Default for WalIoHooks {
@@ -41,7 +41,7 @@ impl WalIoHooks {
             hold_admission: AtomicBool::new(false),
             admission_waiting: AtomicBool::new(false),
             admission_started: Notify::new(),
-            admission_release: Notify::new(),
+            admission_release: (Mutex::new(false), Condvar::new()),
         }
     }
 
@@ -83,6 +83,11 @@ impl WalIoHooks {
     }
 
     pub fn hold_admission(&self) {
+        *self
+            .admission_release
+            .0
+            .lock()
+            .expect("admission release lock poisoned") = false;
         self.hold_admission.store(true, Ordering::SeqCst);
     }
 
@@ -96,7 +101,13 @@ impl WalIoHooks {
     }
 
     pub fn release_admission(&self) {
-        self.admission_release.notify_one();
+        let mut released = self
+            .admission_release
+            .0
+            .lock()
+            .expect("admission release lock poisoned");
+        *released = true;
+        self.admission_release.1.notify_all();
     }
 
     pub(crate) fn on_sync(&self) -> Result<(), WalError> {
@@ -124,11 +135,22 @@ impl WalIoHooks {
         Ok(())
     }
 
-    pub(crate) async fn wait_admission_if_held(&self) {
+    pub(crate) fn wait_admission_if_held(&self) {
         if self.hold_admission.swap(false, Ordering::SeqCst) {
             self.admission_waiting.store(true, Ordering::SeqCst);
             self.admission_started.notify_one();
-            self.admission_release.notified().await;
+            let mut released = self
+                .admission_release
+                .0
+                .lock()
+                .expect("admission release lock poisoned");
+            while !*released {
+                released = self
+                    .admission_release
+                    .1
+                    .wait(released)
+                    .expect("admission release condvar poisoned");
+            }
             self.admission_waiting.store(false, Ordering::SeqCst);
         }
     }

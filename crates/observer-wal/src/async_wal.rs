@@ -2,16 +2,14 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
     },
-    time::Duration,
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use observer_protocol::{AcceptedBatch, AppendError, IngestSink};
-use tokio::sync::{
-    Semaphore,
-    mpsc::{self, UnboundedReceiver, error::TryRecvError},
-    oneshot,
-};
+use tokio::sync::{Semaphore, oneshot};
 
 use crate::{
     FrameError, MAX_PAYLOAD_LEN, MAX_TENANT_LEN, Receipt, Wal, WalConfig, WalError,
@@ -61,12 +59,13 @@ struct Submission {
 }
 
 struct Shared {
-    tx: Mutex<Option<mpsc::UnboundedSender<Submission>>>,
+    tx: Mutex<Option<mpsc::Sender<Submission>>>,
     permits: Arc<Semaphore>,
     max_queued_bytes: usize,
     max_entry_bytes: usize,
     failed: Arc<AtomicBool>,
     done: Mutex<Option<oneshot::Receiver<Result<(), WalError>>>>,
+    join: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// Cloneable handle that admits batches and waits for durable acknowledgement.
@@ -76,14 +75,14 @@ pub struct AsyncWal {
 }
 
 impl AsyncWal {
-    /// Recover the WAL and start the writer. Must run inside a Tokio runtime.
+    /// Recover the WAL and start the dedicated writer thread.
     pub fn open(config: WalWriterConfig) -> Result<Self, WalError> {
         validate_writer_config(&config)?;
         let wal = Wal::open(config.wal.clone())?;
         #[cfg(any(test, feature = "test-util"))]
-        let started = Self::start(wal, &config, None);
+        let started = Self::start(wal, &config, None)?;
         #[cfg(not(any(test, feature = "test-util")))]
-        let started = Self::start(wal, &config);
+        let started = Self::start(wal, &config)?;
         Ok(started)
     }
 
@@ -95,35 +94,36 @@ impl AsyncWal {
         validate_writer_config(&config)?;
         let mut wal = Wal::open(config.wal.clone())?;
         wal.set_io_hooks(Arc::clone(&hooks));
-        Ok(Self::start(wal, &config, Some(hooks)))
+        Self::start(wal, &config, Some(hooks))
     }
 
     fn start(
         wal: Wal,
         config: &WalWriterConfig,
         #[cfg(any(test, feature = "test-util"))] hooks: Option<Arc<WalIoHooks>>,
-    ) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+    ) -> Result<Self, WalError> {
+        let (tx, rx) = mpsc::channel();
         let (done_tx, done_rx) = oneshot::channel();
         let failed = Arc::new(AtomicBool::new(false));
         let writer_failed = Arc::clone(&failed);
         let group_commit_bytes = config.group_commit_bytes;
         let group_commit_deadline = config.group_commit_deadline;
-        tokio::spawn(async move {
-            let result = writer_loop(
-                wal,
-                rx,
-                group_commit_bytes,
-                group_commit_deadline,
-                writer_failed,
-                #[cfg(any(test, feature = "test-util"))]
-                hooks,
-            )
-            .await;
-            let _ = done_tx.send(result);
-        });
+        let join = thread::Builder::new()
+            .name("observer-wal".to_owned())
+            .spawn(move || {
+                let result = writer_loop(
+                    wal,
+                    rx,
+                    group_commit_bytes,
+                    group_commit_deadline,
+                    writer_failed,
+                    #[cfg(any(test, feature = "test-util"))]
+                    hooks,
+                );
+                let _ = done_tx.send(result);
+            })?;
 
-        Self {
+        Ok(Self {
             shared: Arc::new(Shared {
                 tx: Mutex::new(Some(tx)),
                 permits: Arc::new(Semaphore::new(config.max_queued_bytes)),
@@ -131,8 +131,9 @@ impl AsyncWal {
                 max_entry_bytes: config.wal.max_entry_bytes,
                 failed,
                 done: Mutex::new(Some(done_rx)),
+                join: Mutex::new(Some(join)),
             }),
-        }
+        })
     }
 
     /// Admit `batch` and wait until it is fsynced (or the writer fails).
@@ -191,14 +192,23 @@ impl AsyncWal {
             .lock()
             .expect("WAL shutdown lock poisoned")
             .take();
+        let join = self
+            .shared
+            .join
+            .lock()
+            .expect("WAL join lock poisoned")
+            .take();
         let Some(done) = done else {
+            if let Some(join) = join {
+                let _ = join.join();
+            }
             return if self.shared.failed.load(Ordering::SeqCst) {
                 Err(WalError::Failed)
             } else {
                 Ok(())
             };
         };
-        match done.await {
+        let result = match done.await {
             Ok(result) => {
                 if result.is_err() {
                     self.shared.failed.store(true, Ordering::SeqCst);
@@ -209,7 +219,14 @@ impl AsyncWal {
                 self.shared.failed.store(true, Ordering::SeqCst);
                 Err(WalError::Failed)
             }
+        };
+        if let Some(join) = join
+            && join.join().is_err()
+        {
+            self.shared.failed.store(true, Ordering::SeqCst);
+            return Err(WalError::Failed);
         }
+        result
     }
 
     #[must_use]
@@ -298,8 +315,8 @@ enum CollectReason {
     Shutdown,
 }
 
-async fn collect_group(
-    rx: &mut UnboundedReceiver<Submission>,
+fn collect_group(
+    rx: &Receiver<Submission>,
     group: &mut Vec<Submission>,
     group_commit_bytes: usize,
     deadline: Duration,
@@ -309,45 +326,45 @@ async fn collect_group(
         return CollectReason::ByteLimit;
     }
 
-    while bytes < group_commit_bytes {
+    loop {
         match rx.try_recv() {
             Ok(item) => {
                 bytes += item.cost;
                 group.push(item);
+                if bytes >= group_commit_bytes {
+                    return CollectReason::ByteLimit;
+                }
             }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => return CollectReason::Shutdown,
         }
     }
-    if bytes >= group_commit_bytes {
-        return CollectReason::ByteLimit;
-    }
 
-    let sleep = tokio::time::sleep(deadline);
-    tokio::pin!(sleep);
+    let deadline_at = Instant::now() + deadline;
     loop {
-        tokio::select! {
-            biased;
-            next = rx.recv() => {
-                match next {
-                    Some(item) => {
-                        bytes += item.cost;
-                        group.push(item);
-                        if bytes >= group_commit_bytes {
-                            return CollectReason::ByteLimit;
-                        }
-                    }
-                    None => return CollectReason::Shutdown,
+        let Some(remaining) = deadline_at.checked_duration_since(Instant::now()) else {
+            return CollectReason::Deadline;
+        };
+        if remaining.is_zero() {
+            return CollectReason::Deadline;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(item) => {
+                bytes += item.cost;
+                group.push(item);
+                if bytes >= group_commit_bytes {
+                    return CollectReason::ByteLimit;
                 }
             }
-            _ = &mut sleep => return CollectReason::Deadline,
+            Err(RecvTimeoutError::Timeout) => return CollectReason::Deadline,
+            Err(RecvTimeoutError::Disconnected) => return CollectReason::Shutdown,
         }
     }
 }
 
-async fn writer_loop(
+fn writer_loop(
     mut wal: Wal,
-    mut rx: UnboundedReceiver<Submission>,
+    rx: Receiver<Submission>,
     group_commit_bytes: usize,
     group_commit_deadline: Duration,
     failed: Arc<AtomicBool>,
@@ -356,50 +373,39 @@ async fn writer_loop(
     loop {
         #[cfg(any(test, feature = "test-util"))]
         if let Some(hooks) = &hooks {
-            hooks.wait_admission_if_held().await;
+            hooks.wait_admission_if_held();
         }
 
-        let Some(first) = rx.recv().await else {
-            return Ok(());
+        let first = match rx.recv() {
+            Ok(item) => item,
+            Err(_) => return Ok(()),
         };
         let mut group = vec![first];
-        let reason = collect_group(
-            &mut rx,
-            &mut group,
-            group_commit_bytes,
-            group_commit_deadline,
-        )
-        .await;
+        let reason = collect_group(&rx, &mut group, group_commit_bytes, group_commit_deadline);
 
-        let batches: Vec<AcceptedBatch> = group.iter().map(|item| item.batch.clone()).collect();
-        let commit = tokio::task::spawn_blocking(move || {
-            let result = wal.append_group(batches);
-            (wal, result)
-        })
-        .await;
+        let mut batches = Vec::with_capacity(group.len());
+        let mut replies = Vec::with_capacity(group.len());
+        let mut permits = Vec::with_capacity(group.len());
+        for item in group {
+            batches.push(item.batch);
+            replies.push(item.reply);
+            permits.push(item._permit);
+        }
 
-        match commit {
-            Ok((next_wal, Ok(receipts))) => {
-                wal = next_wal;
-                for (item, receipt) in group.into_iter().zip(receipts) {
-                    let _ = item.reply.send(Ok(receipt));
+        match wal.append_group(batches) {
+            Ok(receipts) => {
+                drop(permits);
+                for (reply, receipt) in replies.into_iter().zip(receipts) {
+                    let _ = reply.send(Ok(receipt));
                 }
             }
-            Ok((next_wal, Err(error))) => {
-                let _ = next_wal;
+            Err(error) => {
+                drop(permits);
                 failed.store(true, Ordering::SeqCst);
                 let append_error = append_error_from_wal(&error);
-                reject_group(group, &append_error);
-                reject_queued(&mut rx, &append_error);
+                reject_replies(replies, &append_error);
+                reject_queued(&rx, &append_error);
                 return Err(error);
-            }
-            Err(join_error) => {
-                failed.store(true, Ordering::SeqCst);
-                let append_error =
-                    AppendError::internal(format!("WAL writer task failed: {join_error}"));
-                reject_group(group, &append_error);
-                reject_queued(&mut rx, &append_error);
-                return Err(WalError::Failed);
             }
         }
 
@@ -409,13 +415,16 @@ async fn writer_loop(
     }
 }
 
-fn reject_group(group: Vec<Submission>, error: &AppendError) {
-    for item in group {
-        let _ = item.reply.send(Err(error.clone()));
+fn reject_replies(
+    replies: Vec<oneshot::Sender<Result<Receipt, AppendError>>>,
+    error: &AppendError,
+) {
+    for reply in replies {
+        let _ = reply.send(Err(error.clone()));
     }
 }
 
-fn reject_queued(rx: &mut UnboundedReceiver<Submission>, error: &AppendError) {
+fn reject_queued(rx: &Receiver<Submission>, error: &AppendError) {
     while let Ok(item) = rx.try_recv() {
         let _ = item.reply.send(Err(error.clone()));
     }
