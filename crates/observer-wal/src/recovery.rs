@@ -97,12 +97,12 @@ fn validate_discovered(found: &[FoundSegment]) -> Result<(), WalError> {
     if open_count > 1 {
         return Err(WalError::Corrupt("multiple active segments"));
     }
-    if !found.is_empty()
-        && !found
-            .iter()
-            .any(|segment| segment.kind == SegmentKind::Open)
+    if open_count == 1
+        && found
+            .last()
+            .is_some_and(|segment| segment.kind != SegmentKind::Open)
     {
-        return Err(WalError::Corrupt("missing active segment"));
+        return Err(WalError::Corrupt("active segment is not last"));
     }
     Ok(())
 }
@@ -247,6 +247,38 @@ mod tests {
             tenant_id: "tenant-a".to_owned(),
             payload: Bytes::from_static(b"payload"),
         }
+    }
+
+    #[test]
+    fn discover_allows_sealed_only_after_interrupted_rotation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("00000000000000000000.wal"), []).expect("write");
+        let found = discover_segments(dir.path()).expect("discover");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].kind, SegmentKind::Sealed);
+        assert_eq!(found[0].id, 0);
+    }
+
+    #[test]
+    fn discover_rejects_multiple_open_segments() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("00000000000000000000.open"), []).expect("write");
+        fs::write(dir.path().join("00000000000000000001.open"), []).expect("write");
+        assert!(matches!(
+            discover_segments(dir.path()),
+            Err(WalError::Corrupt("multiple active segments"))
+        ));
+    }
+
+    #[test]
+    fn discover_rejects_open_before_sealed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("00000000000000000000.open"), []).expect("write");
+        fs::write(dir.path().join("00000000000000000001.wal"), []).expect("write");
+        assert!(matches!(
+            discover_segments(dir.path()),
+            Err(WalError::Corrupt("active segment is not last"))
+        ));
     }
 
     #[test]

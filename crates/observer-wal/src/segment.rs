@@ -76,9 +76,19 @@ pub(crate) fn segment_file_name(segment_id: u64) -> String {
     format!("{segment_id:020}.open")
 }
 
+pub(crate) fn sealed_segment_file_name(segment_id: u64) -> String {
+    format!("{segment_id:020}.wal")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_encode_segment_id_and_kind() {
+        assert_eq!(segment_file_name(0), "00000000000000000000.open");
+        assert_eq!(sealed_segment_file_name(3), "00000000000000000003.wal");
+    }
 
     #[test]
     fn header_round_trip() {

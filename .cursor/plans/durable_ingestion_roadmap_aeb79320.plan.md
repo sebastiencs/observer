@@ -4,22 +4,22 @@ overview: Protect the OTLP acknowledgement invariant first, then build a version
 todos:
   - id: ack-semantics
     content: Add failed and delayed sink integration tests proving OTLP success waits for append success.
-    status: pending
+    status: completed
   - id: shared-contract
     content: Move the sink contract and accepted-batch types to observer-protocol to preserve acyclic dependencies.
-    status: pending
+    status: completed
   - id: frame-codec
     content: Implement and exhaustively test the bounded, versioned, checksummed WAL frame codec.
-    status: pending
+    status: completed
   - id: durable-append
     content: Implement single-lane segment append that returns only after sync_data succeeds.
-    status: pending
+    status: completed
   - id: recovery
     content: Implement deterministic tail recovery and fatal handling for non-tail corruption.
-    status: pending
+    status: completed
   - id: rotation
     content: Implement crash-safe segment sealing, directory sync, and rotation recovery.
-    status: pending
+    status: completed
   - id: async-wal
     content: Add byte-bounded async admission and group commit, then integrate it with OTLP logs.
     status: pending

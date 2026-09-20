@@ -15,7 +15,10 @@ use crate::{
     recovery::{
         SegmentKind, discover_segments, lane_directory, scan_open_segment, scan_sealed_segment,
     },
-    segment::{LANE_ID, SEGMENT_HEADER_SIZE, SegmentHeader, encode_header, segment_file_name},
+    segment::{
+        LANE_ID, SEGMENT_HEADER_SIZE, SegmentHeader, encode_header, sealed_segment_file_name,
+        segment_file_name,
+    },
 };
 
 /// Configuration for a single-lane local WAL.
@@ -41,11 +44,23 @@ enum WriteFault {
     Short(usize),
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RotateFault {
+    SyncActive,
+    Rename,
+    SyncDirAfterRename,
+    CreateNext,
+    SyncNewHeader,
+    SyncDirAfterCreate,
+}
+
 /// Durable, synchronous, single-lane write-ahead log.
 pub struct Wal {
     config: WalConfig,
     file: File,
     path: PathBuf,
+    lane_dir: PathBuf,
     header: SegmentHeader,
     next_sequence: u64,
     next_offset: u64,
@@ -54,6 +69,8 @@ pub struct Wal {
     write_fault: Option<WriteFault>,
     #[cfg(test)]
     sync_fault: Option<io::ErrorKind>,
+    #[cfg(test)]
+    rotate_fault: Option<RotateFault>,
 }
 
 impl Wal {
@@ -70,15 +87,9 @@ impl Wal {
         let lane_dir = lane_directory(&config.directory);
         fs::create_dir_all(&lane_dir)?;
         let discovered = discover_segments(&lane_dir)?;
-        validate_sealed_segments(&discovered)?;
-
-        let (path, segment_id) = match discovered.last() {
-            Some(segment) if segment.kind == SegmentKind::Open => {
-                (segment.path.clone(), segment.id)
-            }
-            Some(_) => return Err(WalError::Corrupt("missing active segment")),
-            None => (lane_dir.join(segment_file_name(0)), 0),
-        };
+        let next_after_sealed = validate_sealed_segments(&discovered)?;
+        let (path, segment_id, expected_first_sequence) =
+            resolve_active_segment(&lane_dir, &discovered, next_after_sealed)?;
 
         let mut file = OpenOptions::new()
             .read(true)
@@ -92,16 +103,17 @@ impl Wal {
             let header = SegmentHeader {
                 lane_id: LANE_ID,
                 segment_id,
-                first_sequence: 0,
+                first_sequence: expected_first_sequence,
                 created_at_unix_nanos: unix_nanos()?,
             };
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
             file.write_all(&encode_header(&header))?;
             file.sync_data()?;
+            sync_directory(&lane_dir)?;
             (
                 header,
-                0,
+                expected_first_sequence,
                 u64::try_from(SEGMENT_HEADER_SIZE).expect("header size"),
             )
         } else {
@@ -113,6 +125,9 @@ impl Wal {
                 return Err(WalError::InvalidSegmentHeader(
                     "segment id does not match file",
                 ));
+            }
+            if header.first_sequence != expected_first_sequence {
+                return Err(WalError::Corrupt("sequence discontinuity"));
             }
             let recovered = scan_open_segment(&bytes, header.first_sequence)?;
             if recovered.truncated {
@@ -128,6 +143,7 @@ impl Wal {
             config,
             file,
             path,
+            lane_dir,
             header,
             next_sequence,
             next_offset,
@@ -136,6 +152,8 @@ impl Wal {
             write_fault: None,
             #[cfg(test)]
             sync_fault: None,
+            #[cfg(test)]
+            rotate_fault: None,
         })
     }
 
@@ -172,6 +190,10 @@ impl Wal {
                 size: encoded.len(),
                 max: self.config.max_entry_bytes,
             });
+        }
+
+        if self.needs_rotation(encoded.len())? {
+            self.rotate()?;
         }
 
         let offset = self.next_offset;
@@ -245,9 +267,145 @@ impl Wal {
         }
         Ok(())
     }
+
+    fn needs_rotation(&self, encoded_len: usize) -> Result<bool, WalError> {
+        let encoded_len = u64::try_from(encoded_len).map_err(|_| FrameError::InvalidLength)?;
+        let would_end = self
+            .next_offset
+            .checked_add(encoded_len)
+            .ok_or(WalError::InvalidSegmentHeader("offset overflow"))?;
+        if would_end <= self.config.target_segment_bytes {
+            return Ok(false);
+        }
+        let header_end = u64::try_from(SEGMENT_HEADER_SIZE).expect("header size");
+        Ok(self.next_offset > header_end)
+    }
+
+    fn rotate(&mut self) -> Result<(), WalError> {
+        #[cfg(test)]
+        self.inject_rotate_fault(RotateFault::SyncActive)?;
+        self.sync_data()?;
+
+        let sealed_path = self
+            .lane_dir
+            .join(sealed_segment_file_name(self.header.segment_id));
+        #[cfg(test)]
+        self.inject_rotate_fault(RotateFault::Rename)?;
+        if let Err(error) = fs::rename(&self.path, &sealed_path) {
+            self.failed = true;
+            return Err(error.into());
+        }
+
+        #[cfg(test)]
+        self.inject_rotate_fault(RotateFault::SyncDirAfterRename)?;
+        if let Err(error) = sync_directory(&self.lane_dir) {
+            self.failed = true;
+            return Err(error);
+        }
+
+        let next_id = match self.header.segment_id.checked_add(1) {
+            Some(id) => id,
+            None => {
+                self.failed = true;
+                return Err(WalError::InvalidSegmentHeader("segment id overflow"));
+            }
+        };
+        let next_path = self.lane_dir.join(segment_file_name(next_id));
+        let header = match unix_nanos() {
+            Ok(created_at_unix_nanos) => SegmentHeader {
+                lane_id: LANE_ID,
+                segment_id: next_id,
+                first_sequence: self.next_sequence,
+                created_at_unix_nanos,
+            },
+            Err(error) => {
+                self.failed = true;
+                return Err(error);
+            }
+        };
+
+        #[cfg(test)]
+        self.inject_rotate_fault(RotateFault::CreateNext)?;
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&next_path)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                self.failed = true;
+                return Err(error.into());
+            }
+        };
+
+        if let Err(error) = file.write_all(&encode_header(&header)) {
+            self.failed = true;
+            return Err(error.into());
+        }
+
+        #[cfg(test)]
+        self.inject_rotate_fault(RotateFault::SyncNewHeader)?;
+        if let Err(error) = file.sync_data() {
+            self.failed = true;
+            return Err(error.into());
+        }
+
+        #[cfg(test)]
+        self.inject_rotate_fault(RotateFault::SyncDirAfterCreate)?;
+        if let Err(error) = sync_directory(&self.lane_dir) {
+            self.failed = true;
+            return Err(error);
+        }
+
+        self.file = file;
+        self.path = next_path;
+        self.header = header;
+        self.next_offset = u64::try_from(SEGMENT_HEADER_SIZE).expect("header size");
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn inject_rotate_fault(&mut self, step: RotateFault) -> Result<(), WalError> {
+        if self.rotate_fault == Some(step) {
+            self.rotate_fault = None;
+            self.failed = true;
+            return Err(WalError::io(io::ErrorKind::Other, "injected rotate error"));
+        }
+        Ok(())
+    }
 }
 
-fn validate_sealed_segments(discovered: &[crate::recovery::FoundSegment]) -> Result<(), WalError> {
+fn resolve_active_segment(
+    lane_dir: &Path,
+    discovered: &[crate::recovery::FoundSegment],
+    next_after_sealed: Option<u64>,
+) -> Result<(PathBuf, u64, u64), WalError> {
+    match discovered.last() {
+        Some(segment) if segment.kind == SegmentKind::Open => Ok((
+            segment.path.clone(),
+            segment.id,
+            next_after_sealed.unwrap_or(0),
+        )),
+        Some(segment) => {
+            let next_id = segment
+                .id
+                .checked_add(1)
+                .ok_or(WalError::InvalidSegmentHeader("segment id overflow"))?;
+            Ok((
+                lane_dir.join(segment_file_name(next_id)),
+                next_id,
+                next_after_sealed.ok_or(WalError::Corrupt("missing sealed sequence"))?,
+            ))
+        }
+        None => Ok((lane_dir.join(segment_file_name(0)), 0, 0)),
+    }
+}
+
+fn validate_sealed_segments(
+    discovered: &[crate::recovery::FoundSegment],
+) -> Result<Option<u64>, WalError> {
+    let mut next_sequence = None;
     for segment in discovered {
         if segment.kind != SegmentKind::Sealed {
             continue;
@@ -259,8 +417,19 @@ fn validate_sealed_segments(discovered: &[crate::recovery::FoundSegment]) -> Res
                 "segment id does not match file",
             ));
         }
-        scan_sealed_segment(&bytes, header.first_sequence)?;
+        if let Some(expected) = next_sequence
+            && header.first_sequence != expected
+        {
+            return Err(WalError::Corrupt("sequence discontinuity"));
+        }
+        let recovered = scan_sealed_segment(&bytes, header.first_sequence)?;
+        next_sequence = Some(recovered.next_sequence);
     }
+    Ok(next_sequence)
+}
+
+fn sync_directory(path: &Path) -> Result<(), WalError> {
+    File::open(path)?.sync_all()?;
     Ok(())
 }
 
@@ -325,6 +494,47 @@ mod tests {
         fn fail_next_sync(&mut self, kind: io::ErrorKind) {
             self.sync_fault = Some(kind);
         }
+
+        fn fail_next_rotate(&mut self, step: RotateFault) {
+            self.rotate_fault = Some(step);
+        }
+    }
+
+    fn encoded_len(tenant: &str, payload: &[u8]) -> usize {
+        encode(&Frame {
+            sequence: 0,
+            signal: FrameSignal::Logs,
+            received_at_unix_nanos: 1,
+            tenant_id: tenant.to_owned(),
+            payload: Bytes::copy_from_slice(payload),
+        })
+        .expect("encode")
+        .len()
+    }
+
+    fn lane_names(config: &WalConfig) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(lane_directory(&config.directory))
+            .expect("read lane")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .into_string()
+                    .expect("utf8")
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn config_with_target(target_segment_bytes: u64) -> (tempfile::TempDir, WalConfig) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = WalConfig {
+            directory: dir.path().to_path_buf(),
+            max_entry_bytes: 1024 * 1024,
+            target_segment_bytes,
+        };
+        (dir, config)
     }
 
     #[test]
@@ -713,5 +923,305 @@ mod tests {
             fs::metadata(wal.path()).expect("meta").len(),
             u64::try_from(SEGMENT_HEADER_SIZE).unwrap()
         );
+    }
+
+    #[test]
+    fn rotates_immediately_before_threshold_crossing() {
+        let frame = u64::try_from(encoded_len("tenant-a", b"one")).unwrap();
+        let header = u64::try_from(SEGMENT_HEADER_SIZE).unwrap();
+        let (_dir, config) = config_with_target(header + frame + 1);
+        let mut wal = Wal::open(config.clone()).expect("open");
+
+        let first = wal.append(batch("tenant-a", b"one")).expect("first");
+        assert_eq!(first.segment_id, 0);
+        assert_eq!(
+            lane_names(&config),
+            vec!["00000000000000000000.open".to_owned()]
+        );
+
+        let second = wal.append(batch("tenant-a", b"two")).expect("second");
+        assert_eq!(second.sequence, 1);
+        assert_eq!(second.segment_id, 1);
+        assert_eq!(second.offset, header);
+        assert_eq!(
+            lane_names(&config),
+            vec![
+                "00000000000000000000.wal".to_owned(),
+                "00000000000000000001.open".to_owned()
+            ]
+        );
+
+        let sealed = config.directory.join("lane-0000/00000000000000000000.wal");
+        assert_eq!(recovered_frames(&sealed)[0].payload.as_ref(), b"one");
+        assert_eq!(frame_at(wal.path(), second.offset).payload.as_ref(), b"two");
+    }
+
+    #[test]
+    fn sequence_continues_across_rotated_segments() {
+        let frame = u64::try_from(encoded_len("tenant-a", b"one")).unwrap();
+        let header = u64::try_from(SEGMENT_HEADER_SIZE).unwrap();
+        let (_dir, config) = config_with_target(header + frame * 2);
+        let mut wal = Wal::open(config).expect("open");
+
+        let first = wal.append(batch("tenant-a", b"one")).expect("first");
+        let second = wal.append(batch("tenant-a", b"two")).expect("second");
+        let third = wal.append(batch("tenant-a", b"three")).expect("third");
+
+        assert_eq!(first.sequence, 0);
+        assert_eq!(second.sequence, 1);
+        assert_eq!(third.sequence, 2);
+        assert_eq!(first.segment_id, 0);
+        assert_eq!(second.segment_id, 0);
+        assert_eq!(third.segment_id, 1);
+        assert_eq!(wal.header().first_sequence, 2);
+    }
+
+    #[test]
+    fn reopen_preserves_sealed_and_active_segments() {
+        let frame = u64::try_from(encoded_len("tenant-a", b"one")).unwrap();
+        let header = u64::try_from(SEGMENT_HEADER_SIZE).unwrap();
+        let (_dir, config) = config_with_target(header + frame + 1);
+        {
+            let mut wal = Wal::open(config.clone()).expect("open");
+            wal.append(batch("tenant-a", b"one")).expect("first");
+            wal.append(batch("tenant-a", b"two")).expect("second");
+        }
+
+        let sealed = config.directory.join("lane-0000/00000000000000000000.wal");
+        let mut wal = Wal::open(config.clone()).expect("reopen");
+        assert_eq!(wal.header().segment_id, 1);
+        assert_eq!(wal.header().first_sequence, 1);
+        assert_eq!(recovered_frames(wal.path()).len(), 1);
+        assert_eq!(recovered_frames(&sealed)[0].payload.as_ref(), b"one");
+
+        let third = wal.append(batch("tenant-a", b"two")).expect("third");
+        assert_eq!(third.sequence, 2);
+        assert_eq!(third.segment_id, 2);
+        assert_eq!(recovered_frames(&sealed).len(), 1);
+        assert_eq!(recovered_frames(wal.path())[0].payload.as_ref(), b"two");
+        assert_eq!(
+            lane_names(&config),
+            vec![
+                "00000000000000000000.wal".to_owned(),
+                "00000000000000000001.wal".to_owned(),
+                "00000000000000000002.open".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_active_segment_is_recovered_after_rotation() {
+        let (_dir, config) = temp_config();
+        let sealed = {
+            let mut wal = Wal::open(config.clone()).expect("open");
+            wal.append(batch("tenant-a", b"one")).expect("append");
+            let path = wal.path().to_path_buf();
+            drop(wal);
+            let sealed = path.with_extension("wal");
+            fs::rename(&path, &sealed).expect("seal");
+            sealed
+        };
+
+        let header = encode_header(&SegmentHeader {
+            lane_id: LANE_ID,
+            segment_id: 1,
+            first_sequence: 1,
+            created_at_unix_nanos: 1,
+        });
+        write_segment(
+            &config.directory.join("lane-0000/00000000000000000001.open"),
+            &header,
+        );
+
+        let mut wal = Wal::open(config).expect("reopen empty");
+        assert_eq!(wal.header().segment_id, 1);
+        assert_eq!(wal.header().first_sequence, 1);
+        assert_eq!(recovered_frames(wal.path()).len(), 0);
+        let next = wal.append(batch("tenant-a", b"two")).expect("continue");
+        assert_eq!(next.sequence, 1);
+        assert_eq!(recovered_frames(&sealed).len(), 1);
+    }
+
+    #[test]
+    fn oversized_first_frame_may_exceed_target_without_rotating() {
+        let frame = u64::try_from(encoded_len("tenant-a", b"one")).unwrap();
+        let header = u64::try_from(SEGMENT_HEADER_SIZE).unwrap();
+        let (_dir, config) = config_with_target(header + 10);
+        let mut wal = Wal::open(config.clone()).expect("open");
+
+        let first = wal.append(batch("tenant-a", b"one")).expect("first");
+        assert_eq!(first.segment_id, 0);
+        assert!(fs::metadata(wal.path()).expect("meta").len() > config.target_segment_bytes);
+        assert_eq!(
+            lane_names(&config),
+            vec!["00000000000000000000.open".to_owned()]
+        );
+
+        let second = wal.append(batch("tenant-a", b"two")).expect("second");
+        assert_eq!(second.segment_id, 1);
+        assert_eq!(second.sequence, 1);
+        assert!(frame > 10);
+    }
+
+    #[test]
+    fn recovers_after_seal_before_next_segment_is_created() {
+        let (_dir, config) = temp_config();
+        let sealed = {
+            let mut wal = Wal::open(config.clone()).expect("open");
+            wal.append(batch("tenant-a", b"one")).expect("append");
+            let path = wal.path().to_path_buf();
+            drop(wal);
+            let sealed = path.with_extension("wal");
+            fs::rename(path, &sealed).expect("seal");
+            sealed
+        };
+
+        let mut wal = Wal::open(config.clone()).expect("recover");
+        assert_eq!(wal.header().segment_id, 1);
+        assert_eq!(wal.header().first_sequence, 1);
+        assert_eq!(
+            lane_names(&config),
+            vec![
+                "00000000000000000000.wal".to_owned(),
+                "00000000000000000001.open".to_owned()
+            ]
+        );
+        let next = wal.append(batch("tenant-a", b"two")).expect("continue");
+        assert_eq!(next.sequence, 1);
+        assert_eq!(recovered_frames(&sealed)[0].payload.as_ref(), b"one");
+        assert_eq!(recovered_frames(wal.path())[0].payload.as_ref(), b"two");
+    }
+
+    #[test]
+    fn recovers_torn_next_header_after_new_segment_create() {
+        let (_dir, config) = temp_config();
+        {
+            let mut wal = Wal::open(config.clone()).expect("open");
+            wal.append(batch("tenant-a", b"one")).expect("append");
+            let path = wal.path().to_path_buf();
+            drop(wal);
+            fs::rename(&path, path.with_extension("wal")).expect("seal");
+        }
+        write_segment(
+            &config.directory.join("lane-0000/00000000000000000001.open"),
+            &[0u8; 10],
+        );
+
+        let mut wal = Wal::open(config).expect("recover torn header");
+        assert_eq!(wal.header().segment_id, 1);
+        assert_eq!(wal.header().first_sequence, 1);
+        assert_eq!(recovered_frames(wal.path()).len(), 0);
+        let next = wal.append(batch("tenant-a", b"two")).expect("continue");
+        assert_eq!(next.sequence, 1);
+        assert_eq!(next.segment_id, 1);
+    }
+
+    #[test]
+    fn duplicate_open_segments_are_fatal() {
+        let (_dir, config) = temp_config();
+        let path = {
+            let wal = Wal::open(config.clone()).expect("open");
+            wal.path().to_path_buf()
+        };
+        fs::copy(&path, path.with_file_name("00000000000000000001.open")).expect("duplicate open");
+        assert!(matches!(
+            Wal::open(config),
+            Err(WalError::Corrupt("multiple active segments"))
+        ));
+    }
+
+    #[test]
+    fn sealed_sequence_discontinuity_is_fatal() {
+        let (_dir, config) = temp_config();
+        {
+            let mut wal = Wal::open(config.clone()).expect("open");
+            wal.append(batch("tenant-a", b"one")).expect("append");
+            let path = wal.path().to_path_buf();
+            drop(wal);
+            fs::rename(&path, path.with_extension("wal")).expect("seal");
+        }
+        let mut second = encode_header(&SegmentHeader {
+            lane_id: LANE_ID,
+            segment_id: 1,
+            first_sequence: 99,
+            created_at_unix_nanos: 1,
+        })
+        .to_vec();
+        second.extend_from_slice(
+            &encode(&Frame {
+                sequence: 99,
+                signal: FrameSignal::Logs,
+                received_at_unix_nanos: 1,
+                tenant_id: "tenant-a".to_owned(),
+                payload: Bytes::from_static(b"two"),
+            })
+            .unwrap(),
+        );
+        write_segment(
+            &config.directory.join("lane-0000/00000000000000000001.wal"),
+            &second,
+        );
+
+        assert!(matches!(
+            Wal::open(config),
+            Err(WalError::Corrupt("sequence discontinuity"))
+        ));
+    }
+
+    #[test]
+    fn directory_failure_after_rename_fails_wal_and_recovers_on_reopen() {
+        let frame = u64::try_from(encoded_len("tenant-a", b"one")).unwrap();
+        let header = u64::try_from(SEGMENT_HEADER_SIZE).unwrap();
+        let (_dir, config) = config_with_target(header + frame + 1);
+        let mut wal = Wal::open(config.clone()).expect("open");
+        wal.append(batch("tenant-a", b"one")).expect("first");
+        wal.fail_next_rotate(RotateFault::SyncDirAfterRename);
+
+        let error = wal
+            .append(batch("tenant-a", b"two"))
+            .expect_err("rotate dir sync");
+        assert!(matches!(error, WalError::Io(_)));
+        assert!(matches!(
+            wal.append(batch("tenant-a", b"three")),
+            Err(WalError::Failed)
+        ));
+        drop(wal);
+
+        let mut wal = Wal::open(config.clone()).expect("reopen after rotate fault");
+        assert_eq!(
+            lane_names(&config),
+            vec![
+                "00000000000000000000.wal".to_owned(),
+                "00000000000000000001.open".to_owned()
+            ]
+        );
+        let next = wal.append(batch("tenant-a", b"two")).expect("retry");
+        assert_eq!(next.sequence, 1);
+        assert_eq!(next.segment_id, 1);
+    }
+
+    #[test]
+    fn directory_failure_creating_next_segment_fails_wal() {
+        let frame = u64::try_from(encoded_len("tenant-a", b"one")).unwrap();
+        let header = u64::try_from(SEGMENT_HEADER_SIZE).unwrap();
+        let (_dir, config) = config_with_target(header + frame + 1);
+        let mut wal = Wal::open(config.clone()).expect("open");
+        wal.append(batch("tenant-a", b"one")).expect("first");
+        wal.fail_next_rotate(RotateFault::CreateNext);
+
+        assert!(matches!(
+            wal.append(batch("tenant-a", b"two")),
+            Err(WalError::Io(_))
+        ));
+        assert!(matches!(
+            wal.append(batch("tenant-a", b"three")),
+            Err(WalError::Failed)
+        ));
+        drop(wal);
+
+        let mut wal = Wal::open(config).expect("reopen after create fault");
+        let next = wal.append(batch("tenant-a", b"two")).expect("retry");
+        assert_eq!(next.sequence, 1);
+        assert_eq!(next.segment_id, 1);
     }
 }
