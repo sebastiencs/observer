@@ -3,6 +3,7 @@
 mod codec;
 mod error;
 mod frame;
+mod recovery;
 mod segment;
 mod wal;
 

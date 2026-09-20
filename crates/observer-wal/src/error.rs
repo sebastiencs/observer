@@ -87,6 +87,8 @@ pub enum WalError {
         max: usize,
     },
     IncompleteSegment,
+    /// A complete frame or segment is corrupt before the physical tail.
+    Corrupt(&'static str),
     InvalidSegmentHeader(&'static str),
     UnsupportedSegmentVersion {
         version: u16,
@@ -122,6 +124,7 @@ impl fmt::Display for WalError {
             Self::IncompleteSegment => {
                 formatter.write_str("WAL segment ends with an incomplete frame")
             }
+            Self::Corrupt(reason) => write!(formatter, "WAL corruption: {reason}"),
             Self::InvalidSegmentHeader(reason) => {
                 write!(formatter, "invalid WAL segment header: {reason}")
             }
