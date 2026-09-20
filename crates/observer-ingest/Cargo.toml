@@ -1,0 +1,13 @@
+[package]
+name = "observer-ingest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+observer-protocol = { path = "../observer-protocol" }
+observer-wal = { path = "../observer-wal" }
+
+[lints]
+workspace = true
