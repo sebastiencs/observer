@@ -11,7 +11,9 @@ pub mod otlp {
         logs_service_client::LogsServiceClient,
         logs_service_server::{LogsService, LogsServiceServer},
     };
-    pub use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
-    pub use opentelemetry_proto::tonic::logs::v1::ResourceLogs;
+    pub use opentelemetry_proto::tonic::common::v1::{
+        AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList, any_value,
+    };
+    pub use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     pub use opentelemetry_proto::tonic::resource::v1::Resource;
 }

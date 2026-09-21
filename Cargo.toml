@@ -2,6 +2,7 @@
 members = [
     "crates/observer-ingest",
     "crates/observer-protocol",
+    "crates/observer-storage",
     "crates/observer-wal",
     "crates/observerd",
 ]
@@ -14,7 +15,10 @@ rust-version = "1.88"
 license = "AGPL-3.0-only"
 
 [workspace.dependencies]
+arrow-array = "60"
+arrow-schema = "60"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+base64 = "0.23"
 bytes = "1"
 crc32c = "0.6"
 opentelemetry-proto = { version = "0.33.0", default-features = false, features = ["gen-tonic", "logs"] }
@@ -22,6 +26,7 @@ proptest = "1"
 prost = "0.14.4"
 reqwest = { version = "0.12", default-features = false }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = "1.53.1"
 toml = "0.8"
 tokio-stream = "0.1"
