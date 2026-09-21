@@ -172,7 +172,7 @@ fn scan_frames(
     })
 }
 
-fn classify_scan_error(error: FrameError) -> WalError {
+pub(crate) fn classify_scan_error(error: FrameError) -> WalError {
     match error {
         FrameError::UnsupportedVersion { .. } => WalError::Corrupt("unsupported frame version"),
         FrameError::Incomplete => WalError::IncompleteSegment,
@@ -180,7 +180,7 @@ fn classify_scan_error(error: FrameError) -> WalError {
     }
 }
 
-fn is_torn_tail(bytes: &[u8], offset: usize, error: &FrameError) -> bool {
+pub(crate) fn is_torn_tail(bytes: &[u8], offset: usize, error: &FrameError) -> bool {
     match error {
         FrameError::Incomplete => true,
         FrameError::ChecksumMismatch => {
@@ -214,6 +214,42 @@ fn declared_frame_end(bytes: &[u8], offset: usize) -> Option<usize> {
         offset,
         u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]),
     )
+}
+
+/// Like [`is_torn_tail`], but `prefix` is only the bytes at `offset` and
+/// `file_len` is the physical end of the segment.
+pub(crate) fn is_torn_tail_at(
+    file_len: u64,
+    offset: u64,
+    prefix: &[u8],
+    error: &FrameError,
+) -> bool {
+    let prefix_end = match u64::try_from(prefix.len())
+        .ok()
+        .and_then(|len| offset.checked_add(len))
+    {
+        Some(end) => end,
+        None => return false,
+    };
+    match error {
+        FrameError::Incomplete => prefix_end == file_len,
+        FrameError::ChecksumMismatch => declared_frame_end(prefix, 0)
+            .and_then(|end| offset.checked_add(u64::try_from(end).ok()?))
+            .is_some_and(|end| end == file_len),
+        FrameError::LengthMismatch { declared, .. } => frame_end(0, *declared)
+            .and_then(|end| offset.checked_add(u64::try_from(end).ok()?))
+            .is_none_or(|end| end >= file_len),
+        FrameError::InvalidLength
+        | FrameError::TenantTooLong { .. }
+        | FrameError::PayloadTooLong { .. } => declared_frame_end(prefix, 0)
+            .and_then(|end| offset.checked_add(u64::try_from(end).ok()?))
+            .is_none_or(|end| end >= file_len),
+        FrameError::UnsupportedVersion { .. }
+        | FrameError::UnknownSignal { .. }
+        | FrameError::UnknownFlags { .. }
+        | FrameError::ReservedMustBeZero { .. }
+        | FrameError::InvalidTenantUtf8 => false,
+    }
 }
 
 #[cfg(test)]

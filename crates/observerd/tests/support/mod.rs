@@ -1,7 +1,7 @@
 use std::{
     fs,
     net::{SocketAddr, TcpListener},
-    path::{Path, PathBuf},
+    path::Path,
     process::Stdio,
     time::{Duration, Instant},
 };
@@ -14,7 +14,7 @@ use observer_protocol::otlp::{
     AnyValue, ExportLogsServiceRequest, ExportLogsServiceResponse, KeyValue, Resource,
     ResourceLogs, any_value,
 };
-use observer_wal::{Frame, SEGMENT_HEADER_SIZE, decode};
+use observer_wal::{Frame, WalReader};
 use prost::Message;
 use reqwest::StatusCode;
 use tokio::{
@@ -171,31 +171,14 @@ pub async fn post_logs(http: SocketAddr, request: &ExportLogsServiceRequest) {
 }
 
 pub fn frames_on_disk(wal_directory: &Path) -> Vec<Frame> {
-    let lane = wal_directory.join("lane-0000");
-    let mut paths: Vec<PathBuf> = fs::read_dir(&lane)
-        .unwrap_or_else(|error| panic!("read {}: {error}", lane.display()))
-        .map(|entry| entry.expect("dir entry").path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".open") || name.ends_with(".wal"))
-        })
-        .collect();
-    paths.sort();
-
+    let mut reader = WalReader::open(wal_directory).unwrap_or_else(|error| {
+        panic!("open WAL reader {}: {error}", wal_directory.display());
+    });
     let mut frames = Vec::new();
-    for path in paths {
-        let bytes = fs::read(&path).unwrap_or_else(|error| {
-            panic!("read {}: {error}", path.display());
-        });
-        let mut offset = SEGMENT_HEADER_SIZE;
-        while offset < bytes.len() {
-            let (frame, consumed) = decode(&bytes[offset..]).unwrap_or_else(|error| {
-                panic!("decode {} at {offset}: {error}", path.display());
-            });
-            frames.push(frame);
-            offset += consumed;
-        }
+    while let Some(record) = reader.next_record().unwrap_or_else(|error| {
+        panic!("read WAL {}: {error}", wal_directory.display());
+    }) {
+        frames.push(record.frame);
     }
     frames
 }

@@ -2,19 +2,23 @@
 
 mod async_wal;
 mod codec;
+mod cursor;
 mod error;
 mod frame;
 #[cfg(any(test, feature = "test-util"))]
 mod io_hooks;
+mod reader;
 mod recovery;
 mod segment;
 mod wal;
 
 pub use async_wal::{AsyncWal, WalWriterConfig};
 pub use codec::{decode, encode, encoded_frame_size};
+pub use cursor::{WalCursor, WalRecord};
 pub use error::{FrameError, WalError};
 pub use frame::{FORMAT_VERSION, Frame, FrameSignal, MAX_PAYLOAD_LEN, MAX_TENANT_LEN};
 #[cfg(any(test, feature = "test-util"))]
 pub use io_hooks::WalIoHooks;
+pub use reader::WalReader;
 pub use segment::{SEGMENT_HEADER_SIZE, SegmentHeader};
 pub use wal::{Receipt, Wal, WalConfig};
