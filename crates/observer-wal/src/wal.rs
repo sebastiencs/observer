@@ -11,14 +11,14 @@ use std::io;
 use observer_protocol::{AcceptedBatch, Signal};
 
 use crate::{
-    Frame, FrameError, FrameSignal, WalError, encode,
+    Frame, FrameError, FrameSignal, WalError,
+    checkpoint::{discover_authorized, load_raw_cursor},
+    encode,
     fsutil::sync_directory,
-    recovery::{
-        SegmentKind, discover_segments, lane_directory, scan_open_segment, scan_sealed_segment,
-    },
+    recovery::{SegmentKind, lane_directory, scan_open_segment, scan_sealed_segment},
     segment::{
-        LANE_ID, SEGMENT_HEADER_SIZE, SegmentHeader, encode_header, sealed_segment_file_name,
-        segment_file_name,
+        LANE_ID, SEGMENT_HEADER_SIZE, SegmentHeader, decode_header, encode_header,
+        sealed_segment_file_name, segment_file_name,
     },
 };
 
@@ -89,7 +89,7 @@ impl Wal {
 
         let lane_dir = lane_directory(&config.directory);
         fs::create_dir_all(&lane_dir)?;
-        let discovered = discover_segments(&lane_dir)?;
+        let discovered = discover_authorized(&lane_dir)?;
         let next_after_sealed = validate_sealed_segments(&discovered)?;
         let (path, segment_id, expected_first_sequence) =
             resolve_active_segment(&lane_dir, &discovered, next_after_sealed)?;
@@ -123,7 +123,7 @@ impl Wal {
             let mut bytes = Vec::new();
             file.seek(SeekFrom::Start(0))?;
             file.read_to_end(&mut bytes)?;
-            let header = crate::segment::decode_header(&bytes)?;
+            let header = decode_header(&bytes)?;
             if header.segment_id != segment_id {
                 return Err(WalError::InvalidSegmentHeader(
                     "segment id does not match file",
@@ -420,11 +420,13 @@ fn resolve_active_segment(
     next_after_sealed: Option<u64>,
 ) -> Result<(PathBuf, u64, u64), WalError> {
     match discovered.last() {
-        Some(segment) if segment.kind == SegmentKind::Open => Ok((
-            segment.path.clone(),
-            segment.id,
-            next_after_sealed.unwrap_or(0),
-        )),
+        Some(segment) if segment.kind == SegmentKind::Open => {
+            let expected = match next_after_sealed {
+                Some(sequence) => sequence,
+                None => existing_first_sequence(&segment.path)?.unwrap_or(0),
+            };
+            Ok((segment.path.clone(), segment.id, expected))
+        }
         Some(segment) => {
             let next_id = segment
                 .id
@@ -436,8 +438,44 @@ fn resolve_active_segment(
                 next_after_sealed.ok_or(WalError::Corrupt("missing sealed sequence"))?,
             ))
         }
-        None => Ok((lane_dir.join(segment_file_name(0)), 0, 0)),
+        None => match load_raw_cursor(lane_dir)? {
+            Some(cursor) if cursor.next_sequence() > 0 => {
+                let next_id = next_segment_id_after(cursor)?;
+                Ok((
+                    lane_dir.join(segment_file_name(next_id)),
+                    next_id,
+                    cursor.next_sequence(),
+                ))
+            }
+            _ => Ok((lane_dir.join(segment_file_name(0)), 0, 0)),
+        },
     }
+}
+
+fn next_segment_id_after(cursor: crate::WalCursor) -> Result<u64, WalError> {
+    let header_end = u64::try_from(SEGMENT_HEADER_SIZE).expect("header size");
+    if cursor.offset() > header_end {
+        cursor
+            .segment_id()
+            .checked_add(1)
+            .ok_or(WalError::InvalidSegmentHeader("segment id overflow"))
+    } else {
+        Ok(cursor.segment_id())
+    }
+}
+
+fn existing_first_sequence(path: &Path) -> Result<Option<u64>, WalError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.len() < u64::try_from(SEGMENT_HEADER_SIZE).expect("header size") {
+        return Ok(None);
+    }
+    let mut buf = [0_u8; SEGMENT_HEADER_SIZE];
+    file.read_exact(&mut buf)?;
+    Ok(Some(decode_header(&buf)?.first_sequence))
 }
 
 fn validate_sealed_segments(
@@ -449,7 +487,7 @@ fn validate_sealed_segments(
             continue;
         }
         let bytes = fs::read(&segment.path)?;
-        let header = crate::segment::decode_header(&bytes)?;
+        let header = decode_header(&bytes)?;
         if header.segment_id != segment.id {
             return Err(WalError::InvalidSegmentHeader(
                 "segment id does not match file",

@@ -11,7 +11,7 @@ use std::{
 use axum::{Router, extract::State, http::StatusCode, routing::get};
 use config::Config;
 use observer_ingest::{LogsHttpService, LogsIngestService};
-use observer_wal::{AsyncWal, WalWriterConfig};
+use observer_wal::{TenantWalRouter, WalWriterConfig};
 use tokio::{net::TcpListener, sync::watch};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
@@ -20,7 +20,7 @@ const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 struct AdminState {
-    wal: Arc<AsyncWal>,
+    wal: Arc<TenantWalRouter>,
     serving: Arc<AtomicBool>,
 }
 
@@ -41,7 +41,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: observerd <config.toml>")?;
     let config = Config::load(path)?;
 
-    let wal = Arc::new(AsyncWal::open(WalWriterConfig::new(&config.wal_directory))?);
+    let wal = Arc::new(TenantWalRouter::open(
+        WalWriterConfig::new(&config.wal_directory),
+        config.tokens.tenants(),
+    )?);
     let serving = Arc::new(AtomicBool::new(false));
 
     let grpc_listener = TcpListener::bind(config.listen.grpc).await?;
@@ -84,7 +87,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn spawn_grpc(
     listener: TcpListener,
-    wal: Arc<AsyncWal>,
+    wal: Arc<TenantWalRouter>,
     tokens: observer_ingest::TokenDirectory,
     mut shutdown: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<Result<(), tonic::transport::Error>> {
@@ -101,7 +104,7 @@ fn spawn_grpc(
 
 fn spawn_http(
     listener: TcpListener,
-    wal: Arc<AsyncWal>,
+    wal: Arc<TenantWalRouter>,
     tokens: observer_ingest::TokenDirectory,
     mut shutdown: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<Result<(), std::io::Error>> {

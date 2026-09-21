@@ -1,15 +1,15 @@
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
 use crate::{
-    WalCursor, WalError,
+    SEGMENT_HEADER_SIZE, WalCursor, WalError,
     fsutil::sync_directory,
     reader::{rematerialize_sequence, validate_physical_hint},
-    recovery::{lane_directory, list_segments, validate_contiguous_suffix},
-    segment::LANE_ID,
+    recovery::{FoundSegment, lane_directory, list_segments, validate_contiguous_suffix},
+    segment::{LANE_ID, decode_header},
 };
 
 const CHECKPOINT_MAGIC: &[u8; 8] = b"OBS-CKP1";
@@ -131,9 +131,59 @@ fn decode_checkpoint(data: &[u8]) -> Result<WalCursor, WalError> {
     ))
 }
 
+pub(crate) fn load_raw_cursor(lane_dir: &Path) -> Result<Option<WalCursor>, WalError> {
+    Ok(match read_checkpoint_file(lane_dir)? {
+        None => None,
+        Some(bytes) => Some(decode_checkpoint(&bytes)?),
+    })
+}
+
+pub(crate) fn discover_authorized(lane_dir: &Path) -> Result<Vec<FoundSegment>, WalError> {
+    let found = list_segments(lane_dir)?;
+    validate_contiguous_suffix(&found)?;
+    if found.first().is_some_and(|segment| segment.id != 0) {
+        authorize_nonzero_prefix(lane_dir, &found)?;
+    }
+    Ok(found)
+}
+
+fn authorize_nonzero_prefix(lane_dir: &Path, found: &[FoundSegment]) -> Result<(), WalError> {
+    let Some(cursor) = load_raw_cursor(lane_dir)? else {
+        return Err(WalError::Corrupt("missing or out-of-order segment id"));
+    };
+    let first = &found[0];
+    let mut file = File::open(&first.path)?;
+    let metadata = file.metadata()?;
+    if metadata.len() < u64::try_from(SEGMENT_HEADER_SIZE).expect("header size") {
+        return Err(WalError::InvalidSegmentHeader("truncated header"));
+    }
+    let mut buf = [0_u8; SEGMENT_HEADER_SIZE];
+    file.read_exact(&mut buf)?;
+    let header = decode_header(&buf)?;
+    if header.segment_id != first.id {
+        return Err(WalError::InvalidSegmentHeader(
+            "segment id does not match file",
+        ));
+    }
+    if cursor.next_sequence() < header.first_sequence {
+        return Err(WalError::InvalidCheckpoint(
+            "checkpoint is older than retained data",
+        ));
+    }
+    Ok(())
+}
+
 fn resolve_cursor(directory: &Path, cursor: WalCursor) -> Result<WalCursor, WalError> {
     let found = list_segments(&lane_directory(directory))?;
     validate_contiguous_suffix(&found)?;
+
+    if found.is_empty() {
+        return if cursor.next_sequence() == 0 {
+            Ok(WalCursor::start())
+        } else {
+            Ok(cursor)
+        };
+    }
 
     if let Some(segment) = found
         .iter()

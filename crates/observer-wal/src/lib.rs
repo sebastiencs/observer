@@ -11,7 +11,9 @@ mod fsutil;
 mod io_hooks;
 mod reader;
 mod recovery;
+mod retention;
 mod segment;
+mod tenant;
 mod wal;
 
 pub use async_wal::{AsyncWal, WalWriterConfig};
@@ -23,5 +25,7 @@ pub use frame::{FORMAT_VERSION, Frame, FrameSignal, MAX_PAYLOAD_LEN, MAX_TENANT_
 #[cfg(any(test, feature = "test-util"))]
 pub use io_hooks::WalIoHooks;
 pub use reader::WalReader;
+pub use retention::{RetentionReport, retain_committed};
 pub use segment::{SEGMENT_HEADER_SIZE, SegmentHeader};
+pub use tenant::{TenantWalRouter, tenant_wal_directory};
 pub use wal::{Receipt, Wal, WalConfig};

@@ -14,7 +14,7 @@ use observer_protocol::otlp::{
     AnyValue, ExportLogsServiceRequest, ExportLogsServiceResponse, KeyValue, Resource,
     ResourceLogs, any_value,
 };
-use observer_wal::{Frame, WalReader};
+use observer_wal::{Frame, WalReader, tenant_wal_directory};
 use prost::Message;
 use reqwest::StatusCode;
 use tokio::{
@@ -26,6 +26,9 @@ pub const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SECRET: &str = "secret-a";
 pub const TENANT: &str = "tenant-a";
 pub const BEARER: &str = "Bearer secret-a";
+pub const SECOND_SECRET: &str = "secret-b";
+pub const SECOND_TENANT: &str = "tenant-b";
+pub const SECOND_BEARER: &str = "Bearer secret-b";
 
 #[derive(Clone, Copy, Debug)]
 pub struct ListenAddrs {
@@ -49,7 +52,7 @@ pub fn reserve_ports() -> ListenAddrs {
 
 pub fn write_config(path: &Path, wal_directory: &Path, listen: ListenAddrs) {
     let contents = format!(
-        "wal_directory = {wal_directory:?}\n\n[listen]\ngrpc = \"{grpc}\"\nhttp = \"{http}\"\nadmin = \"{admin}\"\n\n[tokens]\n\"{SECRET}\" = \"{TENANT}\"\n",
+        "wal_directory = {wal_directory:?}\n\n[listen]\ngrpc = \"{grpc}\"\nhttp = \"{http}\"\nadmin = \"{admin}\"\n\n[tokens]\n\"{SECRET}\" = \"{TENANT}\"\n\"{SECOND_SECRET}\" = \"{SECOND_TENANT}\"\n",
         grpc = listen.grpc,
         http = listen.http,
         admin = listen.admin,
@@ -151,10 +154,14 @@ pub fn logs_request(marker: &str) -> ExportLogsServiceRequest {
 }
 
 pub async fn post_logs(http: SocketAddr, request: &ExportLogsServiceRequest) {
+    post_logs_as(http, BEARER, request).await;
+}
+
+pub async fn post_logs_as(http: SocketAddr, bearer: &str, request: &ExportLogsServiceRequest) {
     let response = reqwest::Client::new()
         .post(format!("http://{http}/v1/logs"))
         .header(reqwest::header::CONTENT_TYPE, "application/x-protobuf")
-        .header(reqwest::header::AUTHORIZATION, BEARER)
+        .header(reqwest::header::AUTHORIZATION, bearer)
         .body(request.encode_to_vec())
         .send()
         .await
@@ -170,9 +177,10 @@ pub async fn post_logs(http: SocketAddr, request: &ExportLogsServiceRequest) {
     assert!(decoded.partial_success.is_none());
 }
 
-pub fn frames_on_disk(wal_directory: &Path) -> Vec<Frame> {
-    let mut reader = WalReader::open(wal_directory).unwrap_or_else(|error| {
-        panic!("open WAL reader {}: {error}", wal_directory.display());
+pub fn frames_on_disk(wal_directory: &Path, tenant_id: &str) -> Vec<Frame> {
+    let tenant_directory = tenant_wal_directory(wal_directory, tenant_id);
+    let mut reader = WalReader::open(&tenant_directory).unwrap_or_else(|error| {
+        panic!("open WAL reader {}: {error}", tenant_directory.display());
     });
     let mut frames = Vec::new();
     while let Some(record) = reader.next_record().unwrap_or_else(|error| {

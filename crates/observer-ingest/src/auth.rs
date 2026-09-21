@@ -84,6 +84,11 @@ impl TokenDirectory {
             .cloned()
             .ok_or(AuthError::Unauthenticated)
     }
+
+    /// Configured tenant IDs. Multiple tokens may yield the same tenant.
+    pub fn tenants(&self) -> impl Iterator<Item = &str> {
+        self.tokens.values().map(String::as_str)
+    }
 }
 
 impl fmt::Debug for TokenDirectory {
@@ -129,6 +134,16 @@ mod tests {
         assert_eq!(
             tokens.authenticate(Some("bearer secret-b")).expect("b"),
             "tenant-b"
+        );
+    }
+
+    #[test]
+    fn exposes_configured_tenants() {
+        let tokens = TokenDirectory::new([("secret-a", "tenant-a"), ("secret-b", "tenant-a")])
+            .expect("directory");
+        assert_eq!(
+            tokens.tenants().collect::<Vec<_>>(),
+            ["tenant-a", "tenant-a"]
         );
     }
 

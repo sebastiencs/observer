@@ -33,6 +33,7 @@ pub(crate) fn lane_directory(root: &Path) -> PathBuf {
     root.join(LANE_DIR_NAME)
 }
 
+#[cfg(test)]
 pub(crate) fn discover_segments(lane_dir: &Path) -> Result<Vec<FoundSegment>, WalError> {
     let found = list_segments(lane_dir)?;
     validate_discovered(&found)?;
@@ -80,6 +81,7 @@ fn parse_segment_name(name: &str) -> Option<(u64, SegmentKind)> {
     id.parse().ok().map(|id| (id, kind))
 }
 
+#[cfg(test)]
 fn validate_discovered(found: &[FoundSegment]) -> Result<(), WalError> {
     if found.first().is_some_and(|segment| segment.id != 0) {
         return Err(WalError::Corrupt("missing or out-of-order segment id"));

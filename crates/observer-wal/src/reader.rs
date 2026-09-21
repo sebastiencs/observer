@@ -6,11 +6,10 @@ use std::{
 
 use crate::{
     Frame, FrameError, MAX_PAYLOAD_LEN, MAX_TENANT_LEN, SEGMENT_HEADER_SIZE, WalCursor, WalError,
-    WalRecord, decode, encoded_frame_size,
-    recovery::{
-        FoundSegment, SegmentKind, classify_scan_error, discover_segments, is_torn_tail_at,
-        lane_directory,
-    },
+    WalRecord,
+    checkpoint::discover_authorized,
+    decode, encoded_frame_size,
+    recovery::{FoundSegment, SegmentKind, classify_scan_error, is_torn_tail_at, lane_directory},
     segment::decode_header,
 };
 
@@ -43,7 +42,7 @@ impl WalReader {
     pub fn open_at(directory: impl Into<PathBuf>, cursor: WalCursor) -> Result<Self, WalError> {
         let directory = directory.into();
         let lane_dir = lane_directory(&directory);
-        let discovered = discover_segments(&lane_dir)?;
+        let discovered = discover_authorized(&lane_dir)?;
         if discovered.is_empty() {
             if cursor == WalCursor::start() {
                 return Ok(Self {
@@ -81,7 +80,7 @@ impl WalReader {
         }
 
         let directory = directory.into();
-        let discovered = discover_segments(&lane_directory(&directory))?;
+        let discovered = discover_authorized(&lane_directory(&directory))?;
         if discovered.is_empty() {
             return Err(WalError::Corrupt("sequence not found"));
         }
@@ -137,7 +136,7 @@ impl WalReader {
     /// Rediscover segments so a later `next_record` can see a still-growing
     /// `.open` tail or a newly rotated segment.
     pub fn refresh(&mut self) -> Result<(), WalError> {
-        discover_segments(&self.lane_dir)?;
+        discover_authorized(&self.lane_dir)?;
         Ok(())
     }
 
@@ -150,7 +149,7 @@ impl WalReader {
             return Ok(());
         }
 
-        let discovered = discover_segments(&self.lane_dir)?;
+        let discovered = discover_authorized(&self.lane_dir)?;
         if discovered.is_empty() {
             self.current = None;
             return Ok(());
@@ -180,7 +179,7 @@ impl WalReader {
             Some(id) => id,
             None => return Ok(false),
         };
-        let discovered = discover_segments(&self.lane_dir)?;
+        let discovered = discover_authorized(&self.lane_dir)?;
         let Some(found) = discovered.iter().find(|segment| segment.id == next_id) else {
             return Ok(false);
         };
