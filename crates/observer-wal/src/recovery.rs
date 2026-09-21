@@ -1,11 +1,12 @@
 use std::{
-    fs,
+    io,
     path::{Path, PathBuf},
 };
 
 use crate::{
     FrameError, WalError, decode,
     frame::LENGTH_SIZE,
+    lane_io::LaneIo,
     segment::{LANE_DIR_NAME, SEGMENT_HEADER_SIZE, decode_header},
 };
 
@@ -18,7 +19,7 @@ pub(crate) enum SegmentKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FoundSegment {
     pub id: u64,
-    pub path: PathBuf,
+    pub name: String,
     pub kind: SegmentKind,
 }
 
@@ -35,32 +36,29 @@ pub(crate) fn lane_directory(root: &Path) -> PathBuf {
 
 #[cfg(test)]
 pub(crate) fn discover_segments(lane_dir: &Path) -> Result<Vec<FoundSegment>, WalError> {
-    let found = list_segments(lane_dir)?;
+    let io = crate::lane_io::StdLaneIo::new(lane_dir);
+    let found = list_segments(&io)?;
     validate_discovered(&found)?;
     Ok(found)
 }
 
-pub(crate) fn list_segments(lane_dir: &Path) -> Result<Vec<FoundSegment>, WalError> {
-    if !lane_dir.exists() {
-        return Ok(Vec::new());
-    }
+pub(crate) fn list_segments(io: &dyn LaneIo) -> Result<Vec<FoundSegment>, WalError> {
+    let names = io.list_files().map_err(|error| {
+        if error.kind() == io::ErrorKind::InvalidData {
+            WalError::InvalidSegmentHeader("non-utf8 segment file name")
+        } else {
+            WalError::Io(error)
+        }
+    })?;
 
     let mut found = Vec::new();
-    for entry in fs::read_dir(lane_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            return Err(WalError::InvalidSegmentHeader("non-utf8 segment file name"));
-        };
-        let Some(segment) = parse_segment_name(name) else {
+    for name in names {
+        let Some(segment) = parse_segment_name(&name) else {
             continue;
         };
         found.push(FoundSegment {
             id: segment.0,
-            path,
+            name,
             kind: segment.1,
         });
     }
@@ -266,6 +264,8 @@ pub(crate) fn is_torn_tail_at(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::{
         Frame, FrameSignal, encode,

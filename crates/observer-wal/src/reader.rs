@@ -1,32 +1,43 @@
-use std::{
-    fs::File,
-    io::{Read, Seek, SeekFrom},
-    path::PathBuf,
-};
+use std::{fmt, path::PathBuf, sync::Arc};
 
 use crate::{
     Frame, FrameError, MAX_PAYLOAD_LEN, MAX_TENANT_LEN, SEGMENT_HEADER_SIZE, WalCursor, WalError,
     WalRecord,
     checkpoint::discover_authorized,
     decode, encoded_frame_size,
+    lane_io::{LaneFile, LaneIo, OpenMode, SharedLane},
     recovery::{FoundSegment, SegmentKind, classify_scan_error, is_torn_tail_at, lane_directory},
     segment::decode_header,
 };
 
 /// Bounded, synchronous reader over a single WAL lane.
-#[derive(Debug)]
 pub struct WalReader {
-    lane_dir: PathBuf,
+    io: SharedLane,
     cursor: WalCursor,
     current: Option<CurrentSegment>,
 }
 
-#[derive(Debug)]
 struct CurrentSegment {
-    file: File,
+    file: Box<dyn LaneFile>,
     id: u64,
     kind: SegmentKind,
     header: crate::SegmentHeader,
+}
+
+impl fmt::Debug for WalReader {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WalReader")
+            .field("cursor", &self.cursor)
+            .field(
+                "current",
+                &self
+                    .current
+                    .as_ref()
+                    .map(|current| (current.id, current.kind, current.header.segment_id)),
+            )
+            .finish()
+    }
 }
 
 enum FrameRead {
@@ -40,13 +51,23 @@ impl WalReader {
     }
 
     pub fn open_at(directory: impl Into<PathBuf>, cursor: WalCursor) -> Result<Self, WalError> {
-        let directory = directory.into();
-        let lane_dir = lane_directory(&directory);
-        let discovered = discover_authorized(&lane_dir)?;
+        let io: SharedLane = Arc::new(crate::lane_io::StdLaneIo::new(lane_directory(
+            &directory.into(),
+        )));
+        Self::open_at_io(io, cursor)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_io(io: SharedLane) -> Result<Self, WalError> {
+        Self::open_at_io(io, WalCursor::start())
+    }
+
+    pub(crate) fn open_at_io(io: SharedLane, cursor: WalCursor) -> Result<Self, WalError> {
+        let discovered = discover_authorized(io.as_ref())?;
         if discovered.is_empty() {
             if cursor == WalCursor::start() {
                 return Ok(Self {
-                    lane_dir,
+                    io,
                     cursor,
                     current: None,
                 });
@@ -60,10 +81,10 @@ impl WalReader {
         else {
             return Err(WalError::Corrupt("cursor does not resolve to a segment"));
         };
-        let mut current = open_found(found)?;
+        let mut current = open_found(io.as_ref(), found)?;
         validate_cursor(&mut current, cursor)?;
         Ok(Self {
-            lane_dir,
+            io,
             cursor,
             current: Some(current),
         })
@@ -75,18 +96,27 @@ impl WalReader {
         directory: impl Into<PathBuf>,
         next_sequence: u64,
     ) -> Result<Self, WalError> {
+        let io: SharedLane = Arc::new(crate::lane_io::StdLaneIo::new(lane_directory(
+            &directory.into(),
+        )));
+        Self::open_from_sequence_io(io, next_sequence)
+    }
+
+    pub(crate) fn open_from_sequence_io(
+        io: SharedLane,
+        next_sequence: u64,
+    ) -> Result<Self, WalError> {
         if next_sequence == 0 {
-            return Self::open(directory);
+            return Self::open_at_io(io, WalCursor::start());
         }
 
-        let directory = directory.into();
-        let discovered = discover_authorized(&lane_directory(&directory))?;
+        let discovered = discover_authorized(io.as_ref())?;
         if discovered.is_empty() {
             return Err(WalError::Corrupt("sequence not found"));
         }
 
-        let cursor = rematerialize_sequence(&discovered, next_sequence)?;
-        Self::open_at(directory, cursor)
+        let cursor = rematerialize_sequence(io.as_ref(), &discovered, next_sequence)?;
+        Self::open_at_io(io, cursor)
     }
 
     pub fn next_record(&mut self) -> Result<Option<WalRecord>, WalError> {
@@ -96,9 +126,9 @@ impl WalReader {
                 return Ok(None);
             };
 
-            let file_len = current.file.metadata()?.len();
+            let file_len = current.file.len()?;
             match read_frame(
-                &mut current.file,
+                current.file.as_mut(),
                 self.cursor.offset(),
                 file_len,
                 current.kind,
@@ -136,7 +166,7 @@ impl WalReader {
     /// Rediscover segments so a later `next_record` can see a still-growing
     /// `.open` tail or a newly rotated segment.
     pub fn refresh(&mut self) -> Result<(), WalError> {
-        discover_authorized(&self.lane_dir)?;
+        discover_authorized(self.io.as_ref())?;
         Ok(())
     }
 
@@ -149,7 +179,7 @@ impl WalReader {
             return Ok(());
         }
 
-        let discovered = discover_authorized(&self.lane_dir)?;
+        let discovered = discover_authorized(self.io.as_ref())?;
         if discovered.is_empty() {
             self.current = None;
             return Ok(());
@@ -164,7 +194,7 @@ impl WalReader {
             }
             return Err(WalError::Corrupt("cursor does not resolve to a segment"));
         };
-        let mut current = open_found(found)?;
+        let mut current = open_found(self.io.as_ref(), found)?;
         validate_cursor(&mut current, self.cursor)?;
         self.current = Some(current);
         Ok(())
@@ -179,11 +209,11 @@ impl WalReader {
             Some(id) => id,
             None => return Ok(false),
         };
-        let discovered = discover_authorized(&self.lane_dir)?;
+        let discovered = discover_authorized(self.io.as_ref())?;
         let Some(found) = discovered.iter().find(|segment| segment.id == next_id) else {
             return Ok(false);
         };
-        let next = open_found(found)?;
+        let next = open_found(self.io.as_ref(), found)?;
         if next.header.first_sequence != self.cursor.next_sequence() {
             return Err(WalError::Corrupt("sequence discontinuity"));
         }
@@ -194,14 +224,16 @@ impl WalReader {
 }
 
 pub(crate) fn validate_physical_hint(
+    io: &dyn LaneIo,
     found: &FoundSegment,
     cursor: WalCursor,
 ) -> Result<(), WalError> {
-    let mut current = open_found(found)?;
+    let mut current = open_found(io, found)?;
     validate_cursor(&mut current, cursor)
 }
 
 pub(crate) fn rematerialize_sequence(
+    io: &dyn LaneIo,
     discovered: &[FoundSegment],
     next_sequence: u64,
 ) -> Result<WalCursor, WalError> {
@@ -215,7 +247,7 @@ pub(crate) fn rematerialize_sequence(
         };
     }
 
-    let first = open_found(&discovered[0])?;
+    let first = open_found(io, &discovered[0])?;
     if next_sequence < first.header.first_sequence {
         return Err(WalError::InvalidCheckpoint(
             "checkpoint is older than retained data",
@@ -223,19 +255,19 @@ pub(crate) fn rematerialize_sequence(
     }
 
     for found in discovered {
-        let mut current = open_found(found)?;
+        let mut current = open_found(io, found)?;
         if next_sequence < current.header.first_sequence {
             return Err(WalError::Corrupt("sequence not found"));
         }
 
-        let file_len = current.file.metadata()?.len();
+        let file_len = current.file.len()?;
         let mut offset = header_offset();
         let mut sequence = current.header.first_sequence;
         loop {
             if sequence == next_sequence {
                 return Ok(WalCursor::at(sequence, current.id, offset));
             }
-            match read_frame(&mut current.file, offset, file_len, current.kind)? {
+            match read_frame(current.file.as_mut(), offset, file_len, current.kind)? {
                 FrameRead::Record(frame, consumed) => {
                     if frame.sequence != sequence {
                         return Err(WalError::Corrupt("sequence discontinuity"));
@@ -265,14 +297,14 @@ fn max_encoded_frame_len() -> usize {
     encoded_frame_size(MAX_TENANT_LEN, MAX_PAYLOAD_LEN).expect("max frame")
 }
 
-fn open_found(segment: &FoundSegment) -> Result<CurrentSegment, WalError> {
-    let mut file = File::open(&segment.path)?;
-    let file_len = file.metadata()?.len();
+fn open_found(io: &dyn LaneIo, segment: &FoundSegment) -> Result<CurrentSegment, WalError> {
+    let mut file = io.open(&segment.name, OpenMode::Read)?;
+    let file_len = file.len()?;
     if file_len < header_offset() {
         return Err(WalError::InvalidSegmentHeader("truncated header"));
     }
     let mut header_buf = [0_u8; SEGMENT_HEADER_SIZE];
-    file.seek(SeekFrom::Start(0))?;
+    file.seek(0)?;
     file.read_exact(&mut header_buf)?;
     let header = decode_header(&header_buf)?;
     if header.segment_id != segment.id {
@@ -293,7 +325,7 @@ fn validate_cursor(current: &mut CurrentSegment, cursor: WalCursor) -> Result<()
         return Err(WalError::Corrupt("cursor segment does not match header"));
     }
 
-    let file_len = current.file.metadata()?.len();
+    let file_len = current.file.len()?;
     let mut offset = header_offset();
     let mut sequence = current.header.first_sequence;
     loop {
@@ -306,7 +338,7 @@ fn validate_cursor(current: &mut CurrentSegment, cursor: WalCursor) -> Result<()
         if offset > cursor.offset() {
             return Err(WalError::Corrupt("cursor offset is not a frame boundary"));
         }
-        match read_frame(&mut current.file, offset, file_len, current.kind)? {
+        match read_frame(current.file.as_mut(), offset, file_len, current.kind)? {
             FrameRead::Record(frame, consumed) => {
                 if frame.sequence != sequence {
                     return Err(WalError::Corrupt("sequence discontinuity"));
@@ -329,7 +361,7 @@ fn validate_cursor(current: &mut CurrentSegment, cursor: WalCursor) -> Result<()
 }
 
 fn read_frame(
-    file: &mut File,
+    file: &mut dyn LaneFile,
     offset: u64,
     file_len: u64,
     kind: SegmentKind,
@@ -346,7 +378,7 @@ fn read_frame(
         usize::try_from(remaining.min(u64::try_from(max_encoded_frame_len()).expect("max frame")))
             .expect("read length");
     let mut buf = vec![0_u8; to_read];
-    file.seek(SeekFrom::Start(offset))?;
+    file.seek(offset)?;
     file.read_exact(&mut buf)?;
 
     match decode(&buf) {

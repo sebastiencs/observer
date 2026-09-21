@@ -1,7 +1,6 @@
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -14,7 +13,7 @@ use crate::{
     Frame, FrameError, FrameSignal, WalError,
     checkpoint::{discover_authorized, load_raw_cursor},
     encode,
-    fsutil::sync_directory,
+    lane_io::{LaneIo, OpenMode, SharedLane},
     recovery::{SegmentKind, lane_directory, scan_open_segment, scan_sealed_segment},
     segment::{
         LANE_ID, SEGMENT_HEADER_SIZE, SegmentHeader, decode_header, encode_header,
@@ -59,13 +58,16 @@ enum RotateFault {
 /// Durable, synchronous, single-lane write-ahead log.
 pub struct Wal {
     config: WalConfig,
-    file: File,
+    io: SharedLane,
+    file: Box<dyn crate::lane_io::LaneFile>,
+    name: String,
     path: PathBuf,
-    lane_dir: PathBuf,
     header: SegmentHeader,
     next_sequence: u64,
     next_offset: u64,
     failed: bool,
+    #[cfg(test)]
+    clock_nanos: Option<u64>,
     #[cfg(test)]
     write_fault: Option<WriteFault>,
     #[cfg(test)]
@@ -78,6 +80,26 @@ pub struct Wal {
 
 impl Wal {
     pub fn open(config: WalConfig) -> Result<Self, WalError> {
+        let io: SharedLane = Arc::new(crate::lane_io::StdLaneIo::new(lane_directory(
+            &config.directory,
+        )));
+        Self::open_inner(config, io, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_with_io(
+        config: WalConfig,
+        io: SharedLane,
+        clock_nanos: u64,
+    ) -> Result<Self, WalError> {
+        Self::open_inner(config, io, Some(clock_nanos))
+    }
+
+    fn open_inner(
+        config: WalConfig,
+        io: SharedLane,
+        clock_nanos: Option<u64>,
+    ) -> Result<Self, WalError> {
         if config.max_entry_bytes == 0 {
             return Err(WalError::InvalidConfig("max_entry_bytes must be non-zero"));
         }
@@ -87,33 +109,26 @@ impl Wal {
             ));
         }
 
-        let lane_dir = lane_directory(&config.directory);
-        fs::create_dir_all(&lane_dir)?;
-        let discovered = discover_authorized(&lane_dir)?;
-        let next_after_sealed = validate_sealed_segments(&discovered)?;
-        let (path, segment_id, expected_first_sequence) =
-            resolve_active_segment(&lane_dir, &discovered, next_after_sealed)?;
+        io.ensure_dir()?;
+        let discovered = discover_authorized(io.as_ref())?;
+        let next_after_sealed = validate_sealed_segments(io.as_ref(), &discovered)?;
+        let (name, segment_id, expected_first_sequence) =
+            resolve_active_segment(io.as_ref(), &discovered, next_after_sealed)?;
 
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
-
-        let metadata = file.metadata()?;
-        let (header, next_sequence, next_offset) = if metadata.len() < SEGMENT_HEADER_SIZE as u64 {
+        let mut file = io.open(&name, OpenMode::ReadWriteCreate)?;
+        let metadata_len = file.len()?;
+        let (header, next_sequence, next_offset) = if metadata_len < SEGMENT_HEADER_SIZE as u64 {
             let header = SegmentHeader {
                 lane_id: LANE_ID,
                 segment_id,
                 first_sequence: expected_first_sequence,
-                created_at_unix_nanos: unix_nanos()?,
+                created_at_unix_nanos: created_at(clock_nanos)?,
             };
             file.set_len(0)?;
-            file.seek(SeekFrom::Start(0))?;
+            file.seek(0)?;
             file.write_all(&encode_header(&header))?;
             file.sync_data()?;
-            sync_directory(&lane_dir)?;
+            io.sync_dir()?;
             (
                 header,
                 expected_first_sequence,
@@ -121,7 +136,7 @@ impl Wal {
             )
         } else {
             let mut bytes = Vec::new();
-            file.seek(SeekFrom::Start(0))?;
+            file.seek(0)?;
             file.read_to_end(&mut bytes)?;
             let header = decode_header(&bytes)?;
             if header.segment_id != segment_id {
@@ -140,17 +155,20 @@ impl Wal {
             (header, recovered.next_sequence, recovered.valid_end)
         };
 
-        file.seek(SeekFrom::Start(next_offset))?;
+        file.seek(next_offset)?;
 
         Ok(Self {
+            path: lane_directory(&config.directory).join(&name),
             config,
+            io,
             file,
-            path,
-            lane_dir,
+            name,
             header,
             next_sequence,
             next_offset,
             failed: false,
+            #[cfg(test)]
+            clock_nanos,
             #[cfg(test)]
             write_fault: None,
             #[cfg(test)]
@@ -170,6 +188,18 @@ impl Wal {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn clock(&self) -> Option<u64> {
+        #[cfg(test)]
+        {
+            self.clock_nanos
+        }
+        #[cfg(not(test))]
+        {
+            let _ = self;
+            None
+        }
     }
 
     #[must_use]
@@ -324,21 +354,19 @@ impl Wal {
         self.inject_rotate_fault(RotateFault::SyncActive)?;
         self.sync_data()?;
 
-        let sealed_path = self
-            .lane_dir
-            .join(sealed_segment_file_name(self.header.segment_id));
+        let sealed_name = sealed_segment_file_name(self.header.segment_id);
         #[cfg(test)]
         self.inject_rotate_fault(RotateFault::Rename)?;
-        if let Err(error) = fs::rename(&self.path, &sealed_path) {
+        if let Err(error) = self.io.rename(&self.name, &sealed_name) {
             self.failed = true;
             return Err(error.into());
         }
 
         #[cfg(test)]
         self.inject_rotate_fault(RotateFault::SyncDirAfterRename)?;
-        if let Err(error) = sync_directory(&self.lane_dir) {
+        if let Err(error) = self.io.sync_dir() {
             self.failed = true;
-            return Err(error);
+            return Err(error.into());
         }
 
         let next_id = match self.header.segment_id.checked_add(1) {
@@ -348,8 +376,8 @@ impl Wal {
                 return Err(WalError::InvalidSegmentHeader("segment id overflow"));
             }
         };
-        let next_path = self.lane_dir.join(segment_file_name(next_id));
-        let header = match unix_nanos() {
+        let next_name = segment_file_name(next_id);
+        let header = match created_at(self.clock()) {
             Ok(created_at_unix_nanos) => SegmentHeader {
                 lane_id: LANE_ID,
                 segment_id: next_id,
@@ -364,12 +392,7 @@ impl Wal {
 
         #[cfg(test)]
         self.inject_rotate_fault(RotateFault::CreateNext)?;
-        let mut file = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&next_path)
-        {
+        let mut file = match self.io.open(&next_name, OpenMode::ReadWriteCreateNew) {
             Ok(file) => file,
             Err(error) => {
                 self.failed = true;
@@ -391,13 +414,14 @@ impl Wal {
 
         #[cfg(test)]
         self.inject_rotate_fault(RotateFault::SyncDirAfterCreate)?;
-        if let Err(error) = sync_directory(&self.lane_dir) {
+        if let Err(error) = self.io.sync_dir() {
             self.failed = true;
-            return Err(error);
+            return Err(error.into());
         }
 
         self.file = file;
-        self.path = next_path;
+        self.name = next_name;
+        self.path = lane_directory(&self.config.directory).join(&self.name);
         self.header = header;
         self.next_offset = u64::try_from(SEGMENT_HEADER_SIZE).expect("header size");
         Ok(())
@@ -415,17 +439,17 @@ impl Wal {
 }
 
 fn resolve_active_segment(
-    lane_dir: &Path,
+    io: &dyn LaneIo,
     discovered: &[crate::recovery::FoundSegment],
     next_after_sealed: Option<u64>,
-) -> Result<(PathBuf, u64, u64), WalError> {
+) -> Result<(String, u64, u64), WalError> {
     match discovered.last() {
         Some(segment) if segment.kind == SegmentKind::Open => {
             let expected = match next_after_sealed {
                 Some(sequence) => sequence,
-                None => existing_first_sequence(&segment.path)?.unwrap_or(0),
+                None => existing_first_sequence(io, &segment.name)?.unwrap_or(0),
             };
-            Ok((segment.path.clone(), segment.id, expected))
+            Ok((segment.name.clone(), segment.id, expected))
         }
         Some(segment) => {
             let next_id = segment
@@ -433,21 +457,17 @@ fn resolve_active_segment(
                 .checked_add(1)
                 .ok_or(WalError::InvalidSegmentHeader("segment id overflow"))?;
             Ok((
-                lane_dir.join(segment_file_name(next_id)),
+                segment_file_name(next_id),
                 next_id,
                 next_after_sealed.ok_or(WalError::Corrupt("missing sealed sequence"))?,
             ))
         }
-        None => match load_raw_cursor(lane_dir)? {
+        None => match load_raw_cursor(io)? {
             Some(cursor) if cursor.next_sequence() > 0 => {
                 let next_id = next_segment_id_after(cursor)?;
-                Ok((
-                    lane_dir.join(segment_file_name(next_id)),
-                    next_id,
-                    cursor.next_sequence(),
-                ))
+                Ok((segment_file_name(next_id), next_id, cursor.next_sequence()))
             }
-            _ => Ok((lane_dir.join(segment_file_name(0)), 0, 0)),
+            _ => Ok((segment_file_name(0), 0, 0)),
         },
     }
 }
@@ -464,13 +484,12 @@ fn next_segment_id_after(cursor: crate::WalCursor) -> Result<u64, WalError> {
     }
 }
 
-fn existing_first_sequence(path: &Path) -> Result<Option<u64>, WalError> {
-    if !path.exists() {
+fn existing_first_sequence(io: &dyn LaneIo, name: &str) -> Result<Option<u64>, WalError> {
+    if !io.exists(name)? {
         return Ok(None);
     }
-    let mut file = File::open(path)?;
-    let metadata = file.metadata()?;
-    if metadata.len() < u64::try_from(SEGMENT_HEADER_SIZE).expect("header size") {
+    let mut file = io.open(name, OpenMode::Read)?;
+    if file.len()? < u64::try_from(SEGMENT_HEADER_SIZE).expect("header size") {
         return Ok(None);
     }
     let mut buf = [0_u8; SEGMENT_HEADER_SIZE];
@@ -479,6 +498,7 @@ fn existing_first_sequence(path: &Path) -> Result<Option<u64>, WalError> {
 }
 
 fn validate_sealed_segments(
+    io: &dyn LaneIo,
     discovered: &[crate::recovery::FoundSegment],
 ) -> Result<Option<u64>, WalError> {
     let mut next_sequence = None;
@@ -486,7 +506,7 @@ fn validate_sealed_segments(
         if segment.kind != SegmentKind::Sealed {
             continue;
         }
-        let bytes = fs::read(&segment.path)?;
+        let bytes = io.read_file(&segment.name)?;
         let header = decode_header(&bytes)?;
         if header.segment_id != segment.id {
             return Err(WalError::InvalidSegmentHeader(
@@ -502,6 +522,13 @@ fn validate_sealed_segments(
         next_sequence = Some(recovered.next_sequence);
     }
     Ok(next_sequence)
+}
+
+fn created_at(clock_nanos: Option<u64>) -> Result<u64, WalError> {
+    if let Some(clock_nanos) = clock_nanos {
+        return Ok(clock_nanos);
+    }
+    unix_nanos()
 }
 
 fn unix_nanos() -> Result<u64, WalError> {
@@ -520,7 +547,7 @@ fn frame_signal(signal: Signal) -> FrameSignal {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use std::{fs, io};
 
     use bytes::Bytes;
     use observer_protocol::{AcceptedBatch, Signal};

@@ -1,14 +1,10 @@
-use std::{
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
-    path::{Path, PathBuf},
-};
+use std::{fmt, io, path::PathBuf};
 
 use crate::{
     SEGMENT_HEADER_SIZE, WalCursor, WalError,
-    fsutil::sync_directory,
+    lane_io::{LaneIo, OpenMode, SharedLane},
     reader::{rematerialize_sequence, validate_physical_hint},
-    recovery::{FoundSegment, lane_directory, list_segments, validate_contiguous_suffix},
+    recovery::{FoundSegment, list_segments, validate_contiguous_suffix},
     segment::{LANE_ID, decode_header},
 };
 
@@ -19,28 +15,37 @@ const CHECKPOINT_NAME: &str = "consumer.checkpoint";
 const CHECKPOINT_TMP_NAME: &str = "consumer.checkpoint.tmp";
 
 /// One durable, monotonic consumer checkpoint for a WAL lane.
-#[derive(Debug)]
 pub struct WalCheckpoint {
-    directory: PathBuf,
-    lane_dir: PathBuf,
+    io: SharedLane,
     committed: WalCursor,
+}
+
+impl fmt::Debug for WalCheckpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WalCheckpoint")
+            .field("committed", &self.committed)
+            .finish()
+    }
 }
 
 impl WalCheckpoint {
     pub fn load(directory: impl Into<PathBuf>) -> Result<Self, WalError> {
         let directory = directory.into();
-        let lane_dir = lane_directory(&directory);
-        let raw = read_checkpoint_file(&lane_dir)?;
+        let io: SharedLane = std::sync::Arc::new(crate::lane_io::StdLaneIo::new(
+            crate::recovery::lane_directory(&directory),
+        ));
+        Self::load_io(io)
+    }
+
+    pub(crate) fn load_io(io: SharedLane) -> Result<Self, WalError> {
+        let raw = read_checkpoint_file(io.as_ref())?;
         let cursor = match raw {
             None => WalCursor::start(),
             Some(bytes) => decode_checkpoint(&bytes)?,
         };
-        let committed = resolve_cursor(&directory, cursor)?;
-        Ok(Self {
-            directory,
-            lane_dir,
-            committed,
-        })
+        let committed = resolve_cursor(io.as_ref(), cursor)?;
+        Ok(Self { io, committed })
     }
 
     #[must_use]
@@ -64,16 +69,15 @@ impl WalCheckpoint {
             return Ok(());
         }
 
-        let resolved = resolve_cursor(&self.directory, cursor)?;
-        persist_checkpoint(&self.lane_dir, resolved)?;
+        let resolved = resolve_cursor(self.io.as_ref(), cursor)?;
+        persist_checkpoint(self.io.as_ref(), resolved)?;
         self.committed = resolved;
         Ok(())
     }
 }
 
-fn read_checkpoint_file(lane_dir: &Path) -> Result<Option<[u8; CHECKPOINT_SIZE]>, WalError> {
-    let path = lane_dir.join(CHECKPOINT_NAME);
-    match fs::read(&path) {
+fn read_checkpoint_file(io: &dyn LaneIo) -> Result<Option<[u8; CHECKPOINT_SIZE]>, WalError> {
+    match io.read_file(CHECKPOINT_NAME) {
         Ok(bytes) => {
             if bytes.len() != CHECKPOINT_SIZE {
                 return Err(WalError::InvalidCheckpoint("unexpected length"));
@@ -82,7 +86,7 @@ fn read_checkpoint_file(lane_dir: &Path) -> Result<Option<[u8; CHECKPOINT_SIZE]>
             buf.copy_from_slice(&bytes);
             Ok(Some(buf))
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
@@ -131,33 +135,33 @@ fn decode_checkpoint(data: &[u8]) -> Result<WalCursor, WalError> {
     ))
 }
 
-pub(crate) fn load_raw_cursor(lane_dir: &Path) -> Result<Option<WalCursor>, WalError> {
-    Ok(match read_checkpoint_file(lane_dir)? {
+pub(crate) fn load_raw_cursor(io: &dyn LaneIo) -> Result<Option<WalCursor>, WalError> {
+    Ok(match read_checkpoint_file(io)? {
         None => None,
         Some(bytes) => Some(decode_checkpoint(&bytes)?),
     })
 }
 
-pub(crate) fn discover_authorized(lane_dir: &Path) -> Result<Vec<FoundSegment>, WalError> {
-    let found = list_segments(lane_dir)?;
+pub(crate) fn discover_authorized(io: &dyn LaneIo) -> Result<Vec<FoundSegment>, WalError> {
+    let found = list_segments(io)?;
     validate_contiguous_suffix(&found)?;
     if found.first().is_some_and(|segment| segment.id != 0) {
-        authorize_nonzero_prefix(lane_dir, &found)?;
+        authorize_nonzero_prefix(io, &found)?;
     }
     Ok(found)
 }
 
-fn authorize_nonzero_prefix(lane_dir: &Path, found: &[FoundSegment]) -> Result<(), WalError> {
-    let Some(cursor) = load_raw_cursor(lane_dir)? else {
+fn authorize_nonzero_prefix(io: &dyn LaneIo, found: &[FoundSegment]) -> Result<(), WalError> {
+    let Some(cursor) = load_raw_cursor(io)? else {
         return Err(WalError::Corrupt("missing or out-of-order segment id"));
     };
     let first = &found[0];
-    let mut file = File::open(&first.path)?;
-    let metadata = file.metadata()?;
-    if metadata.len() < u64::try_from(SEGMENT_HEADER_SIZE).expect("header size") {
+    let mut file = io.open(&first.name, OpenMode::Read)?;
+    if file.len()? < u64::try_from(SEGMENT_HEADER_SIZE).expect("header size") {
         return Err(WalError::InvalidSegmentHeader("truncated header"));
     }
     let mut buf = [0_u8; SEGMENT_HEADER_SIZE];
+    file.seek(0)?;
     file.read_exact(&mut buf)?;
     let header = decode_header(&buf)?;
     if header.segment_id != first.id {
@@ -173,8 +177,8 @@ fn authorize_nonzero_prefix(lane_dir: &Path, found: &[FoundSegment]) -> Result<(
     Ok(())
 }
 
-fn resolve_cursor(directory: &Path, cursor: WalCursor) -> Result<WalCursor, WalError> {
-    let found = list_segments(&lane_directory(directory))?;
+fn resolve_cursor(io: &dyn LaneIo, cursor: WalCursor) -> Result<WalCursor, WalError> {
+    let found = list_segments(io)?;
     validate_contiguous_suffix(&found)?;
 
     if found.is_empty() {
@@ -189,33 +193,29 @@ fn resolve_cursor(directory: &Path, cursor: WalCursor) -> Result<WalCursor, WalE
         .iter()
         .find(|segment| segment.id == cursor.segment_id())
     {
-        validate_physical_hint(segment, cursor)?;
+        validate_physical_hint(io, segment, cursor)?;
         return Ok(cursor);
     }
 
-    rematerialize_sequence(&found, cursor.next_sequence())
+    rematerialize_sequence(io, &found, cursor.next_sequence())
 }
 
-fn persist_checkpoint(lane_dir: &Path, cursor: WalCursor) -> Result<(), WalError> {
-    fs::create_dir_all(lane_dir)?;
-    let tmp = lane_dir.join(CHECKPOINT_TMP_NAME);
-    let path = lane_dir.join(CHECKPOINT_NAME);
+fn persist_checkpoint(io: &dyn LaneIo, cursor: WalCursor) -> Result<(), WalError> {
+    io.ensure_dir()?;
     let encoded = encode_checkpoint(cursor);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp)?;
-    file.write_all(&encoded)?;
-    file.sync_data()?;
-    fs::rename(&tmp, &path)?;
-    sync_directory(lane_dir)?;
+    {
+        let mut file = io.open(CHECKPOINT_TMP_NAME, OpenMode::WriteTruncate)?;
+        file.write_all(&encoded)?;
+        file.sync_data()?;
+    }
+    io.rename(CHECKPOINT_TMP_NAME, CHECKPOINT_NAME)?;
+    io.sync_dir()?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::Path};
 
     use bytes::Bytes;
     use observer_protocol::{AcceptedBatch, Signal};

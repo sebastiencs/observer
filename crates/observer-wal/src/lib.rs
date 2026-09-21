@@ -3,16 +3,22 @@
 mod async_wal;
 mod checkpoint;
 mod codec;
+#[cfg(test)]
+mod crash_fs;
+#[cfg(test)]
+mod crash_tests;
 mod cursor;
 mod error;
 mod frame;
-mod fsutil;
 #[cfg(any(test, feature = "test-util"))]
 mod io_hooks;
+mod lane_io;
 mod reader;
 mod recovery;
 mod retention;
 mod segment;
+#[cfg(test)]
+mod state_machine;
 mod tenant;
 mod wal;
 

@@ -1,8 +1,8 @@
-use std::{fs, path::Path};
+use std::{path::Path, sync::Arc};
 
 use crate::{
     WalCheckpoint, WalError,
-    fsutil::sync_directory,
+    lane_io::SharedLane,
     recovery::{
         SegmentKind, lane_directory, list_segments, scan_sealed_segment, validate_contiguous_suffix,
     },
@@ -19,15 +19,20 @@ pub struct RetentionReport {
 /// Delete sealed segments whose exclusive end is at or before the durable
 /// consumer checkpoint.
 pub fn retain_committed(directory: impl AsRef<Path>) -> Result<RetentionReport, WalError> {
-    let directory = directory.as_ref();
-    let checkpoint = WalCheckpoint::load(directory)?;
+    let io: SharedLane = Arc::new(crate::lane_io::StdLaneIo::new(lane_directory(
+        directory.as_ref(),
+    )));
+    retain_committed_io(io)
+}
+
+pub(crate) fn retain_committed_io(io: SharedLane) -> Result<RetentionReport, WalError> {
+    let checkpoint = WalCheckpoint::load_io(Arc::clone(&io))?;
     let committed = checkpoint.cursor().next_sequence();
     if committed == 0 {
         return Ok(RetentionReport::default());
     }
 
-    let lane_dir = lane_directory(directory);
-    let found = list_segments(&lane_dir)?;
+    let found = list_segments(io.as_ref())?;
     validate_contiguous_suffix(&found)?;
 
     let mut eligible = Vec::new();
@@ -36,7 +41,7 @@ pub fn retain_committed(directory: impl AsRef<Path>) -> Result<RetentionReport, 
         if segment.kind != SegmentKind::Sealed {
             break;
         }
-        let bytes = fs::read(&segment.path)?;
+        let bytes = io.read_file(&segment.name)?;
         let header = decode_header(&bytes)?;
         if header.segment_id != segment.id {
             return Err(WalError::InvalidSegmentHeader(
@@ -58,8 +63,8 @@ pub fn retain_committed(directory: impl AsRef<Path>) -> Result<RetentionReport, 
 
     let mut report = RetentionReport::default();
     for segment in eligible {
-        let bytes = fs::metadata(&segment.path)?.len();
-        fs::remove_file(&segment.path)?;
+        let bytes = io.file_len(&segment.name)?;
+        io.remove_file(&segment.name)?;
         report.deleted_segments.push(segment.id);
         report.bytes_reclaimed = report
             .bytes_reclaimed
@@ -67,7 +72,7 @@ pub fn retain_committed(directory: impl AsRef<Path>) -> Result<RetentionReport, 
             .ok_or(WalError::Corrupt("offset overflow"))?;
     }
     if !report.deleted_segments.is_empty() {
-        sync_directory(&lane_dir)?;
+        io.sync_dir()?;
     }
     Ok(report)
 }
