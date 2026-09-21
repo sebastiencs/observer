@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 axum.workspace = true
+fs2 = "0.4"
 observer-ingest = { path = "../observer-ingest" }
 observer-wal = { path = "../observer-wal" }
 serde.workspace = true

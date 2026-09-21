@@ -1,6 +1,9 @@
 mod config;
+mod readiness;
 
 use std::{
+    fs,
+    path::PathBuf,
     process::ExitCode,
     sync::{
         Arc,
@@ -12,6 +15,7 @@ use axum::{Router, extract::State, http::StatusCode, routing::get};
 use config::Config;
 use observer_ingest::{LogsHttpService, LogsIngestService};
 use observer_wal::{TenantWalRouter, WalWriterConfig};
+use readiness::{FilesystemFreeSpace, Readiness};
 use tokio::{net::TcpListener, sync::watch};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
@@ -22,6 +26,8 @@ const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 struct AdminState {
     wal: Arc<TenantWalRouter>,
     serving: Arc<AtomicBool>,
+    wal_directory: PathBuf,
+    readiness: Arc<Readiness<FilesystemFreeSpace>>,
 }
 
 #[tokio::main]
@@ -40,6 +46,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .ok_or("usage: observerd <config.toml>")?;
     let config = Config::load(path)?;
+
+    fs::create_dir_all(&config.wal_directory)?;
+    let readiness = Arc::new(Readiness::filesystem(config.readiness));
+    readiness.ensure_startup(&config.wal_directory)?;
 
     let wal = Arc::new(TenantWalRouter::open(
         WalWriterConfig::new(&config.wal_directory),
@@ -69,6 +79,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         AdminState {
             wal: Arc::clone(&wal),
             serving: Arc::clone(&serving),
+            wal_directory: config.wal_directory.clone(),
+            readiness,
         },
         shutdown_rx,
     );
@@ -141,7 +153,11 @@ async fn live() -> StatusCode {
 }
 
 async fn ready(State(state): State<AdminState>) -> StatusCode {
-    if state.serving.load(Ordering::SeqCst) && !state.wal.is_failed() {
+    if state.readiness.is_ready(
+        state.serving.load(Ordering::SeqCst),
+        state.wal.is_failed(),
+        &state.wal_directory,
+    ) {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -163,5 +179,15 @@ async fn wait_for_shutdown() {
     #[cfg(not(unix))]
     {
         let _ = ctrl_c.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn live_stays_ok_when_not_ready() {
+        assert_eq!(live().await, StatusCode::OK);
     }
 }

@@ -9,12 +9,30 @@ use std::{
 use observer_ingest::{AuthConfigError, TokenDirectory};
 use serde::Deserialize;
 
+/// Two target WAL segments (256 MiB each).
+pub const DEFAULT_MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
+
 /// File-backed daemon configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub wal_directory: PathBuf,
     pub listen: ListenConfig,
     pub tokens: TokenDirectory,
+    pub readiness: ReadinessConfig,
+}
+
+/// WAL-filesystem free-space gate. Zero disables the check.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadinessConfig {
+    pub min_free_bytes: u64,
+}
+
+impl Default for ReadinessConfig {
+    fn default() -> Self {
+        Self {
+            min_free_bytes: DEFAULT_MIN_FREE_BYTES,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -29,6 +47,12 @@ struct FileConfig {
     wal_directory: PathBuf,
     listen: ListenConfig,
     tokens: HashMap<String, String>,
+    readiness: Option<FileReadiness>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileReadiness {
+    min_free_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -71,6 +95,12 @@ impl Config {
             wal_directory: file.wal_directory,
             listen: file.listen,
             tokens,
+            readiness: file
+                .readiness
+                .map(|readiness| ReadinessConfig {
+                    min_free_bytes: readiness.min_free_bytes,
+                })
+                .unwrap_or_default(),
         })
     }
 }
@@ -107,6 +137,61 @@ admin = "127.0.0.1:8080"
             config.tokens.authenticate(Some("Bearer secret-b")).unwrap(),
             "tenant-b"
         );
+        assert_eq!(config.readiness.min_free_bytes, DEFAULT_MIN_FREE_BYTES);
+    }
+
+    #[test]
+    fn readiness_threshold_can_be_set_or_disabled() {
+        let explicit = Config::parse(
+            r#"
+wal_directory = "/tmp/wal"
+[listen]
+grpc = "127.0.0.1:4317"
+http = "127.0.0.1:4318"
+admin = "127.0.0.1:8080"
+[tokens]
+"secret-a" = "tenant-a"
+[readiness]
+min_free_bytes = 1024
+"#,
+        )
+        .expect("parse");
+        assert_eq!(explicit.readiness.min_free_bytes, 1024);
+
+        let disabled = Config::parse(
+            r#"
+wal_directory = "/tmp/wal"
+[listen]
+grpc = "127.0.0.1:4317"
+http = "127.0.0.1:4318"
+admin = "127.0.0.1:8080"
+[tokens]
+"secret-a" = "tenant-a"
+[readiness]
+min_free_bytes = 0
+"#,
+        )
+        .expect("parse");
+        assert_eq!(disabled.readiness.min_free_bytes, 0);
+    }
+
+    #[test]
+    fn rejects_malformed_min_free_bytes() {
+        let error = Config::parse(
+            r#"
+wal_directory = "/tmp/wal"
+[listen]
+grpc = "127.0.0.1:4317"
+http = "127.0.0.1:4318"
+admin = "127.0.0.1:8080"
+[tokens]
+"secret-a" = "tenant-a"
+[readiness]
+min_free_bytes = "lots"
+"#,
+        )
+        .expect_err("malformed");
+        assert!(matches!(error, ConfigError::Parse(_)));
     }
 
     #[test]
@@ -160,12 +245,16 @@ mod properties {
             http in any::<SocketAddrV4>(),
             admin in any::<SocketAddrV4>(),
             tokens in prop::collection::hash_map(token(), tenant(), 1..6),
+            min_free_bytes in prop::option::of(0_u64..=i64::MAX as u64),
         ) {
             let mut body = format!(
                 "wal_directory = \"/tmp/observer-{suffix}\"\n\n[listen]\ngrpc = \"{grpc}\"\nhttp = \"{http}\"\nadmin = \"{admin}\"\n\n[tokens]\n"
             );
             for (token, tenant) in &tokens {
                 body.push_str(&format!("\"{token}\" = \"{tenant}\"\n"));
+            }
+            if let Some(min_free_bytes) = min_free_bytes {
+                body.push_str(&format!("\n[readiness]\nmin_free_bytes = {min_free_bytes}\n"));
             }
 
             let config = Config::parse(&body).expect("parse");
@@ -176,6 +265,10 @@ mod properties {
             prop_assert_eq!(config.listen.grpc, SocketAddr::V4(grpc));
             prop_assert_eq!(config.listen.http, SocketAddr::V4(http));
             prop_assert_eq!(config.listen.admin, SocketAddr::V4(admin));
+            prop_assert_eq!(
+                config.readiness.min_free_bytes,
+                min_free_bytes.unwrap_or(DEFAULT_MIN_FREE_BYTES)
+            );
             for (token, tenant) in &tokens {
                 let header = format!("Bearer {token}");
                 let resolved = config
