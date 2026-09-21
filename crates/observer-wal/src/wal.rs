@@ -12,6 +12,7 @@ use observer_protocol::{AcceptedBatch, Signal};
 
 use crate::{
     Frame, FrameError, FrameSignal, WalError, encode,
+    fsutil::sync_directory,
     recovery::{
         SegmentKind, discover_segments, lane_directory, scan_open_segment, scan_sealed_segment,
     },
@@ -463,11 +464,6 @@ fn validate_sealed_segments(
         next_sequence = Some(recovered.next_sequence);
     }
     Ok(next_sequence)
-}
-
-fn sync_directory(path: &Path) -> Result<(), WalError> {
-    File::open(path)?.sync_all()?;
-    Ok(())
 }
 
 fn unix_nanos() -> Result<u64, WalError> {

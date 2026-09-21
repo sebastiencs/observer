@@ -81,50 +81,13 @@ impl WalReader {
         }
 
         let directory = directory.into();
-        let lane_dir = lane_directory(&directory);
-        let discovered = discover_segments(&lane_dir)?;
+        let discovered = discover_segments(&lane_directory(&directory))?;
         if discovered.is_empty() {
             return Err(WalError::Corrupt("sequence not found"));
         }
 
-        for found in &discovered {
-            let mut current = open_found(found)?;
-            if next_sequence < current.header.first_sequence {
-                return Err(WalError::Corrupt("sequence not found"));
-            }
-
-            let file_len = current.file.metadata()?.len();
-            let mut offset = header_offset();
-            let mut sequence = current.header.first_sequence;
-            loop {
-                if sequence == next_sequence {
-                    let cursor = WalCursor::at(sequence, current.id, offset);
-                    return Ok(Self {
-                        lane_dir,
-                        cursor,
-                        current: Some(current),
-                    });
-                }
-                match read_frame(&mut current.file, offset, file_len, current.kind)? {
-                    FrameRead::Record(frame, consumed) => {
-                        if frame.sequence != sequence {
-                            return Err(WalError::Corrupt("sequence discontinuity"));
-                        }
-                        sequence = sequence
-                            .checked_add(1)
-                            .ok_or(WalError::Corrupt("sequence overflow"))?;
-                        offset = offset
-                            .checked_add(
-                                u64::try_from(consumed).map_err(|_| FrameError::InvalidLength)?,
-                            )
-                            .ok_or(WalError::Corrupt("offset overflow"))?;
-                    }
-                    FrameRead::Tail => break,
-                }
-            }
-        }
-
-        Err(WalError::Corrupt("sequence not found"))
+        let cursor = rematerialize_sequence(&discovered, next_sequence)?;
+        Self::open_at(directory, cursor)
     }
 
     pub fn next_record(&mut self) -> Result<Option<WalRecord>, WalError> {
@@ -229,6 +192,70 @@ impl WalReader {
         self.current = Some(next);
         Ok(true)
     }
+}
+
+pub(crate) fn validate_physical_hint(
+    found: &FoundSegment,
+    cursor: WalCursor,
+) -> Result<(), WalError> {
+    let mut current = open_found(found)?;
+    validate_cursor(&mut current, cursor)
+}
+
+pub(crate) fn rematerialize_sequence(
+    discovered: &[FoundSegment],
+    next_sequence: u64,
+) -> Result<WalCursor, WalError> {
+    if discovered.is_empty() {
+        return if next_sequence == 0 {
+            Ok(WalCursor::start())
+        } else {
+            Err(WalError::InvalidCheckpoint(
+                "checkpoint is older than retained data",
+            ))
+        };
+    }
+
+    let first = open_found(&discovered[0])?;
+    if next_sequence < first.header.first_sequence {
+        return Err(WalError::InvalidCheckpoint(
+            "checkpoint is older than retained data",
+        ));
+    }
+
+    for found in discovered {
+        let mut current = open_found(found)?;
+        if next_sequence < current.header.first_sequence {
+            return Err(WalError::Corrupt("sequence not found"));
+        }
+
+        let file_len = current.file.metadata()?.len();
+        let mut offset = header_offset();
+        let mut sequence = current.header.first_sequence;
+        loop {
+            if sequence == next_sequence {
+                return Ok(WalCursor::at(sequence, current.id, offset));
+            }
+            match read_frame(&mut current.file, offset, file_len, current.kind)? {
+                FrameRead::Record(frame, consumed) => {
+                    if frame.sequence != sequence {
+                        return Err(WalError::Corrupt("sequence discontinuity"));
+                    }
+                    sequence = sequence
+                        .checked_add(1)
+                        .ok_or(WalError::Corrupt("sequence overflow"))?;
+                    offset = offset
+                        .checked_add(
+                            u64::try_from(consumed).map_err(|_| FrameError::InvalidLength)?,
+                        )
+                        .ok_or(WalError::Corrupt("offset overflow"))?;
+                }
+                FrameRead::Tail => break,
+            }
+        }
+    }
+
+    Err(WalError::Corrupt("sequence not found"))
 }
 
 fn header_offset() -> u64 {

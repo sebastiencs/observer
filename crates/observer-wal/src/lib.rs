@@ -1,10 +1,12 @@
 //! Durable, local write-ahead log primitives.
 
 mod async_wal;
+mod checkpoint;
 mod codec;
 mod cursor;
 mod error;
 mod frame;
+mod fsutil;
 #[cfg(any(test, feature = "test-util"))]
 mod io_hooks;
 mod reader;
@@ -13,6 +15,7 @@ mod segment;
 mod wal;
 
 pub use async_wal::{AsyncWal, WalWriterConfig};
+pub use checkpoint::WalCheckpoint;
 pub use codec::{decode, encode, encoded_frame_size};
 pub use cursor::{WalCursor, WalRecord};
 pub use error::{FrameError, WalError};

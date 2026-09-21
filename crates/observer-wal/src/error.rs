@@ -97,6 +97,13 @@ pub enum WalError {
         lane_id: u32,
     },
     InvalidConfig(&'static str),
+    /// A checkpoint file exists but is truncated, badly versioned, or corrupt.
+    InvalidCheckpoint(&'static str),
+    /// An attempted commit is behind the last durable checkpoint.
+    CheckpointRegression {
+        committed: u64,
+        attempted: u64,
+    },
 }
 
 #[cfg(test)]
@@ -135,6 +142,16 @@ impl fmt::Display for WalError {
                 write!(formatter, "unexpected WAL lane id {lane_id}")
             }
             Self::InvalidConfig(reason) => write!(formatter, "invalid WAL config: {reason}"),
+            Self::InvalidCheckpoint(reason) => {
+                write!(formatter, "invalid WAL checkpoint: {reason}")
+            }
+            Self::CheckpointRegression {
+                committed,
+                attempted,
+            } => write!(
+                formatter,
+                "WAL checkpoint regression: attempted sequence {attempted} is behind committed {committed}"
+            ),
         }
     }
 }

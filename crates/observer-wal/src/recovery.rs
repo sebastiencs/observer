@@ -34,6 +34,12 @@ pub(crate) fn lane_directory(root: &Path) -> PathBuf {
 }
 
 pub(crate) fn discover_segments(lane_dir: &Path) -> Result<Vec<FoundSegment>, WalError> {
+    let found = list_segments(lane_dir)?;
+    validate_discovered(&found)?;
+    Ok(found)
+}
+
+pub(crate) fn list_segments(lane_dir: &Path) -> Result<Vec<FoundSegment>, WalError> {
     if !lane_dir.exists() {
         return Ok(Vec::new());
     }
@@ -59,7 +65,6 @@ pub(crate) fn discover_segments(lane_dir: &Path) -> Result<Vec<FoundSegment>, Wa
     }
 
     found.sort_by_key(|segment| segment.id);
-    validate_discovered(&found)?;
     Ok(found)
 }
 
@@ -76,6 +81,13 @@ fn parse_segment_name(name: &str) -> Option<(u64, SegmentKind)> {
 }
 
 fn validate_discovered(found: &[FoundSegment]) -> Result<(), WalError> {
+    if found.first().is_some_and(|segment| segment.id != 0) {
+        return Err(WalError::Corrupt("missing or out-of-order segment id"));
+    }
+    validate_contiguous_suffix(found)
+}
+
+pub(crate) fn validate_contiguous_suffix(found: &[FoundSegment]) -> Result<(), WalError> {
     let mut previous: Option<u64> = None;
     let mut open_count = 0;
     for segment in found {
@@ -86,8 +98,6 @@ fn validate_discovered(found: &[FoundSegment]) -> Result<(), WalError> {
             if segment.id != previous + 1 {
                 return Err(WalError::Corrupt("missing or out-of-order segment id"));
             }
-        } else if segment.id != 0 {
-            return Err(WalError::Corrupt("missing or out-of-order segment id"));
         }
         if segment.kind == SegmentKind::Open {
             open_count += 1;
