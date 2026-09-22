@@ -5,6 +5,10 @@
 //! active and frozen batches with the Parquet files named by published commits. A file that is not
 //! named by a commit is not read.
 //!
+//! The scan projects only the physical columns DataFusion asks for. Comparisons on
+//! `event_time_unix_nano` drop event hours that cannot match; DataFusion applies that nanosecond
+//! predicate again. Every other filter stays above the scan.
+//!
 //! Results have no order unless the SQL contains `ORDER BY`. The tenant is the store passed to
 //! `execute`, never a value inside the SQL. Only one `SELECT` statement is accepted.
 //!
@@ -17,6 +21,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
+use datafusion::common::ScalarValue;
 use datafusion::datasource::MemTable;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
@@ -25,7 +30,7 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
-use datafusion::logical_expr::{Expr, TableType};
+use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
@@ -33,9 +38,12 @@ use datafusion::physical_plan::{
 };
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::Statement;
-use observer_storage::{Scan, Store, StoreError, StoreSnapshot, align_batch};
+use observer_storage::{
+    COLUMN_EVENT_TIME_UNIX_NANO, EventHour, Scan, Store, StoreError, StoreSnapshot, align_batch,
+};
 
 const LOGS_TABLE: &str = "logs";
+const NANOS_PER_HOUR: u64 = 3_600_000_000_000;
 
 /// Shared DataFusion resources for tenant-scoped SQL execution.
 pub struct QueryEngine {
@@ -128,6 +136,7 @@ impl QueryEngine {
 
 /// One event hour's visible batches and commit-referenced Parquet files.
 struct HourPartition {
+    hour: EventHour,
     files: Vec<std::path::PathBuf>,
     batches: Vec<RecordBatch>,
 }
@@ -177,6 +186,7 @@ impl ObserverTableProvider {
                 );
             }
             hours.push(HourPartition {
+                hour: hour.hour,
                 files: hour.files,
                 batches,
             });
@@ -200,22 +210,235 @@ impl TableProvider for ObserverTableProvider {
         TableType::Base
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|filter| {
+                if time_predicate(filter).is_some() {
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         _limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        if self.hours.is_empty() {
+        let window = hour_window(filters);
+        let selected: Vec<_> = self
+            .hours
+            .iter()
+            .filter(|hour| window.contains(hour.hour))
+            .collect();
+        if selected.is_empty() {
             let table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![]])?;
             return table.scan(state, projection, &[], None).await;
         }
-        let mut hour_plans = Vec::with_capacity(self.hours.len());
-        for hour in &self.hours {
+        let mut hour_plans = Vec::with_capacity(selected.len());
+        for hour in selected {
             hour_plans.push(hour_plan(state, &self.schema, hour, projection).await?);
         }
         UnionExec::try_new(hour_plans)
+    }
+}
+
+/// Inclusive start and exclusive end of the event hours a predicate can touch.
+#[derive(Clone, Copy)]
+struct HourWindow {
+    from: Option<EventHour>,
+    to: Option<EventHour>,
+    impossible: bool,
+}
+
+impl HourWindow {
+    fn unbounded() -> Self {
+        Self {
+            from: None,
+            to: None,
+            impossible: false,
+        }
+    }
+
+    fn contains(self, hour: EventHour) -> bool {
+        !self.impossible
+            && self.from.is_none_or(|start| hour >= start)
+            && self.to.is_none_or(|end| hour < end)
+    }
+
+    fn intersect(&mut self, other: Self) {
+        if other.impossible {
+            self.impossible = true;
+            return;
+        }
+        self.from = match (self.from, other.from) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (Some(bound), None) | (None, Some(bound)) => Some(bound),
+            (None, None) => None,
+        };
+        self.to = match (self.to, other.to) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(bound), None) | (None, Some(bound)) => Some(bound),
+            (None, None) => None,
+        };
+        if let (Some(from), Some(to)) = (self.from, self.to)
+            && from >= to
+        {
+            self.impossible = true;
+        }
+    }
+}
+
+fn hour_window(filters: &[Expr]) -> HourWindow {
+    let mut window = HourWindow::unbounded();
+    for filter in filters {
+        if let Some(bound) = time_predicate(filter) {
+            window.intersect(bound);
+        }
+    }
+    window
+}
+
+fn time_predicate(expr: &Expr) -> Option<HourWindow> {
+    let mut window = HourWindow::unbounded();
+    time_predicate_into(expr, &mut window).then_some(window)
+}
+
+fn time_predicate_into(expr: &Expr, window: &mut HourWindow) -> bool {
+    match expr {
+        Expr::BinaryExpr(binary) if binary.op == Operator::And => {
+            time_predicate_into(&binary.left, window) && time_predicate_into(&binary.right, window)
+        }
+        Expr::Between(between) if !between.negated => {
+            let Some(low) = literal_u64(&between.low) else {
+                return false;
+            };
+            let Some(high) = literal_u64(&between.high) else {
+                return false;
+            };
+            if !is_event_time(&between.expr) {
+                return false;
+            }
+            window.intersect(bound_window(Operator::GtEq, low));
+            window.intersect(bound_window(Operator::LtEq, high));
+            true
+        }
+        Expr::BinaryExpr(binary) => {
+            let compared = match (bare(&binary.left), binary.op, bare(&binary.right)) {
+                (column, operator, literal)
+                    if is_event_time(column) && is_order_comparison(operator) =>
+                {
+                    literal_u64(literal).map(|timestamp| (operator, timestamp))
+                }
+                (literal, operator, column)
+                    if is_event_time(column) && is_order_comparison(operator) =>
+                {
+                    flip_comparison(operator).and_then(|operator| {
+                        literal_u64(literal).map(|timestamp| (operator, timestamp))
+                    })
+                }
+                _ => None,
+            };
+            let Some((operator, timestamp)) = compared else {
+                return false;
+            };
+            window.intersect(bound_window(operator, timestamp));
+            true
+        }
+        _ => false,
+    }
+}
+
+fn bound_window(operator: Operator, timestamp: u64) -> HourWindow {
+    let mut window = HourWindow::unbounded();
+    match operator {
+        Operator::GtEq => window.from = Some(EventHour::containing(timestamp)),
+        Operator::Gt => match timestamp.checked_add(1) {
+            Some(next) => window.from = Some(EventHour::containing(next)),
+            None => window.impossible = true,
+        },
+        Operator::LtEq => {
+            window.to = hour_after(EventHour::containing(timestamp));
+        }
+        Operator::Lt => match timestamp.checked_sub(1) {
+            Some(previous) => window.to = hour_after(EventHour::containing(previous)),
+            None => window.impossible = true,
+        },
+        Operator::Eq => {
+            let hour = EventHour::containing(timestamp);
+            window.from = Some(hour);
+            window.to = hour_after(hour);
+        }
+        _ => window.impossible = true,
+    }
+    if let (Some(from), Some(to)) = (window.from, window.to)
+        && from >= to
+    {
+        window.impossible = true;
+    }
+    window
+}
+
+fn hour_after(hour: EventHour) -> Option<EventHour> {
+    hour.start_unix_nano()
+        .checked_add(NANOS_PER_HOUR)
+        .map(EventHour::containing)
+}
+
+fn is_event_time(expr: &Expr) -> bool {
+    bare(expr)
+        .try_as_col()
+        .is_some_and(|column| column.name == COLUMN_EVENT_TIME_UNIX_NANO)
+}
+
+fn bare(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Cast(cast) => bare(&cast.expr),
+        Expr::TryCast(cast) => bare(&cast.expr),
+        other => other,
+    }
+}
+
+fn literal_u64(expr: &Expr) -> Option<u64> {
+    let Expr::Literal(value, _) = bare(expr) else {
+        return None;
+    };
+    match value {
+        ScalarValue::UInt64(Some(value)) => Some(*value),
+        ScalarValue::UInt32(Some(value)) => Some(u64::from(*value)),
+        ScalarValue::UInt16(Some(value)) => Some(u64::from(*value)),
+        ScalarValue::UInt8(Some(value)) => Some(u64::from(*value)),
+        ScalarValue::Int64(Some(value)) => u64::try_from(*value).ok(),
+        ScalarValue::Int32(Some(value)) => u64::try_from(*value).ok(),
+        ScalarValue::Int16(Some(value)) => u64::try_from(*value).ok(),
+        ScalarValue::Int8(Some(value)) => u64::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+fn is_order_comparison(operator: Operator) -> bool {
+    matches!(
+        operator,
+        Operator::Eq | Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+    )
+}
+
+fn flip_comparison(operator: Operator) -> Option<Operator> {
+    match operator {
+        Operator::Lt => Some(Operator::Gt),
+        Operator::LtEq => Some(Operator::GtEq),
+        Operator::Gt => Some(Operator::Lt),
+        Operator::GtEq => Some(Operator::LtEq),
+        Operator::Eq => Some(Operator::Eq),
+        _ => None,
     }
 }
 
@@ -310,6 +533,10 @@ mod tests {
 
     use arrow_array::{Array, Int64Array, StringArray, UInt64Array};
     use bytes::Bytes;
+    use datafusion::datasource::physical_plan::FileScanConfig;
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::execution::context::SessionContext;
+    use datafusion::physical_plan::ExecutionPlan;
     use datafusion::physical_plan::common::collect;
     use observer_protocol::otlp::{
         AnyValue, ExportLogsServiceRequest, KeyValue, LogRecord, ResourceLogs, ScopeLogs, any_value,
@@ -320,7 +547,7 @@ mod tests {
     use observer_wal::{Frame, FrameSignal};
     use prost::Message;
 
-    use super::{QueryEngine, QueryError};
+    use super::{ObserverTableProvider, QueryEngine, QueryError};
 
     const HOUR: u64 = 3_600_000_000_000;
 
@@ -595,6 +822,158 @@ mod tests {
         )
         .await;
         assert_eq!(i64_column(&reopened, "rows"), vec![Some(0)]);
+    }
+
+    async fn physical_plan(store: Arc<Store>, sql: &str) -> Arc<dyn ExecutionPlan> {
+        let snapshot = store.snapshot().expect("snapshot");
+        let provider = ObserverTableProvider::new(store, snapshot).expect("provider");
+        let context = SessionContext::new();
+        context
+            .register_table("logs", Arc::new(provider))
+            .expect("register");
+        let frame = context.sql(sql).await.expect("sql");
+        frame.create_physical_plan().await.expect("plan")
+    }
+
+    struct ScanShape {
+        files: Vec<String>,
+        schemas: Vec<Vec<String>>,
+        memory_scans: usize,
+    }
+
+    fn scan_shape(plan: &Arc<dyn ExecutionPlan>) -> ScanShape {
+        let mut shape = ScanShape {
+            files: Vec::new(),
+            schemas: Vec::new(),
+            memory_scans: 0,
+        };
+        collect_scans(plan, &mut shape);
+        shape
+    }
+
+    fn collect_scans(plan: &Arc<dyn ExecutionPlan>, shape: &mut ScanShape) {
+        if let Some(exec) = plan.downcast_ref::<DataSourceExec>() {
+            shape.schemas.push(
+                exec.schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().clone())
+                    .collect(),
+            );
+            if let Some(config) = exec.data_source().downcast_ref::<FileScanConfig>() {
+                for group in &config.file_groups {
+                    for file in group.files() {
+                        shape.files.push(file.object_meta.location.to_string());
+                    }
+                }
+            } else {
+                shape.memory_scans += 1;
+            }
+        }
+        for child in plan.children() {
+            collect_scans(child, shape);
+        }
+    }
+
+    #[tokio::test]
+    async fn projection_reads_only_selected_columns() {
+        let store = store();
+        store.append(&frame(0, 0, Vec::new())).expect("append");
+        let plan = physical_plan(Arc::clone(&store), "SELECT wal_sequence FROM logs").await;
+        let shape = scan_shape(&plan);
+        assert!(!shape.schemas.is_empty());
+        for schema in &shape.schemas {
+            assert_eq!(schema.as_slice(), ["wal_sequence"]);
+        }
+        let rows = batches(store, "SELECT wal_sequence FROM logs").await;
+        assert_eq!(u64_column(&rows, "wal_sequence"), [0]);
+    }
+
+    #[tokio::test]
+    async fn event_time_bounds_skip_hours_and_keep_boundary_rows() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = open_at(directory.path());
+        store.append(&frame(0, 1, Vec::new())).expect("append");
+        store
+            .append(&frame(1, HOUR - 1, Vec::new()))
+            .expect("hour boundary");
+        store.rotate().expect("rotate");
+        store.publish(&PublishOptions::default()).expect("publish");
+        store.append(&frame(2, HOUR, Vec::new())).expect("append");
+        store.rotate().expect("rotate");
+        store.publish(&PublishOptions::default()).expect("publish");
+        store.append(&frame(3, 2, Vec::new())).expect("hour tail");
+
+        let lower = format!(
+            "SELECT wal_sequence FROM logs WHERE event_time_unix_nano >= {HOUR} ORDER BY wal_sequence"
+        );
+        let shape = scan_shape(&physical_plan(Arc::clone(&store), &lower).await);
+        let files = shape.files.join(" ");
+        assert!(files.contains("hour=01"), "{files}");
+        assert!(!files.contains("hour=00"), "{files}");
+        assert_eq!(shape.memory_scans, 0);
+        for schema in &shape.schemas {
+            assert!(schema.iter().any(|name| name == "wal_sequence"));
+            assert!(schema.iter().any(|name| name == "event_time_unix_nano"));
+            assert!(!schema.iter().any(|name| name == "body"));
+        }
+        let rows = batches(Arc::clone(&store), &lower).await;
+        assert_eq!(u64_column(&rows, "wal_sequence"), [2]);
+
+        let inside =
+            "SELECT wal_sequence FROM logs WHERE event_time_unix_nano > 1 ORDER BY wal_sequence";
+        let shape = scan_shape(&physical_plan(Arc::clone(&store), inside).await);
+        let files = shape.files.join(" ");
+        assert!(files.contains("hour=00"), "{files}");
+        assert!(files.contains("hour=01"), "{files}");
+        assert!(shape.memory_scans > 0);
+        let rows = batches(Arc::clone(&store), inside).await;
+        assert_eq!(u64_column(&rows, "wal_sequence"), [1, 2, 3]);
+
+        let upper = format!(
+            "SELECT wal_sequence FROM logs WHERE event_time_unix_nano < {HOUR} ORDER BY wal_sequence"
+        );
+        let shape = scan_shape(&physical_plan(Arc::clone(&store), &upper).await);
+        let files = shape.files.join(" ");
+        assert!(files.contains("hour=00"), "{files}");
+        assert!(!files.contains("hour=01"), "{files}");
+        let rows = batches(Arc::clone(&store), &upper).await;
+        assert_eq!(u64_column(&rows, "wal_sequence"), [0, 1, 3]);
+
+        let past_boundary = format!(
+            "SELECT wal_sequence FROM logs WHERE event_time_unix_nano > {} ORDER BY wal_sequence",
+            HOUR - 1
+        );
+        let shape = scan_shape(&physical_plan(Arc::clone(&store), &past_boundary).await);
+        let files = shape.files.join(" ");
+        assert!(!files.contains("hour=00"), "{files}");
+        assert!(files.contains("hour=01"), "{files}");
+        let rows = batches(Arc::clone(&store), &past_boundary).await;
+        assert_eq!(u64_column(&rows, "wal_sequence"), [2]);
+
+        let equal = format!(
+            "SELECT wal_sequence FROM logs WHERE event_time_unix_nano = {HOUR} ORDER BY wal_sequence"
+        );
+        let shape = scan_shape(&physical_plan(Arc::clone(&store), &equal).await);
+        let files = shape.files.join(" ");
+        assert!(!files.contains("hour=00"), "{files}");
+        let rows = batches(Arc::clone(&store), &equal).await;
+        assert_eq!(u64_column(&rows, "wal_sequence"), [2]);
+
+        let narrowed = format!(
+            "SELECT wal_sequence FROM logs WHERE event_time_unix_nano >= {HOUR} AND body = 'row-2' ORDER BY wal_sequence"
+        );
+        let shape = scan_shape(&physical_plan(Arc::clone(&store), &narrowed).await);
+        let files = shape.files.join(" ");
+        assert!(!files.contains("hour=00"), "{files}");
+        assert!(
+            shape
+                .schemas
+                .iter()
+                .any(|schema| schema.iter().any(|name| name == "body"))
+        );
+        let rows = batches(store, &narrowed).await;
+        assert_eq!(u64_column(&rows, "wal_sequence"), [2]);
     }
 
     #[tokio::test]
