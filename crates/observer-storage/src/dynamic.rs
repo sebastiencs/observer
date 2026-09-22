@@ -58,6 +58,15 @@ impl AttributeSource {
             Self::Log => 3,
         }
     }
+
+    fn from_name(value: &str) -> Option<Self> {
+        match value {
+            "resource" => Some(Self::Resource),
+            "scope" => Some(Self::Scope),
+            "log" => Some(Self::Log),
+            _ => None,
+        }
+    }
 }
 
 /// Physical type of one dynamic leaf.
@@ -109,6 +118,18 @@ impl DynamicKind {
             Self::String => 4,
             Self::Bytes => 5,
             Self::Json => 6,
+        }
+    }
+
+    fn from_name(value: &str) -> Option<Self> {
+        match value {
+            "bool" => Some(Self::Bool),
+            "i64" => Some(Self::Int64),
+            "f64" => Some(Self::Float64),
+            "string" => Some(Self::String),
+            "bytes" => Some(Self::Bytes),
+            "json" => Some(Self::Json),
+            _ => None,
         }
     }
 }
@@ -321,6 +342,17 @@ pub fn record_dynamic_values<'a>(
             )
         })
         .collect())
+}
+
+/// Read the dynamic identity stored in an Arrow field's metadata.
+#[must_use]
+pub fn dynamic_identity(field: &Field) -> Option<DynamicIdentity> {
+    let metadata = field.metadata();
+    Some(DynamicIdentity {
+        source: AttributeSource::from_name(metadata.get(FIELD_SOURCE)?)?,
+        path: serde_json::from_str(metadata.get(FIELD_PATH)?).ok()?,
+        kind: DynamicKind::from_name(metadata.get(FIELD_KIND)?)?,
+    })
 }
 
 /// Admit a deterministic subset of field identities and assign physical names.

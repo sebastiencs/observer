@@ -1,9 +1,13 @@
 //! Per-tenant active and frozen Arrow generations.
 //!
 //! The caller decodes a WAL frame, then appends the resulting [`DecodedLogs`]. A generation owns a
-//! contiguous exclusive sequence range. The frame that crosses the row or byte limit stays in the
-//! active generation, and that generation then freezes. Age freezes a generation that already holds
-//! frames before the next frame starts a new window. An empty generation does not rotate.
+//! contiguous exclusive sequence range and one dynamic schema. New attribute fields are admitted
+//! until the generation column cap; later fields stay in the JSON fallback columns. A normalized
+//! name collision renames every member of that group and rebuilds batch schemas around the same
+//! arrays. Freezing aligns every batch to the union schema, inserting typed nulls for columns a
+//! batch does not contain. The frame that crosses the row or byte limit stays in the active
+//! generation, and that generation then freezes. Age freezes a generation that already holds frames
+//! before the next frame starts a new window. An empty generation does not rotate.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -16,9 +20,13 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use arrow_array::RecordBatch;
+use arrow_array::{RecordBatch, new_null_array};
+use arrow_schema::{DataType, Schema, SchemaRef};
 
-use crate::{DecodedLogs, EventHour};
+use crate::{
+    DecodedLogs, DynamicError, DynamicField, DynamicIdentity, EventHour, discover_dynamic_schema,
+    dynamic_identity, logs_batch_schema, logs_schema,
+};
 
 /// Upper bounds that rotate or pause one memtable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,6 +39,11 @@ pub struct MemtableConfig {
     pub max_age: Duration,
     /// Maximum number of frozen generations waiting to be released.
     pub max_frozen: usize,
+    /// Maximum number of dynamic attribute columns admitted into one generation.
+    ///
+    /// Fields past this limit are removed from the stored batches and remain in the JSON fallback
+    /// columns. Already admitted fields stay when a later frame arrives.
+    pub max_dynamic_columns: usize,
 }
 
 /// Clock used to decide age rotation.
@@ -93,6 +106,10 @@ pub enum MemtableError {
     SequenceOverflow { sequence: u64 },
     /// Freezing this append or rotation would exceed `max_frozen`. Nothing was stored.
     FrozenLimit,
+    /// A batch does not use the core logs schema, or a dynamic column has no identity metadata.
+    IncompatibleBatch(String),
+    /// Collision suffixes could not be assigned for the generation schema.
+    Dynamic(DynamicError),
 }
 
 impl fmt::Display for MemtableError {
@@ -120,11 +137,33 @@ impl fmt::Display for MemtableError {
                 )
             }
             Self::FrozenLimit => formatter.write_str("frozen generation limit has been reached"),
+            Self::IncompatibleBatch(detail) => {
+                write!(formatter, "incompatible log batch: {detail}")
+            }
+            Self::Dynamic(error) => write!(formatter, "dynamic log columns: {error}"),
         }
     }
 }
 
-impl Error for MemtableError {}
+impl From<DynamicError> for MemtableError {
+    fn from(error: DynamicError) -> Self {
+        Self::Dynamic(error)
+    }
+}
+
+impl Error for MemtableError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Dynamic(error) => Some(error),
+            Self::FrozenLimitZero
+            | Self::TenantMismatch { .. }
+            | Self::NonContiguous { .. }
+            | Self::SequenceOverflow { .. }
+            | Self::FrozenLimit
+            | Self::IncompatibleBatch(_) => None,
+        }
+    }
+}
 
 /// Result of storing one decoded frame.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -163,6 +202,15 @@ pub struct Generation {
     pub bytes: u64,
     /// Clock time when this generation accepted its first frame.
     pub opened_at_unix_nanos: u64,
+    /// Admitted dynamic columns in physical-name order.
+    pub dynamic_fields: Vec<DynamicField>,
+    /// Core columns plus [`Generation::dynamic_fields`].
+    ///
+    /// While the generation is active, an individual batch can omit a dynamic column. Freezing
+    /// aligns every batch to this schema.
+    pub schema: SchemaRef,
+    /// BLAKE3 of [`Generation::schema`]. The same admitted fields produce the same fingerprint.
+    pub fingerprint: String,
     /// Hour batches in UTC hour order. Each batch list preserves append order.
     pub partitions: Vec<GenerationPartition>,
 }
@@ -238,9 +286,15 @@ impl Memtable {
         }
 
         let now = self.clock.unix_nanos();
-        let frame_rows = frame_rows(logs);
-        let frame_bytes = frame_bytes(logs);
         let age_freeze = self.active.has_frames() && self.age_reached(now);
+        let state = if age_freeze {
+            SchemaState::initial()
+        } else {
+            self.active.schema_state()
+        };
+        let projected = state.project(logs, self.config.max_dynamic_columns)?;
+        let frame_rows = projected.rows();
+        let frame_bytes = projected.bytes();
         let rows_before = if age_freeze { 0 } else { self.active.rows };
         let bytes_before = if age_freeze { 0 } else { self.active.bytes };
         let size_freeze = rows_before.saturating_add(frame_rows) > self.config.max_rows
@@ -260,13 +314,7 @@ impl Memtable {
         self.active.next_sequence = next_sequence;
         self.active.rows = self.active.rows.saturating_add(frame_rows);
         self.active.bytes = self.active.bytes.saturating_add(frame_bytes);
-        for partition in &logs.partitions {
-            self.active
-                .partitions
-                .entry(partition.hour)
-                .or_default()
-                .push(Arc::new(partition.batch.clone()));
-        }
+        self.active.store_projected(projected);
         self.next_sequence = Some(next_sequence);
         let generation_id = self.active.id;
         if size_freeze {
@@ -322,6 +370,7 @@ impl Memtable {
 
     fn seal_active(&mut self) {
         debug_assert!(self.active.has_frames());
+        self.active.align_batches();
         let replacement = self.open_generation();
         let sealed = std::mem::replace(&mut self.active, replacement);
         self.frozen.push_back(sealed);
@@ -341,11 +390,16 @@ struct ActiveGeneration {
     rows: u64,
     bytes: u64,
     opened_at_unix_nanos: u64,
+    admitted: Vec<DynamicIdentity>,
+    fields: Vec<DynamicField>,
+    schema: SchemaRef,
+    fingerprint: String,
     partitions: BTreeMap<EventHour, Vec<Arc<RecordBatch>>>,
 }
 
 impl ActiveGeneration {
     fn empty(id: u64) -> Self {
+        let state = SchemaState::initial();
         Self {
             id,
             first_sequence: 0,
@@ -353,8 +407,59 @@ impl ActiveGeneration {
             rows: 0,
             bytes: 0,
             opened_at_unix_nanos: 0,
+            admitted: state.admitted,
+            fields: state.fields,
+            schema: state.schema,
+            fingerprint: state.fingerprint,
             partitions: BTreeMap::new(),
         }
+    }
+
+    fn schema_state(&self) -> SchemaState {
+        SchemaState {
+            admitted: self.admitted.clone(),
+            fields: self.fields.clone(),
+            schema: Arc::clone(&self.schema),
+            fingerprint: self.fingerprint.clone(),
+        }
+    }
+
+    fn store_projected(&mut self, projected: ProjectedFrame) {
+        let renamed = names_changed(&self.fields, &projected.fields);
+        self.admitted = projected.admitted;
+        self.fields = projected.fields;
+        self.schema = projected.schema;
+        self.fingerprint = projected.fingerprint;
+        if renamed {
+            let fields = self.fields.clone();
+            for batches in self.partitions.values_mut() {
+                for batch in batches.iter_mut() {
+                    *batch = Arc::new(rename_batch(batch, &fields));
+                }
+            }
+        }
+        for (hour, batch) in projected.partitions {
+            self.partitions
+                .entry(hour)
+                .or_default()
+                .push(Arc::new(batch));
+        }
+    }
+
+    fn align_batches(&mut self) {
+        let schema = Arc::clone(&self.schema);
+        let mut bytes = 0u64;
+        for batches in self.partitions.values_mut() {
+            for batch in batches.iter_mut() {
+                if batch.schema().as_ref() != schema.as_ref() {
+                    let aligned = align_batch(batch, Arc::clone(&schema))
+                        .expect("generation batches align to the union schema");
+                    *batch = Arc::new(aligned);
+                }
+                bytes += u64::try_from(batch.get_array_memory_size()).expect("batch bytes");
+            }
+        }
+        self.bytes = bytes;
     }
 
     fn has_frames(&self) -> bool {
@@ -369,6 +474,9 @@ impl ActiveGeneration {
             rows: self.rows,
             bytes: self.bytes,
             opened_at_unix_nanos: self.opened_at_unix_nanos,
+            dynamic_fields: self.fields.clone(),
+            schema: Arc::clone(&self.schema),
+            fingerprint: self.fingerprint.clone(),
             partitions: self
                 .partitions
                 .iter()
@@ -392,20 +500,266 @@ impl fmt::Debug for Memtable {
     }
 }
 
-fn frame_rows(logs: &DecodedLogs) -> u64 {
-    logs.partitions
-        .iter()
-        .map(|partition| u64::try_from(partition.batch.num_rows()).expect("row count"))
-        .sum()
+struct SchemaState {
+    admitted: Vec<DynamicIdentity>,
+    fields: Vec<DynamicField>,
+    schema: SchemaRef,
+    fingerprint: String,
 }
 
-fn frame_bytes(logs: &DecodedLogs) -> u64 {
-    logs.partitions
-        .iter()
-        .map(|partition| {
-            u64::try_from(partition.batch.get_array_memory_size()).expect("batch bytes")
+impl SchemaState {
+    fn initial() -> Self {
+        let schema = logs_schema();
+        let fingerprint = schema_fingerprint(&schema);
+        Self {
+            admitted: Vec::new(),
+            fields: Vec::new(),
+            schema,
+            fingerprint,
+        }
+    }
+
+    fn project(
+        &self,
+        logs: &DecodedLogs,
+        max_columns: usize,
+    ) -> Result<ProjectedFrame, MemtableError> {
+        let mut admitted = self.admitted.clone();
+        let mut overflow = Vec::new();
+        for partition in &logs.partitions {
+            if !core_columns_match(&partition.batch) {
+                return Err(MemtableError::IncompatibleBatch(
+                    "batch does not start with the core logs schema".to_owned(),
+                ));
+            }
+            for field in partition
+                .batch
+                .schema()
+                .fields()
+                .iter()
+                .skip(logs_schema().fields().len())
+            {
+                let Some(identity) = dynamic_identity(field) else {
+                    return Err(MemtableError::IncompatibleBatch(format!(
+                        "dynamic column {} has no attribute identity",
+                        field.name()
+                    )));
+                };
+                if admitted.iter().any(|admitted| admitted == &identity)
+                    || overflow.iter().any(|skipped| skipped == &identity)
+                {
+                    continue;
+                }
+                if admitted.len() >= max_columns {
+                    overflow.push(identity);
+                } else {
+                    admitted.push(identity);
+                }
+            }
+        }
+        let named = discover_dynamic_schema(admitted.clone(), admitted.len())?;
+        let schema = logs_batch_schema(
+            &named
+                .fields
+                .iter()
+                .map(DynamicField::arrow_field)
+                .collect::<Vec<_>>(),
+        );
+        let partitions = logs
+            .partitions
+            .iter()
+            .map(|partition| {
+                Ok((
+                    partition.hour,
+                    project_batch(&partition.batch, &named.fields)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, MemtableError>>()?;
+        Ok(ProjectedFrame {
+            admitted,
+            fields: named.fields,
+            fingerprint: schema_fingerprint(&schema),
+            schema,
+            partitions,
         })
-        .sum()
+    }
+}
+
+struct ProjectedFrame {
+    admitted: Vec<DynamicIdentity>,
+    fields: Vec<DynamicField>,
+    schema: SchemaRef,
+    fingerprint: String,
+    partitions: Vec<(EventHour, RecordBatch)>,
+}
+
+impl ProjectedFrame {
+    fn rows(&self) -> u64 {
+        self.partitions
+            .iter()
+            .map(|(_, batch)| u64::try_from(batch.num_rows()).expect("row count"))
+            .sum()
+    }
+
+    fn bytes(&self) -> u64 {
+        self.partitions
+            .iter()
+            .map(|(_, batch)| u64::try_from(batch.get_array_memory_size()).expect("batch bytes"))
+            .sum()
+    }
+}
+
+/// Reorder `batch` to `schema` and fill missing nullable columns with typed nulls.
+///
+/// # Errors
+///
+/// Returns [`MemtableError::IncompatibleBatch`] when a required column is missing or a present
+/// column has a different Arrow type.
+pub fn align_batch(batch: &RecordBatch, schema: SchemaRef) -> Result<RecordBatch, MemtableError> {
+    let mut columns = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        if let Some(column) = batch.column_by_name(field.name()) {
+            if column.data_type() != field.data_type() {
+                return Err(MemtableError::IncompatibleBatch(format!(
+                    "column {} has type {:?}, schema expects {:?}",
+                    field.name(),
+                    column.data_type(),
+                    field.data_type()
+                )));
+            }
+            columns.push(Arc::clone(column));
+        } else if field.is_nullable() {
+            columns.push(new_null_array(field.data_type(), batch.num_rows()));
+        } else {
+            return Err(MemtableError::IncompatibleBatch(format!(
+                "missing required column {}",
+                field.name()
+            )));
+        }
+    }
+    RecordBatch::try_new(schema, columns)
+        .map_err(|error| MemtableError::IncompatibleBatch(error.to_string()))
+}
+
+fn project_batch(
+    batch: &RecordBatch,
+    fields: &[DynamicField],
+) -> Result<RecordBatch, MemtableError> {
+    let mut columns = Vec::new();
+    let mut projected = Vec::new();
+    for (index, field) in batch.schema().fields().iter().enumerate() {
+        if let Some(identity) = dynamic_identity(field) {
+            let Some(named) = fields
+                .iter()
+                .find(|candidate| candidate.identity == identity)
+            else {
+                continue;
+            };
+            projected.push(named.arrow_field());
+        } else {
+            projected.push((**field).clone());
+        }
+        columns.push(Arc::clone(batch.column(index)));
+    }
+    if projected_fields_match(batch, &projected) {
+        return Ok(batch.clone());
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(projected)), columns)
+        .map_err(|error| MemtableError::IncompatibleBatch(error.to_string()))
+}
+
+fn projected_fields_match(batch: &RecordBatch, projected: &[arrow_schema::Field]) -> bool {
+    batch.schema().fields().len() == projected.len()
+        && batch
+            .schema()
+            .fields()
+            .iter()
+            .zip(projected)
+            .all(|(current, projected)| current.as_ref() == projected)
+}
+
+fn rename_batch(batch: &RecordBatch, fields: &[DynamicField]) -> RecordBatch {
+    project_batch(batch, fields).expect("renamed batch keeps its admitted columns")
+}
+
+fn names_changed(current: &[DynamicField], updated: &[DynamicField]) -> bool {
+    current.iter().any(|field| {
+        updated
+            .iter()
+            .find(|candidate| candidate.identity == field.identity)
+            .is_none_or(|candidate| candidate.physical_name != field.physical_name)
+    })
+}
+
+fn core_columns_match(batch: &RecordBatch) -> bool {
+    let core = logs_schema();
+    batch.schema().fields().len() >= core.fields().len()
+        && batch
+            .schema()
+            .fields()
+            .iter()
+            .zip(core.fields())
+            .all(|(actual, expected)| actual.as_ref() == expected.as_ref())
+}
+
+fn schema_fingerprint(schema: &Schema) -> String {
+    let mut hasher = blake3::Hasher::new();
+    let count = u32::try_from(schema.fields().len()).expect("field count");
+    hasher.update(&count.to_be_bytes());
+    for field in schema.fields() {
+        write_fingerprint_str(&mut hasher, field.name());
+        write_fingerprint_type(&mut hasher, field.data_type());
+        hasher.update(&[u8::from(field.is_nullable())]);
+        let mut metadata: Vec<_> = field.metadata().iter().collect();
+        metadata.sort_by(|left, right| left.0.cmp(right.0));
+        let meta_count = u32::try_from(metadata.len()).expect("metadata count");
+        hasher.update(&meta_count.to_be_bytes());
+        for (key, value) in metadata {
+            write_fingerprint_str(&mut hasher, key);
+            write_fingerprint_str(&mut hasher, value);
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn write_fingerprint_str(hasher: &mut blake3::Hasher, value: &str) {
+    let length = u32::try_from(value.len()).expect("fingerprint string length");
+    hasher.update(&length.to_be_bytes());
+    hasher.update(value.as_bytes());
+}
+
+fn write_fingerprint_type(hasher: &mut blake3::Hasher, data_type: &DataType) {
+    let tag = match data_type {
+        DataType::Boolean => [1],
+        DataType::Int32 => [2],
+        DataType::Int64 => [3],
+        DataType::UInt16 => [4],
+        DataType::UInt32 => [5],
+        DataType::UInt64 => [6],
+        DataType::Float64 => [7],
+        DataType::Binary => [8],
+        DataType::Utf8 => [9],
+        DataType::FixedSizeBinary(_) => [10],
+        _ => [11],
+    };
+    hasher.update(&tag);
+    if let DataType::FixedSizeBinary(length) = data_type {
+        hasher.update(&length.to_be_bytes());
+    } else if !matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float64
+            | DataType::Binary
+            | DataType::Utf8
+            | DataType::FixedSizeBinary(_)
+    ) {
+        write_fingerprint_str(hasher, &data_type.to_string());
+    }
 }
 
 #[cfg(test)]
@@ -414,11 +768,15 @@ mod tests {
         Appended, Clock, Generation, ManualClock, Memtable, MemtableConfig, MemtableError,
         SystemClock,
     };
-    use crate::{DynamicLimits, EventHour, decode_logs_frame};
-    use arrow_array::{Array, StringArray};
+    use crate::{
+        COLUMN_LOG_ATTRIBUTES, DynamicIdentity, DynamicLimits, EventHour, decode_logs_frame,
+        discover_dynamic_schema, dynamic_identity,
+    };
+    use arrow_array::{Array, Int64Array, StringArray};
     use bytes::Bytes;
     use observer_protocol::otlp::{
-        AnyValue, ExportLogsServiceRequest, LogRecord, ResourceLogs, ScopeLogs, any_value,
+        AnyValue, ExportLogsServiceRequest, KeyValue, KeyValueList, LogRecord, ResourceLogs,
+        ScopeLogs, any_value,
     };
     use observer_wal::{Frame, FrameSignal};
     use prost::Message;
@@ -432,6 +790,7 @@ mod tests {
             max_bytes,
             max_age: Duration::from_secs(60),
             max_frozen,
+            max_dynamic_columns: 32,
         }
     }
 
@@ -796,5 +1155,297 @@ mod tests {
     #[test]
     fn system_clock_reports_unix_time() {
         assert!(SystemClock.unix_nanos() > 1_000_000_000_000_000_000);
+    }
+
+    #[test]
+    fn schema_grows_across_frames_and_freeze_fills_missing_columns() {
+        let clock = ManualClock::new(0);
+        let mut table = open(config(10, u64::MAX, 1), &clock);
+        table
+            .append(&logs_with(0, 1, vec![int_attribute("a", 1)]))
+            .expect("first");
+        let before = table.snapshot();
+        let before_active = before.active.as_ref().expect("active");
+        let before_batch = Arc::clone(&before_active.partitions[0].batches[0]);
+        let before_fingerprint = before_active.fingerprint.clone();
+        table
+            .append(&logs_with(1, 1, vec![int_attribute("b", 2)]))
+            .expect("second");
+        let active = table.snapshot().active.expect("active");
+        assert_ne!(active.fingerprint, before_fingerprint);
+        assert_eq!(active.dynamic_fields.len(), 2);
+        assert!(before_batch.column_by_name("log_b_i64").is_none());
+        assert!(Arc::ptr_eq(&before_batch, &active.partitions[0].batches[0]));
+        assert!(active.schema.field_with_name("log_b_i64").is_ok());
+        assert_eq!(
+            optional_i64(&active.partitions[0].batches[1], "log_b_i64", 0),
+            Some(2)
+        );
+
+        let fingerprint = active.fingerprint.clone();
+        table.rotate().expect("rotate").expect("sealed");
+        let frozen = &table.snapshot().frozen[0];
+        assert_eq!(frozen.fingerprint, fingerprint);
+        assert_eq!(frozen.partitions[0].batches.len(), 2);
+        for batch in &frozen.partitions[0].batches {
+            assert_eq!(batch.schema().as_ref(), frozen.schema.as_ref());
+        }
+        assert!(
+            frozen.partitions[0].batches[0]
+                .column_by_name("log_b_i64")
+                .expect("b")
+                .is_null(0)
+        );
+        assert_eq!(
+            optional_i64(&frozen.partitions[0].batches[0], "log_a_i64", 0),
+            Some(1)
+        );
+        assert_eq!(
+            optional_i64(&frozen.partitions[0].batches[1], "log_b_i64", 0),
+            Some(2)
+        );
+        assert!(
+            frozen.partitions[0].batches[1]
+                .column_by_name("log_a_i64")
+                .expect("a")
+                .is_null(0)
+        );
+    }
+
+    #[test]
+    fn late_collision_renames_stored_batches_and_preserves_snapshots() {
+        let clock = ManualClock::new(0);
+        let mut table = open(config(10, u64::MAX, 1), &clock);
+        let dotted = vec![int_attribute("http.status", 1)];
+        let nested = vec![attribute(
+            "http",
+            any_value::Value::KvlistValue(KeyValueList {
+                values: vec![int_attribute("status", 2)],
+            }),
+        )];
+        table
+            .append(&logs_with(0, 1, dotted.clone()))
+            .expect("dotted");
+        let pinned = table.snapshot();
+        let pinned_batch =
+            Arc::clone(&pinned.active.as_ref().expect("active").partitions[0].batches[0]);
+        assert_eq!(
+            pinned_batch.schema().field(logs_core_len()).name(),
+            "log_http_status_i64"
+        );
+        table
+            .append(&logs_with(1, HOUR, nested.clone()))
+            .expect("nested");
+        let active = table.snapshot().active.expect("active");
+        assert!(Arc::ptr_eq(
+            &pinned_batch,
+            &pinned.active.as_ref().expect("active").partitions[0].batches[0]
+        ));
+        assert!(!Arc::ptr_eq(
+            &pinned_batch,
+            &active.partitions[0].batches[0]
+        ));
+        assert_eq!(active.dynamic_fields.len(), 2);
+        assert!(
+            active
+                .dynamic_fields
+                .iter()
+                .all(|field| { field.physical_name.starts_with("log_http_status_i64__") })
+        );
+        let renamed = &active.partitions[0].batches[0];
+        let values: Vec<Option<i64>> = active
+            .dynamic_fields
+            .iter()
+            .map(|field| {
+                renamed
+                    .column_by_name(&field.physical_name)
+                    .map(|_| optional_i64(renamed, &field.physical_name, 0).expect("renamed value"))
+            })
+            .collect();
+        assert!(values.contains(&Some(1)));
+        assert!(values.contains(&None));
+        let identities = identities_of(&[dotted, nested]);
+        let expected = discover_dynamic_schema(identities, 2).expect("names");
+        assert_eq!(active.dynamic_fields, expected.fields);
+
+        table.rotate().expect("rotate").expect("sealed");
+        let frozen = &table.snapshot().frozen[0];
+        assert_eq!(frozen.partitions.len(), 2);
+        for batch in frozen
+            .partitions
+            .iter()
+            .flat_map(|partition| &partition.batches)
+        {
+            assert_eq!(batch.schema().as_ref(), frozen.schema.as_ref());
+            assert_eq!(batch.num_columns(), frozen.schema.fields().len());
+        }
+    }
+
+    #[test]
+    fn generation_cap_keeps_overflow_in_json_only() {
+        let clock = ManualClock::new(0);
+        let mut config = config(10, u64::MAX, 1);
+        config.max_dynamic_columns = 1;
+        let mut table = open(config, &clock);
+        table
+            .append(&logs_with(
+                0,
+                1,
+                vec![int_attribute("b", 2), int_attribute("a", 1)],
+            ))
+            .expect("capped");
+        let active = table.snapshot().active.expect("active");
+        assert_eq!(active.dynamic_fields.len(), 1);
+        assert_eq!(active.dynamic_fields[0].physical_name, "log_a_i64");
+        assert_eq!(
+            optional_i64(&active.partitions[0].batches[0], "log_a_i64", 0),
+            Some(1)
+        );
+        assert!(
+            active.partitions[0].batches[0]
+                .column_by_name("log_b_i64")
+                .is_none()
+        );
+        assert_eq!(
+            string_at(&active.partitions[0].batches[0], COLUMN_LOG_ATTRIBUTES, 0),
+            r#"{"a":1,"b":2}"#
+        );
+        table
+            .append(&logs_with(1, 1, vec![int_attribute("c", 3)]))
+            .expect("overflow");
+        let active = table.snapshot().active.expect("active");
+        assert_eq!(active.dynamic_fields.len(), 1);
+        assert!(
+            active.partitions[0].batches[1]
+                .column_by_name("log_c_i64")
+                .is_none()
+        );
+        assert_eq!(
+            string_at(&active.partitions[0].batches[1], COLUMN_LOG_ATTRIBUTES, 0),
+            r#"{"c":3}"#
+        );
+        table.rotate().expect("rotate").expect("sealed");
+        let frozen = &table.snapshot().frozen[0];
+        assert!(
+            frozen.partitions[0].batches[1]
+                .column_by_name("log_a_i64")
+                .expect("a")
+                .is_null(0)
+        );
+        assert_eq!(frozen.schema.as_ref(), active.schema.as_ref());
+    }
+
+    #[test]
+    fn fingerprint_matches_for_the_same_admitted_fields() {
+        let clock = ManualClock::new(0);
+        let mut first = open(config(10, u64::MAX, 1), &clock);
+        let mut second = open(config(10, u64::MAX, 1), &clock);
+        first
+            .append(&logs_with(0, 1, vec![int_attribute("b", 1)]))
+            .expect("b");
+        first
+            .append(&logs_with(1, 1, vec![int_attribute("a", 2)]))
+            .expect("a");
+        second
+            .append(&logs_with(0, HOUR, vec![int_attribute("a", 9)]))
+            .expect("a");
+        second
+            .append(&logs_with(1, 1, vec![int_attribute("b", 8)]))
+            .expect("b");
+        let left = first.snapshot().active.expect("first");
+        let right = second.snapshot().active.expect("second");
+        assert_eq!(left.fingerprint, right.fingerprint);
+        assert_eq!(left.schema, right.schema);
+        assert_eq!(left.dynamic_fields, right.dynamic_fields);
+    }
+
+    fn logs_with(sequence: u64, time: u64, attributes: Vec<KeyValue>) -> crate::DecodedLogs {
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: time,
+                        attributes,
+                        body: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue(format!("row-{time}"))),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        decode_logs_frame(
+            &Frame {
+                sequence,
+                signal: FrameSignal::Logs,
+                received_at_unix_nanos: 1,
+                tenant_id: "tenant-a".to_owned(),
+                payload: Bytes::from(request.encode_to_vec()),
+            },
+            DynamicLimits {
+                max_depth: 4,
+                max_columns: 64,
+            },
+        )
+        .expect("decode")
+    }
+
+    fn attribute(key: &str, value: any_value::Value) -> KeyValue {
+        KeyValue {
+            key: key.to_owned(),
+            value: Some(AnyValue { value: Some(value) }),
+            ..Default::default()
+        }
+    }
+
+    fn int_attribute(key: &str, value: i64) -> KeyValue {
+        attribute(key, any_value::Value::IntValue(value))
+    }
+
+    fn identities_of(groups: &[Vec<KeyValue>]) -> Vec<DynamicIdentity> {
+        groups
+            .iter()
+            .flat_map(|attributes| {
+                logs_with(0, 1, attributes.clone())
+                    .partitions
+                    .into_iter()
+                    .flat_map(|partition| {
+                        partition
+                            .batch
+                            .schema()
+                            .fields()
+                            .iter()
+                            .filter_map(|field| dynamic_identity(field))
+                            .collect::<Vec<_>>()
+                    })
+            })
+            .collect()
+    }
+
+    fn logs_core_len() -> usize {
+        crate::logs_schema().fields().len()
+    }
+
+    fn optional_i64(batch: &arrow_array::RecordBatch, name: &str, row: usize) -> Option<i64> {
+        let column = batch
+            .column_by_name(name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap_or_else(|| panic!("{name} is not i64"));
+        (!column.is_null(row)).then(|| column.value(row))
+    }
+
+    fn string_at(batch: &arrow_array::RecordBatch, name: &str, row: usize) -> String {
+        batch
+            .column_by_name(name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap_or_else(|| panic!("{name} is not utf8"))
+            .value(row)
+            .to_owned()
     }
 }

@@ -13,12 +13,12 @@ pub use decode::{DecodeError, DecodedLogs, DecodedPartition, decode_logs_frame};
 pub use dynamic::{
     AttributeSource, DynamicColumn, DynamicError, DynamicField, DynamicIdentity, DynamicKind,
     DynamicLimits, DynamicProjection, DynamicSchema, DynamicValue, FIELD_KIND, FIELD_PATH,
-    FIELD_SOURCE, discover_dynamic_schema, ordered_field_names, project_dynamic_fields,
-    record_dynamic_values,
+    FIELD_SOURCE, discover_dynamic_schema, dynamic_identity, ordered_field_names,
+    project_dynamic_fields, record_dynamic_values,
 };
 pub use memtable::{
     Appended, Clock, Generation, GenerationPartition, ManualClock, Memtable, MemtableConfig,
-    MemtableError, Snapshot, SystemClock,
+    MemtableError, Snapshot, SystemClock, align_batch,
 };
 pub use schema::{
     COLUMN_BODY, COLUMN_EVENT_TIME_UNIX_NANO, COLUMN_LOG_ATTRIBUTES,
