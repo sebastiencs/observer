@@ -3,7 +3,8 @@
 //! Publication writes every hour file, then the commit descriptor, and only then — under the store
 //! lock — adds the commit to the catalog and drops the frozen generation. A snapshot taken under
 //! that same lock therefore sees the generation in memory or in the catalog, and a scan reads each
-//! row once.
+//! row once. [`Store::sources`] reports those same rows grouped by event hour: memory batches plus
+//! the absolute paths of files named by published commits.
 
 use std::{
     collections::BTreeMap,
@@ -53,6 +54,21 @@ pub struct Scan {
     pub to_hour: Option<EventHour>,
 }
 
+/// Memory batches and commit-referenced Parquet files for one event hour.
+///
+/// Files are absolute paths named by published commits, oldest commit first. Batches are frozen
+/// generations and then the active generation, oldest first. Empty batches are omitted. A directory
+/// listing is never a source.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HourSources {
+    /// UTC hour these sources cover.
+    pub hour: EventHour,
+    /// Absolute paths of published Parquet files.
+    pub files: Vec<PathBuf>,
+    /// Active and frozen batches that contain at least one row.
+    pub batches: Vec<Arc<RecordBatch>>,
+}
+
 /// Point-in-time view of one tenant. Published ranges are not also present as frozen batches.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoreSnapshot {
@@ -64,6 +80,21 @@ pub struct StoreSnapshot {
     pub frozen: Vec<Generation>,
     /// Published commits, oldest range first.
     pub published: Vec<Commit>,
+}
+
+impl StoreSnapshot {
+    /// Union of every visible generation: core columns, then dynamic columns by physical name.
+    ///
+    /// Hour bounds do not remove a generation from this schema. A column that one generation lacks
+    /// stays in the union so a scan can fill it with typed nulls.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Incompatible`] when two generations give one physical name different
+    /// Arrow types.
+    pub fn schema(&self) -> Result<SchemaRef, StoreError> {
+        union_schema(visible_schemas(self))
+    }
 }
 
 /// Why the store could not append, publish, recover, or scan.
@@ -301,17 +332,18 @@ impl Store {
         snapshot: &StoreSnapshot,
         scan: &Scan,
     ) -> Result<Vec<RecordBatch>, StoreError> {
-        let pieces = pieces(snapshot, scan);
-        if pieces.is_empty() {
+        let sources = visible_sources(snapshot, scan);
+        if sources.is_empty() {
             return Ok(Vec::new());
         }
-        let union = union_schema(visible_schemas(snapshot))?;
-        let schema = projected_schema(&union, scan.columns.as_deref())?;
+        let schema = projected_schema(&snapshot.schema()?, scan.columns.as_deref())?;
         let tenant_dir = tenant_directory(&self.root, &self.tenant);
         let mut batches = Vec::new();
-        for piece in pieces {
-            match piece.origin {
-                Origin::Memory(source) => {
+        for source in sources {
+            match source {
+                Visible::Memory {
+                    batches: source, ..
+                } => {
                     for batch in source {
                         if batch.num_rows() == 0 {
                             continue;
@@ -319,8 +351,8 @@ impl Store {
                         batches.push(align_batch(batch, Arc::clone(&schema))?);
                     }
                 }
-                Origin::File(relative) => {
-                    for batch in read_parquet_batches(&tenant_dir.join(relative))? {
+                Visible::File { relative_path, .. } => {
+                    for batch in read_parquet_batches(&tenant_dir.join(relative_path))? {
                         if batch.num_rows() == 0 {
                             continue;
                         }
@@ -330,6 +362,38 @@ impl Store {
             }
         }
         Ok(batches)
+    }
+
+    /// Hour-grouped memory batches and commit-referenced Parquet paths in `snapshot`.
+    ///
+    /// Hours outside `scan` are omitted. Paths are absolute and come only from published commits.
+    #[must_use]
+    pub fn sources(&self, snapshot: &StoreSnapshot, scan: &Scan) -> Vec<HourSources> {
+        let mut hours = BTreeMap::<EventHour, HourSources>::new();
+        for source in visible_sources(snapshot, scan) {
+            match source {
+                Visible::File {
+                    hour,
+                    relative_path,
+                } => {
+                    hour_sources(&mut hours, hour)
+                        .files
+                        .push(tenant_directory(&self.root, &self.tenant).join(relative_path));
+                }
+                Visible::Memory { hour, batches } => {
+                    let kept: Vec<_> = batches
+                        .iter()
+                        .filter(|batch| batch.num_rows() > 0)
+                        .cloned()
+                        .collect();
+                    if kept.is_empty() {
+                        continue;
+                    }
+                    hour_sources(&mut hours, hour).batches.extend(kept);
+                }
+            }
+        }
+        hours.into_values().collect()
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, State>, StoreError> {
@@ -358,22 +422,25 @@ fn ensure_publishable(catalog: &Catalog, first: u64, next: u64) -> Result<(), Ca
     }
 }
 
-struct Piece<'a> {
-    origin: Origin<'a>,
+enum Visible<'a> {
+    Memory {
+        hour: EventHour,
+        batches: &'a [Arc<RecordBatch>],
+    },
+    File {
+        hour: EventHour,
+        relative_path: &'a str,
+    },
 }
 
-enum Origin<'a> {
-    Memory(&'a [Arc<RecordBatch>]),
-    File(&'a str),
-}
-
-fn pieces<'a>(snapshot: &'a StoreSnapshot, scan: &Scan) -> Vec<Piece<'a>> {
-    let mut pieces = Vec::new();
+fn visible_sources<'a>(snapshot: &'a StoreSnapshot, scan: &Scan) -> Vec<Visible<'a>> {
+    let mut sources = Vec::new();
     for commit in &snapshot.published {
         for file in &commit.files {
             if hour_selected(file.hour, scan) {
-                pieces.push(Piece {
-                    origin: Origin::File(&file.relative_path),
+                sources.push(Visible::File {
+                    hour: file.hour,
+                    relative_path: &file.relative_path,
                 });
             }
         }
@@ -381,13 +448,22 @@ fn pieces<'a>(snapshot: &'a StoreSnapshot, scan: &Scan) -> Vec<Piece<'a>> {
     for generation in snapshot.frozen.iter().chain(snapshot.active.iter()) {
         for partition in &generation.partitions {
             if hour_selected(partition.hour, scan) {
-                pieces.push(Piece {
-                    origin: Origin::Memory(&partition.batches),
+                sources.push(Visible::Memory {
+                    hour: partition.hour,
+                    batches: &partition.batches,
                 });
             }
         }
     }
-    pieces
+    sources
+}
+
+fn hour_sources(hours: &mut BTreeMap<EventHour, HourSources>, hour: EventHour) -> &mut HourSources {
+    hours.entry(hour).or_insert_with(|| HourSources {
+        hour,
+        files: Vec::new(),
+        batches: Vec::new(),
+    })
 }
 
 fn visible_schemas(snapshot: &StoreSnapshot) -> impl Iterator<Item = &SchemaRef> {
@@ -566,10 +642,11 @@ mod tests {
         store.rotate().expect("rotate");
     }
 
-    fn sequences(batches: &[arrow_array::RecordBatch]) -> Vec<u64> {
+    fn sequences(batches: &[impl std::borrow::Borrow<arrow_array::RecordBatch>]) -> Vec<u64> {
         batches
             .iter()
             .flat_map(|batch| {
+                let batch = batch.borrow();
                 let column = batch
                     .column_by_name(COLUMN_WAL_SEQUENCE)
                     .expect("sequence")
@@ -706,6 +783,96 @@ mod tests {
         assert_eq!(sequences(&pruned), [1]);
         assert_eq!(i64_column(&pruned, "log_a_i64"), vec![None]);
         assert_eq!(i64_column(&pruned, "log_b_i64"), vec![Some(2)]);
+    }
+
+    #[test]
+    fn sources_describe_each_visible_generation_once() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = open_store(&directory);
+
+        store.append(&frame(0, 0, Vec::new())).expect("active");
+        let active = store.snapshot().expect("active snapshot");
+        let active_sources = store.sources(&active, &Scan::default());
+        assert_eq!(active_sources.len(), 1);
+        assert!(active_sources[0].files.is_empty());
+        assert_eq!(active_sources[0].batches.len(), 1);
+        assert_eq!(sequences(&active_sources[0].batches), [0]);
+
+        seal(&store, frame(1, 0, Vec::new()));
+        let frozen = store.snapshot().expect("frozen snapshot");
+        let frozen_sources = store.sources(&frozen, &Scan::default());
+        assert_eq!(frozen_sources.len(), 1);
+        assert!(frozen_sources[0].files.is_empty());
+        assert_eq!(sequences(&frozen_sources[0].batches), [0, 1]);
+
+        store.publish(&PublishOptions::default()).expect("publish");
+        store
+            .append(&frame(2, HOUR, Vec::new()))
+            .expect("later active");
+        let mixed = store.snapshot().expect("mixed snapshot");
+        let mixed_sources = store.sources(&mixed, &Scan::default());
+        assert_eq!(mixed_sources.len(), 2);
+        assert!(mixed_sources[0].batches.is_empty());
+        assert_eq!(mixed_sources[0].files.len(), 1);
+        assert_eq!(
+            mixed_sources[0].files[0],
+            crate::parquet_path(directory.path(), "tenant-a", EventHour::containing(0), 0, 2)
+        );
+        assert!(mixed_sources[0].files[0].is_file());
+        assert!(mixed_sources[1].files.is_empty());
+        assert_eq!(sequences(&mixed_sources[1].batches), [2]);
+
+        let stray = crate::hour_directory(directory.path(), "tenant-a", EventHour::containing(0))
+            .join("stray.parquet");
+        fs::write(&stray, b"not a commit").expect("stray");
+        let published = store.sources(&mixed, &Scan::default());
+        assert_eq!(published[0].files, mixed_sources[0].files);
+
+        let selected = store.sources(
+            &mixed,
+            &Scan {
+                from_hour: Some(EventHour::containing(HOUR)),
+                ..Scan::default()
+            },
+        );
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].hour, EventHour::containing(HOUR));
+        assert!(selected[0].files.is_empty());
+    }
+
+    #[test]
+    fn source_schema_keeps_dynamic_columns_a_generation_lacks() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = open_store(&directory);
+        seal(&store, frame(0, 0, vec![attribute("a", 1)]));
+        store.publish(&PublishOptions::default()).expect("publish");
+        seal(&store, frame(1, 0, vec![attribute("b", 2)]));
+        let snapshot = store.snapshot().expect("snapshot");
+        let schema = snapshot.schema().expect("schema");
+        assert!(schema.field_with_name("log_a_i64").is_ok());
+        assert!(schema.field_with_name("log_b_i64").is_ok());
+        assert!(
+            snapshot.published[0]
+                .schema
+                .field_with_name("log_b_i64")
+                .is_err()
+        );
+        assert!(
+            snapshot.frozen[0]
+                .schema
+                .field_with_name("log_a_i64")
+                .is_err()
+        );
+        let sources = store.sources(&snapshot, &Scan::default());
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].files.len(), 1);
+        assert_eq!(sources[0].batches.len(), 1);
+        assert!(
+            sources[0].batches[0]
+                .schema()
+                .field_with_name("log_a_i64")
+                .is_err()
+        );
     }
 
     #[test]

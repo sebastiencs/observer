@@ -114,4 +114,6 @@ pub use schema::{
     PROJECTION_VERSION, SCHEMA_VERSION, SERVICE_NAME_ATTRIBUTE, SPAN_ID_BYTES, SPAN_ID_LEN,
     TRACE_ID_BYTES, TRACE_ID_LEN, core_logs_schema, logs_batch_schema,
 };
-pub use snapshot::{PublishFault, PublishOptions, Scan, Store, StoreError, StoreSnapshot};
+pub use snapshot::{
+    HourSources, PublishFault, PublishOptions, Scan, Store, StoreError, StoreSnapshot,
+};
