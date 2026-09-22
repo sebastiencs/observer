@@ -36,20 +36,33 @@
 //! While it is active, individual batches can omit dynamic columns. Freezing reorders every batch
 //! to the union schema and fills the gaps with typed nulls. A frozen generation can be written as
 //! local Snappy Parquet at
-//! `tenants/<tenant>/date=YYYY-MM-DD/hour=HH/<first>-<next>.parquet`. Generations that admitted the same
-//! fields share a fingerprint. A later scan groups those generations together, skips a generation
-//! whose schema lacks a filtered column, and fills columns that generation lacks with typed nulls.
+//! `tenants/<tenant>/date=YYYY-MM-DD/hour=HH/<first>-<next>.parquet`. A generation is published by a
+//! CRC32C commit descriptor at `tenants/<tenant>/commits/<first>-<next>.commit`. The catalog swaps
+//! that descriptor in and the frozen batches out under one lock, so a snapshot sees the rows in
+//! memory or in Parquet. A scan reconciles those schemas by physical name and fills columns a
+//! generation lacks with typed nulls. Generations that admitted the same
+//! fields share a fingerprint. A later filtered scan skips a generation whose schema lacks a
+//! filtered column.
 
 mod canonical_json;
+mod catalog;
+mod commit;
 mod decode;
 mod dynamic;
 mod layout;
 mod memtable;
 mod parquet;
+mod recovery;
 mod schema;
+mod snapshot;
 
 pub use canonical_json::{
     CanonicalJsonError, MAX_JSON_DEPTH, canonical_any_value_json, canonical_attributes_json,
+};
+pub use catalog::{Catalog, CatalogError};
+pub use commit::{
+    Commit, CommitError, CommitFault, CommitFile, CommitWriteOptions, commit_for, read_commit,
+    write_commit,
 };
 pub use decode::{DecodeError, DecodedLogs, DecodedPartition, decode_logs_frame};
 pub use dynamic::{
@@ -58,7 +71,10 @@ pub use dynamic::{
     FIELD_SOURCE, discover_dynamic_schema, dynamic_identity, ordered_field_names,
     project_dynamic_fields, record_dynamic_values,
 };
-pub use layout::{hour_directory, parquet_file_name, parquet_path};
+pub use layout::{
+    commit_file_name, commit_path, commits_directory, hour_directory, parquet_file_name,
+    parquet_path, tenant_directory,
+};
 pub use memtable::{
     Appended, Clock, Generation, GenerationPartition, ManualClock, Memtable, MemtableConfig,
     MemtableError, Snapshot, SystemClock, align_batch,
@@ -68,6 +84,7 @@ pub use parquet::{
     META_ROW_COUNT, META_WAL_FIRST_SEQUENCE, META_WAL_NEXT_SEQUENCE, ParquetError, ParquetFault,
     ParquetFile, ParquetWriteOptions, read_parquet_batches, write_generation,
 };
+pub use recovery::{Recovered, RecoveryError, recover};
 pub use schema::{
     COLUMN_BODY, COLUMN_EVENT_TIME_UNIX_NANO, COLUMN_LOG_ATTRIBUTES,
     COLUMN_OBSERVED_TIME_UNIX_NANO, COLUMN_RECEIVED_TIME_UNIX_NANO, COLUMN_RECORD_INDEX,
@@ -77,3 +94,4 @@ pub use schema::{
     PROJECTION_VERSION, SCHEMA_VERSION, SERVICE_NAME_ATTRIBUTE, SPAN_ID_BYTES, SPAN_ID_LEN,
     TRACE_ID_BYTES, TRACE_ID_LEN, core_logs_schema, logs_batch_schema,
 };
+pub use snapshot::{PublishFault, PublishOptions, Scan, Store, StoreError, StoreSnapshot};

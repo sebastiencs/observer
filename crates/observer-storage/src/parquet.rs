@@ -19,7 +19,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
-use crate::layout::hour_end_unix_nano;
+use crate::layout::{hour_end_unix_nano, sync_ancestors};
 use crate::{EventHour, Generation, MemtableError, PROJECTION_VERSION, align_batch, parquet_path};
 
 /// Arrow schema metadata key for [`PROJECTION_VERSION`].
@@ -167,6 +167,18 @@ pub fn write_generation(
     Ok(written)
 }
 
+/// Arrow schema stored in a Parquet file written by [`write_generation`].
+///
+/// # Errors
+///
+/// Returns [`ParquetError`] when the file cannot be opened or decoded.
+pub fn read_parquet_schema(path: &Path) -> Result<SchemaRef, ParquetError> {
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|error| ParquetError::Storage(error.to_string()))?;
+    Ok(Arc::clone(builder.schema()))
+}
+
 /// Read every row group of a Parquet file written by [`write_generation`].
 ///
 /// # Errors
@@ -266,7 +278,7 @@ fn write_hour(
     fail(options, ParquetFault::Rename)?;
     fs::rename(&temporary, path)?;
     fail(options, ParquetFault::SyncDir)?;
-    sync_directories(directory, root)?;
+    sync_ancestors(directory, root)?;
     Ok(())
 }
 
@@ -275,29 +287,6 @@ fn fail(options: &ParquetWriteOptions, step: ParquetFault) -> Result<(), Parquet
         Err(ParquetError::Fault(step))
     } else {
         Ok(())
-    }
-}
-
-fn sync_directories(start: &Path, root: &Path) -> Result<(), ParquetError> {
-    if !start.starts_with(root) {
-        return Err(ParquetError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "parquet path is outside the data directory",
-        )));
-    }
-    let mut current = start.to_path_buf();
-    loop {
-        File::open(&current)?.sync_all()?;
-        if current == root {
-            return Ok(());
-        }
-        let parent = current.parent().map(Path::to_path_buf).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "parquet directory has no parent",
-            )
-        })?;
-        current = parent;
     }
 }
 

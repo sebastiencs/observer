@@ -2,22 +2,49 @@
 //!
 //! `data_directory/tenants/<tenant>/date=YYYY-MM-DD/hour=HH/<first>-<next>.parquet`
 //!
-//! `<first>-<next>` is the generation's exclusive WAL sequence range. Replaying that range writes
-//! the same path.
+//! Commit descriptors live at `tenants/<tenant>/commits/<first>-<next>.commit`. `<first>-<next>` is
+//! the generation's exclusive WAL sequence range. Replaying that range writes the same paths.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs::File,
+    io,
+    path::{Path, PathBuf},
+};
 
 use crate::EventHour;
 
 const TENANTS_DIR: &str = "tenants";
 const NANOS_PER_HOUR: u64 = 3_600_000_000_000;
 
+/// `tenants/<tenant>` under the data directory.
+#[must_use]
+pub fn tenant_directory(root: &Path, tenant: &str) -> PathBuf {
+    root.join(TENANTS_DIR).join(tenant)
+}
+
+/// Directory of commit descriptors for one tenant.
+#[must_use]
+pub fn commits_directory(root: &Path, tenant: &str) -> PathBuf {
+    tenant_directory(root, tenant).join("commits")
+}
+
+/// File name for one generation's commit descriptor.
+#[must_use]
+pub fn commit_file_name(first_sequence: u64, next_sequence: u64) -> String {
+    format!("{first_sequence}-{next_sequence}.commit")
+}
+
+/// Full path of one generation's commit descriptor.
+#[must_use]
+pub fn commit_path(root: &Path, tenant: &str, first_sequence: u64, next_sequence: u64) -> PathBuf {
+    commits_directory(root, tenant).join(commit_file_name(first_sequence, next_sequence))
+}
+
 /// Directory that holds every Parquet file for one tenant hour.
 #[must_use]
 pub fn hour_directory(root: &Path, tenant: &str, hour: EventHour) -> PathBuf {
     let (year, month, day) = hour.utc_date();
-    root.join(TENANTS_DIR)
-        .join(tenant)
+    tenant_directory(root, tenant)
         .join(format!("date={year:04}-{month:02}-{day:02}"))
         .join(format!("hour={:02}", hour.utc_hour()))
 }
@@ -44,4 +71,24 @@ pub fn parquet_path(
 #[must_use]
 pub fn hour_end_unix_nano(hour: EventHour) -> u64 {
     hour.start_unix_nano().saturating_add(NANOS_PER_HOUR)
+}
+
+/// Fsync `start` and every parent up through `root`.
+pub(crate) fn sync_ancestors(start: &Path, root: &Path) -> io::Result<()> {
+    if !start.starts_with(root) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is outside the data directory",
+        ));
+    }
+    let mut current = start.to_path_buf();
+    loop {
+        File::open(&current)?.sync_all()?;
+        if current == root {
+            return Ok(());
+        }
+        current = current.parent().map(Path::to_path_buf).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "directory has no parent")
+        })?;
+    }
 }

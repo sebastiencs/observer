@@ -104,6 +104,8 @@ pub enum MemtableError {
     NonContiguous { expected: u64, actual: u64 },
     /// The frame sequence has no following exclusive bound.
     SequenceOverflow { sequence: u64 },
+    /// [`Memtable::resume`] was called after the memtable had already accepted a sequence.
+    NotResumable,
     /// Freezing this append or rotation would exceed `max_frozen`. Nothing was stored.
     FrozenLimit,
     /// A batch does not use the core logs schema, or a dynamic column has no identity metadata.
@@ -136,6 +138,9 @@ impl fmt::Display for MemtableError {
                     "WAL sequence {sequence} has no exclusive successor"
                 )
             }
+            Self::NotResumable => {
+                formatter.write_str("memtable already has a sequence and cannot resume")
+            }
             Self::FrozenLimit => formatter.write_str("frozen generation limit has been reached"),
             Self::IncompatibleBatch(detail) => {
                 write!(formatter, "incompatible log batch: {detail}")
@@ -159,6 +164,7 @@ impl Error for MemtableError {
             | Self::TenantMismatch { .. }
             | Self::NonContiguous { .. }
             | Self::SequenceOverflow { .. }
+            | Self::NotResumable
             | Self::FrozenLimit
             | Self::IncompatibleBatch(_) => None,
         }
@@ -343,6 +349,29 @@ impl Memtable {
         self.seal_active();
         self.epoch = self.epoch.saturating_add(1);
         Ok(Some(generation_id))
+    }
+
+    /// Require the next appended sequence to be `next_sequence`.
+    ///
+    /// Used after recovery so new frames continue past the published high-water mark. The memtable
+    /// must not already hold a sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemtableError::NotResumable`] when a frame was already accepted or [`Self::resume`]
+    /// was already called.
+    pub fn resume(&mut self, next_sequence: u64) -> Result<(), MemtableError> {
+        if self.next_sequence.is_some() || self.active.has_frames() || !self.frozen.is_empty() {
+            return Err(MemtableError::NotResumable);
+        }
+        self.next_sequence = Some(next_sequence);
+        Ok(())
+    }
+
+    /// Oldest frozen generation, still owned by the memtable.
+    #[must_use]
+    pub fn oldest_frozen(&self) -> Option<Generation> {
+        self.frozen.front().map(ActiveGeneration::view)
     }
 
     /// Remove the oldest frozen generation after a later phase has finished with it.
