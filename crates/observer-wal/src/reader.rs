@@ -163,6 +163,12 @@ impl WalReader {
         }
     }
 
+    /// Exclusive cursor of the next unread frame.
+    #[must_use]
+    pub fn cursor(&self) -> WalCursor {
+        self.cursor
+    }
+
     /// Rediscover segments so a later `next_record` can see a still-growing
     /// `.open` tail or a newly rotated segment.
     pub fn refresh(&mut self) -> Result<(), WalError> {

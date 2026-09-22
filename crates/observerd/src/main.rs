@@ -1,4 +1,5 @@
 mod config;
+mod consumer;
 mod readiness;
 
 use std::{
@@ -25,8 +26,10 @@ const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 #[derive(Clone)]
 struct AdminState {
     wal: Arc<TenantWalRouter>,
+    consumers_failed: Arc<AtomicBool>,
     serving: Arc<AtomicBool>,
     wal_directory: PathBuf,
+    data_directory: PathBuf,
     readiness: Arc<Readiness<FilesystemFreeSpace>>,
 }
 
@@ -48,18 +51,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load(path)?;
 
     fs::create_dir_all(&config.wal_directory)?;
+    fs::create_dir_all(&config.data_directory)?;
     let readiness = Arc::new(Readiness::filesystem(config.readiness));
-    readiness.ensure_startup(&config.wal_directory)?;
+    readiness.ensure_startup(&[&config.wal_directory, &config.data_directory])?;
 
     let wal = Arc::new(TenantWalRouter::open(
         WalWriterConfig::new(&config.wal_directory),
         config.tokens.tenants(),
     )?);
-    let serving = Arc::new(AtomicBool::new(false));
-
     let grpc_listener = TcpListener::bind(config.listen.grpc).await?;
     let http_listener = TcpListener::bind(config.listen.http).await?;
     let admin_listener = TcpListener::bind(config.listen.admin).await?;
+    let consumers = match consumer::ConsumerSet::start(&config, wal.tenant_ids()) {
+        Ok(consumers) => consumers,
+        Err(error) => {
+            let _ = wal.shutdown().await;
+            return Err(error.into());
+        }
+    };
+    let serving = Arc::new(AtomicBool::new(false));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let grpc = spawn_grpc(
@@ -78,8 +88,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         admin_listener,
         AdminState {
             wal: Arc::clone(&wal),
+            consumers_failed: consumers.failed_flag(),
             serving: Arc::clone(&serving),
             wal_directory: config.wal_directory.clone(),
+            data_directory: config.data_directory.clone(),
             readiness,
         },
         shutdown_rx,
@@ -90,10 +102,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     serving.store(false, Ordering::SeqCst);
     let _ = shutdown_tx.send(true);
 
-    grpc.await??;
-    http.await??;
-    admin.await??;
-    wal.shutdown().await?;
+    let grpc_result = grpc.await;
+    let http_result = http.await;
+    let admin_result = admin.await;
+    let wal_result = wal.shutdown().await;
+    let consumer_result = consumers.shutdown();
+    grpc_result??;
+    http_result??;
+    admin_result??;
+    wal_result?;
+    consumer_result?;
     Ok(())
 }
 
@@ -155,8 +173,8 @@ async fn live() -> StatusCode {
 async fn ready(State(state): State<AdminState>) -> StatusCode {
     if state.readiness.is_ready(
         state.serving.load(Ordering::SeqCst),
-        state.wal.is_failed(),
-        &state.wal_directory,
+        state.wal.is_failed() || state.consumers_failed.load(Ordering::SeqCst),
+        &[&state.wal_directory, &state.data_directory],
     ) {
         StatusCode::OK
     } else {

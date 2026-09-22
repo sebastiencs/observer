@@ -9,6 +9,7 @@ license.workspace = true
 axum.workspace = true
 fs2 = "0.4"
 observer-ingest = { path = "../observer-ingest" }
+observer-storage = { path = "../observer-storage" }
 observer-wal = { path = "../observer-wal" }
 serde.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
@@ -17,7 +18,9 @@ toml.workspace = true
 tonic.workspace = true
 
 [dev-dependencies]
+arrow-array.workspace = true
 nix = { version = "0.30", default-features = false, features = ["signal"] }
+bytes.workspace = true
 observer-protocol = { path = "../observer-protocol" }
 observer-wal = { path = "../observer-wal" }
 proptest.workspace = true

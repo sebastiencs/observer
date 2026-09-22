@@ -12,6 +12,7 @@ const TENANTS_DIR_NAME: &str = "tenants";
 
 /// Eagerly opened, independently queued WAL writer for every configured tenant.
 pub struct TenantWalRouter {
+    root: PathBuf,
     tenants: BTreeMap<String, AsyncWal>,
 }
 
@@ -36,12 +37,28 @@ impl TenantWalRouter {
             tenant_config.wal.directory = tenant_wal_directory(&root, &tenant_id);
             opened.insert(tenant_id, AsyncWal::open(tenant_config)?);
         }
-        Ok(Self { tenants: opened })
+        Ok(Self {
+            root,
+            tenants: opened,
+        })
     }
 
     #[must_use]
     pub fn tenant_count(&self) -> usize {
         self.tenants.len()
+    }
+
+    /// Configured tenant ids in sorted order.
+    pub fn tenant_ids(&self) -> impl Iterator<Item = &str> {
+        self.tenants.keys().map(String::as_str)
+    }
+
+    /// WAL directory for a configured tenant.
+    #[must_use]
+    pub fn wal_directory(&self, tenant_id: &str) -> Option<PathBuf> {
+        self.tenants
+            .contains_key(tenant_id)
+            .then(|| tenant_wal_directory(&self.root, tenant_id))
     }
 
     /// True if any configured tenant writer has entered a failed state.
@@ -130,6 +147,14 @@ mod tests {
         )
         .expect("router");
         assert_eq!(router.tenant_count(), 2);
+        assert_eq!(
+            router.tenant_ids().collect::<Vec<_>>(),
+            ["tenant-a", "tenant-b"]
+        );
+        assert_eq!(
+            router.wal_directory("tenant-a").expect("directory"),
+            tenant_wal_directory(dir.path(), "tenant-a")
+        );
 
         router
             .append(batch("tenant-a", b"a-one"))

@@ -52,7 +52,8 @@ pub fn reserve_ports() -> ListenAddrs {
 
 pub fn write_config(path: &Path, wal_directory: &Path, listen: ListenAddrs) {
     let contents = format!(
-        "wal_directory = {wal_directory:?}\n\n[listen]\ngrpc = \"{grpc}\"\nhttp = \"{http}\"\nadmin = \"{admin}\"\n\n[tokens]\n\"{SECRET}\" = \"{TENANT}\"\n\"{SECOND_SECRET}\" = \"{SECOND_TENANT}\"\n\n[readiness]\nmin_free_bytes = 1\n",
+        "wal_directory = {wal_directory:?}\ndata_directory = {data_directory:?}\n\n[listen]\ngrpc = \"{grpc}\"\nhttp = \"{http}\"\nadmin = \"{admin}\"\n\n[tokens]\n\"{SECRET}\" = \"{TENANT}\"\n\"{SECOND_SECRET}\" = \"{SECOND_TENANT}\"\n\n[storage]\nmax_rows = 100000\nmax_bytes = 67108864\nmax_age_ms = 60000\nmax_frozen = 4\nmax_dynamic_columns = 256\nmax_depth = 4\npoll_interval_ms = 20\n\n[readiness]\nmin_free_bytes = 1\n",
+        data_directory = wal_directory.parent().unwrap_or(wal_directory).join("data"),
         grpc = listen.grpc,
         http = listen.http,
         admin = listen.admin,

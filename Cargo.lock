@@ -1000,11 +1000,14 @@ dependencies = [
 name = "observerd"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
  "axum",
+ "bytes",
  "fs2",
  "nix",
  "observer-ingest",
  "observer-protocol",
+ "observer-storage",
  "observer-wal",
  "proptest",
  "prost",
