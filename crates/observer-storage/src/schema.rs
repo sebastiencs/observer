@@ -1,4 +1,4 @@
-//! Lean Arrow schema for one OTLP log row.
+//! Core Arrow columns for one OTLP log row, plus composition with dynamic attribute fields.
 
 use std::sync::OnceLock;
 
@@ -85,7 +85,7 @@ impl EventHour {
 /// Dynamic attribute columns are appended by [`logs_batch_schema`]. A batch schema matches this
 /// value only when the frame admitted no dynamic fields.
 #[must_use]
-pub fn logs_schema() -> SchemaRef {
+pub fn core_logs_schema() -> SchemaRef {
     static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
     SCHEMA
         .get_or_init(|| std::sync::Arc::new(Schema::new(schema_fields())))
@@ -96,7 +96,7 @@ pub fn logs_schema() -> SchemaRef {
 #[must_use]
 pub fn logs_batch_schema(dynamic: &[Field]) -> SchemaRef {
     if dynamic.is_empty() {
-        return logs_schema();
+        return core_logs_schema();
     }
     let mut fields = schema_fields();
     fields.extend(dynamic.iter().cloned());
@@ -163,7 +163,7 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{EventHour, logs_batch_schema, logs_schema, schema_fields};
+    use super::{EventHour, core_logs_schema, logs_batch_schema, schema_fields};
     use arrow_schema::{DataType, Field};
 
     fn nanos(seconds: u64) -> u64 {
@@ -171,8 +171,8 @@ mod tests {
     }
 
     #[test]
-    fn logs_schema_v1_columns() {
-        let schema = logs_schema();
+    fn core_logs_schema_v1_columns() {
+        let schema = core_logs_schema();
         let fields = schema_fields();
         assert_eq!(schema.fields().len(), fields.len());
         for (index, expected) in fields.iter().enumerate() {
@@ -187,16 +187,16 @@ mod tests {
     fn batch_schema_keeps_core_fields_and_appends_dynamic_ones() {
         assert!(std::sync::Arc::ptr_eq(
             &logs_batch_schema(&[]),
-            &logs_schema()
+            &core_logs_schema()
         ));
         let extra = Field::new("log_status_i64", DataType::Int64, true);
         let schema = logs_batch_schema(std::slice::from_ref(&extra));
-        assert_eq!(schema.fields().len(), logs_schema().fields().len() + 1);
+        assert_eq!(schema.fields().len(), core_logs_schema().fields().len() + 1);
         assert_eq!(
             schema.fields().last().map(std::convert::AsRef::as_ref),
             Some(&extra)
         );
-        for (index, field) in logs_schema().fields().iter().enumerate() {
+        for (index, field) in core_logs_schema().fields().iter().enumerate() {
             assert_eq!(schema.field(index), field.as_ref());
         }
     }

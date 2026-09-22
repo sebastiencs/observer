@@ -25,7 +25,7 @@ use crate::{
     discover_dynamic_schema, logs_batch_schema, record_dynamic_values,
 };
 
-/// Why a logs WAL frame could not be projected into the v1 schema.
+/// Why a logs WAL frame could not be projected into Arrow columns.
 #[derive(Debug)]
 pub enum DecodeError {
     /// The frame is not a logs frame.
@@ -544,7 +544,8 @@ mod tests {
         COLUMN_SERVICE_NAME, COLUMN_SEVERITY_NUMBER, COLUMN_SEVERITY_TEXT, COLUMN_SPAN_ID,
         COLUMN_TENANT_ID, COLUMN_TIME_UNIX_NANO, COLUMN_TRACE_ID, COLUMN_WAL_SEQUENCE,
         DynamicLimits, DynamicValue, FIELD_KIND, FIELD_PATH, FIELD_SOURCE, SCHEMA_VERSION,
-        SERVICE_NAME_ATTRIBUTE, canonical_attributes_json, logs_schema, project_dynamic_fields,
+        SERVICE_NAME_ATTRIBUTE, canonical_attributes_json, core_logs_schema,
+        project_dynamic_fields,
     };
     use arrow_array::{
         Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, Float64Array, Int32Array,
@@ -707,7 +708,10 @@ mod tests {
             decoded.partitions.iter().zip(expected)
         {
             assert_eq!(partition.hour.start_unix_nano(), hour);
-            assert_eq!(partition.batch.schema().as_ref(), logs_schema().as_ref());
+            assert_eq!(
+                partition.batch.schema().as_ref(),
+                core_logs_schema().as_ref()
+            );
             assert_eq!(partition.batch.num_rows(), 1);
             let batch = &partition.batch;
             assert_eq!(u16_at(batch, COLUMN_SCHEMA_VERSION, 0), SCHEMA_VERSION);
@@ -992,6 +996,49 @@ mod tests {
                 );
             }
         }
+
+        #[test]
+        fn attribute_batches_replay_and_keep_json_past_the_column_cap(
+            pairs in prop::collection::vec(("[a-z]{1,4}", proptest::prelude::any::<i64>()), 0..6)
+        ) {
+            let attributes: Vec<_> = pairs
+                .iter()
+                .map(|(key, value)| attribute(key, any(any_value::Value::IntValue(*value))))
+                .collect();
+            let frame = logs_frame(&request(vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: RECEIVED,
+                        attributes: attributes.clone(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }]));
+            let wide = DynamicLimits {
+                max_depth: 4,
+                max_columns: 32,
+            };
+            assert_eq!(
+                decode_logs_frame(&frame, wide).unwrap(),
+                decode_logs_frame(&frame, wide).unwrap()
+            );
+            let capped = decode_logs_frame(
+                &frame,
+                DynamicLimits {
+                    max_depth: 4,
+                    max_columns: 1,
+                },
+            )
+            .unwrap();
+            let batch = &capped.partitions[0].batch;
+            assert_eq!(
+                string_column(batch, COLUMN_LOG_ATTRIBUTES).value(0),
+                canonical_attributes_json(&attributes).unwrap()
+            );
+            assert!(batch.schema().fields().len() - core_logs_schema().fields().len() <= 1);
+        }
     }
 
     #[test]
@@ -1167,7 +1214,7 @@ mod tests {
         );
         assert_eq!(
             batch.schema().fields().len(),
-            logs_schema().fields().len() + 1
+            core_logs_schema().fields().len() + 1
         );
     }
 
@@ -1207,7 +1254,7 @@ mod tests {
             .schema()
             .fields()
             .iter()
-            .skip(logs_schema().fields().len())
+            .skip(core_logs_schema().fields().len())
             .map(|field| field.name().to_owned())
             .collect();
         assert_eq!(names.len(), 2);
@@ -1276,7 +1323,7 @@ mod tests {
     }
 
     fn assert_core_prefix(batch: &arrow_array::RecordBatch) {
-        let core = logs_schema();
+        let core = core_logs_schema();
         for (index, field) in core.fields().iter().enumerate() {
             assert_eq!(batch.schema().field(index), field.as_ref());
         }

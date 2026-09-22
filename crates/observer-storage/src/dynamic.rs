@@ -647,6 +647,7 @@ mod tests {
     use arrow_schema::DataType;
     use observer_protocol::otlp::{AnyValue, ArrayValue, KeyValue, KeyValueList, any_value};
     use proptest::prelude::*;
+    use std::collections::BTreeSet;
 
     fn limits(max_depth: usize, max_columns: usize) -> DynamicLimits {
         DynamicLimits {
@@ -1061,6 +1062,56 @@ mod tests {
             assert_eq!(projection.columns.len(), 1);
             assert_eq!(projection.columns[0].value, DynamicValue::Int64(*values.last().expect("value")));
             assert_eq!(projection.columns[0].physical_name, "log_status_i64");
+        }
+
+        #[test]
+        fn projected_names_are_unique_and_stable(
+            pairs in prop::collection::vec(("[A-Za-z][A-Za-z0-9_-]{0,5}", any::<i64>()), 0..8)
+        ) {
+            let attributes: Vec<_> = pairs
+                .iter()
+                .map(|(key, value)| int_attribute(key, *value))
+                .collect();
+            let first = project_log(&attributes, 4);
+            let second = project_log(&attributes, 4);
+            assert_eq!(first, second);
+            let mut names = BTreeSet::new();
+            for column in &first.columns {
+                assert!(names.insert(column.physical_name.clone()));
+            }
+        }
+
+        #[test]
+        fn normalized_collisions_keep_every_value(
+            base in "[a-z]{1,4}",
+            left in any::<i64>(),
+            right in any::<i64>(),
+        ) {
+            let dotted = format!("{base}-{base}");
+            let underscored = format!("{base}_{base}");
+            let projection = project_log(
+                &[
+                    int_attribute(&dotted, left),
+                    int_attribute(&underscored, right),
+                ],
+                4,
+            );
+            assert_eq!(projection.columns.len(), 2);
+            assert_ne!(
+                projection.columns[0].physical_name,
+                projection.columns[1].physical_name
+            );
+            assert!(projection.columns.iter().all(|column| {
+                column.physical_name.starts_with("log_") && column.physical_name.contains("__")
+            }));
+            assert_eq!(
+                column(&projection, &[dotted.as_str()]).value,
+                DynamicValue::Int64(left)
+            );
+            assert_eq!(
+                column(&projection, &[underscored.as_str()]).value,
+                DynamicValue::Int64(right)
+            );
         }
     }
 }

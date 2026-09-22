@@ -24,8 +24,8 @@ use arrow_array::{RecordBatch, new_null_array};
 use arrow_schema::{DataType, Schema, SchemaRef};
 
 use crate::{
-    DecodedLogs, DynamicError, DynamicField, DynamicIdentity, EventHour, discover_dynamic_schema,
-    dynamic_identity, logs_batch_schema, logs_schema,
+    DecodedLogs, DynamicError, DynamicField, DynamicIdentity, EventHour, core_logs_schema,
+    discover_dynamic_schema, dynamic_identity, logs_batch_schema,
 };
 
 /// Upper bounds that rotate or pause one memtable.
@@ -509,7 +509,7 @@ struct SchemaState {
 
 impl SchemaState {
     fn initial() -> Self {
-        let schema = logs_schema();
+        let schema = core_logs_schema();
         let fingerprint = schema_fingerprint(&schema);
         Self {
             admitted: Vec::new(),
@@ -537,7 +537,7 @@ impl SchemaState {
                 .schema()
                 .fields()
                 .iter()
-                .skip(logs_schema().fields().len())
+                .skip(core_logs_schema().fields().len())
             {
                 let Some(identity) = dynamic_identity(field) else {
                     return Err(MemtableError::IncompatibleBatch(format!(
@@ -692,7 +692,7 @@ fn names_changed(current: &[DynamicField], updated: &[DynamicField]) -> bool {
 }
 
 fn core_columns_match(batch: &RecordBatch) -> bool {
-    let core = logs_schema();
+    let core = core_logs_schema();
     batch.schema().fields().len() >= core.fields().len()
         && batch
             .schema()
@@ -769,8 +769,8 @@ mod tests {
         SystemClock,
     };
     use crate::{
-        COLUMN_LOG_ATTRIBUTES, DynamicIdentity, DynamicLimits, EventHour, decode_logs_frame,
-        discover_dynamic_schema, dynamic_identity,
+        COLUMN_LOG_ATTRIBUTES, DynamicIdentity, DynamicLimits, EventHour,
+        canonical_attributes_json, decode_logs_frame, discover_dynamic_schema, dynamic_identity,
     };
     use arrow_array::{Array, Int64Array, StringArray};
     use bytes::Bytes;
@@ -779,6 +779,7 @@ mod tests {
         ScopeLogs, any_value,
     };
     use observer_wal::{Frame, FrameSignal};
+    use proptest::prelude::*;
     use prost::Message;
     use std::{sync::Arc, time::Duration};
 
@@ -1425,7 +1426,7 @@ mod tests {
     }
 
     fn logs_core_len() -> usize {
-        crate::logs_schema().fields().len()
+        crate::core_logs_schema().fields().len()
     }
 
     fn optional_i64(batch: &arrow_array::RecordBatch, name: &str, row: usize) -> Option<i64> {
@@ -1447,5 +1448,101 @@ mod tests {
             .unwrap_or_else(|| panic!("{name} is not utf8"))
             .value(row)
             .to_owned()
+    }
+
+    fn fingerprint_for(keys: &[String]) -> (String, Vec<String>) {
+        let clock = ManualClock::new(0);
+        let mut table = open(config(20, u64::MAX, 1), &clock);
+        for (index, key) in keys.iter().enumerate() {
+            table
+                .append(&logs_with(
+                    u64::try_from(index).expect("index"),
+                    1,
+                    vec![int_attribute(key, i64::try_from(index).expect("value"))],
+                ))
+                .expect("append");
+        }
+        let active = table.snapshot().active.expect("active");
+        let names = active
+            .dynamic_fields
+            .iter()
+            .map(|field| field.physical_name.clone())
+            .collect();
+        (active.fingerprint, names)
+    }
+
+    proptest! {
+        #[test]
+        fn union_schema_is_independent_of_append_order(
+            keys in prop::collection::hash_set("[a-z]{1,3}", 1..5)
+        ) {
+            let mut keys: Vec<_> = keys.into_iter().collect();
+            keys.sort();
+            let mut reversed = keys.clone();
+            reversed.reverse();
+            let mut rotated = keys.clone();
+            rotated.rotate_left(1);
+            let expected = fingerprint_for(&keys);
+            assert_eq!(fingerprint_for(&reversed), expected);
+            assert_eq!(fingerprint_for(&rotated), expected);
+        }
+
+        #[test]
+        fn frozen_rows_keep_present_values_and_null_the_rest(
+            keys in prop::collection::hash_set("[a-z]{1,3}", 1..4)
+        ) {
+            let mut keys: Vec<_> = keys.into_iter().collect();
+            keys.sort();
+            let clock = ManualClock::new(0);
+            let mut table = open(config(20, u64::MAX, 1), &clock);
+            for (index, key) in keys.iter().enumerate() {
+                table
+                    .append(&logs_with(
+                        u64::try_from(index).expect("index"),
+                        1,
+                        vec![int_attribute(key, i64::try_from(index).expect("value"))],
+                    ))
+                    .expect("append");
+            }
+            table.rotate().expect("rotate").expect("sealed");
+            let snapshot = table.snapshot();
+            let frozen = &snapshot.frozen[0];
+            assert_eq!(frozen.partitions[0].batches.len(), keys.len());
+            for (index, key) in keys.iter().enumerate() {
+                let batch = &frozen.partitions[0].batches[index];
+                assert_eq!(batch.schema().as_ref(), frozen.schema.as_ref());
+                for field in &frozen.dynamic_fields {
+                    let value = optional_i64(batch, &field.physical_name, 0);
+                    if field.identity.path == [key.clone()] {
+                        assert_eq!(value, Some(i64::try_from(index).expect("value")));
+                    } else {
+                        assert_eq!(value, None);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn generation_overflow_keeps_the_canonical_json(
+            pairs in prop::collection::vec(("[a-z]{1,4}", any::<i64>()), 1..6)
+        ) {
+            let attributes: Vec<_> = pairs
+                .iter()
+                .map(|(key, value)| int_attribute(key, *value))
+                .collect();
+            let clock = ManualClock::new(0);
+            let mut limits = config(20, u64::MAX, 1);
+            limits.max_dynamic_columns = 1;
+            let mut table = open(limits, &clock);
+            table
+                .append(&logs_with(0, 1, attributes.clone()))
+                .expect("append");
+            let active = table.snapshot().active.expect("active");
+            assert!(active.dynamic_fields.len() <= 1);
+            assert_eq!(
+                string_at(&active.partitions[0].batches[0], COLUMN_LOG_ATTRIBUTES, 0),
+                canonical_attributes_json(&attributes).expect("json")
+            );
+        }
     }
 }
