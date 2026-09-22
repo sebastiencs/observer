@@ -81,7 +81,16 @@ impl WalReader {
         else {
             return Err(WalError::Corrupt("cursor does not resolve to a segment"));
         };
-        let mut current = open_found(io.as_ref(), found)?;
+        let Some(mut current) = open_ready(io.as_ref(), found)? else {
+            if cursor == WalCursor::start() {
+                return Ok(Self {
+                    io,
+                    cursor,
+                    current: None,
+                });
+            }
+            return Err(WalError::InvalidSegmentHeader("truncated header"));
+        };
         validate_cursor(&mut current, cursor)?;
         Ok(Self {
             io,
@@ -200,7 +209,10 @@ impl WalReader {
             }
             return Err(WalError::Corrupt("cursor does not resolve to a segment"));
         };
-        let mut current = open_found(self.io.as_ref(), found)?;
+        let Some(mut current) = open_ready(self.io.as_ref(), found)? else {
+            self.current = None;
+            return Ok(());
+        };
         validate_cursor(&mut current, self.cursor)?;
         self.current = Some(current);
         Ok(())
@@ -219,7 +231,9 @@ impl WalReader {
         let Some(found) = discovered.iter().find(|segment| segment.id == next_id) else {
             return Ok(false);
         };
-        let next = open_found(self.io.as_ref(), found)?;
+        let Some(next) = open_ready(self.io.as_ref(), found)? else {
+            return Ok(false);
+        };
         if next.header.first_sequence != self.cursor.next_sequence() {
             return Err(WalError::Corrupt("sequence discontinuity"));
         }
@@ -234,7 +248,13 @@ pub(crate) fn validate_physical_hint(
     found: &FoundSegment,
     cursor: WalCursor,
 ) -> Result<(), WalError> {
-    let mut current = open_found(io, found)?;
+    let Some(mut current) = open_ready(io, found)? else {
+        return if cursor == WalCursor::start() {
+            Ok(())
+        } else {
+            Err(WalError::InvalidSegmentHeader("truncated header"))
+        };
+    };
     validate_cursor(&mut current, cursor)
 }
 
@@ -301,6 +321,22 @@ fn header_offset() -> u64 {
 
 fn max_encoded_frame_len() -> usize {
     encoded_frame_size(MAX_TENANT_LEN, MAX_PAYLOAD_LEN).expect("max frame")
+}
+
+/// Opens `segment`, or reports that an active segment is not readable yet.
+///
+/// A writer can create the open file before its header is durable. A sealed file with a short
+/// header is corrupt.
+fn open_ready(io: &dyn LaneIo, segment: &FoundSegment) -> Result<Option<CurrentSegment>, WalError> {
+    match open_found(io, segment) {
+        Ok(current) => Ok(Some(current)),
+        Err(WalError::InvalidSegmentHeader("truncated header"))
+            if segment.kind == SegmentKind::Open =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn open_found(io: &dyn LaneIo, segment: &FoundSegment) -> Result<CurrentSegment, WalError> {
@@ -409,7 +445,9 @@ mod tests {
     use crate::{
         FrameError, FrameSignal, Wal, WalConfig, encode,
         recovery::lane_directory,
-        segment::{LANE_ID, SegmentHeader, encode_header, sealed_segment_file_name},
+        segment::{
+            LANE_ID, SegmentHeader, encode_header, sealed_segment_file_name, segment_file_name,
+        },
     };
 
     fn temp_config() -> (tempfile::TempDir, WalConfig) {
@@ -683,6 +721,28 @@ mod tests {
             error,
             WalError::Corrupt("unsupported frame version")
         ));
+    }
+
+    #[test]
+    fn an_open_segment_without_a_header_is_not_ready() {
+        let (_dir, config) = temp_config();
+        let mut reader = WalReader::open(&config.directory).expect("reader");
+        let lane = lane_directory(&config.directory);
+        fs::create_dir_all(&lane).expect("lane");
+        let path = lane.join(segment_file_name(0));
+        fs::write(&path, []).expect("empty");
+        reader.refresh().expect("refresh");
+        assert!(reader.next_record().expect("short header").is_none());
+
+        let header = encode_header(&SegmentHeader {
+            lane_id: LANE_ID,
+            segment_id: 0,
+            first_sequence: 0,
+            created_at_unix_nanos: 1,
+        });
+        fs::write(&path, header).expect("header");
+        reader.refresh().expect("refresh");
+        assert!(reader.next_record().expect("empty tail").is_none());
     }
 
     #[test]

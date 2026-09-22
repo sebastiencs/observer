@@ -15,6 +15,26 @@
 //! One engine shares a bounded memory pool. Each query uses its own session and the timeout and
 //! returned-row cap in [`QueryOptions`]. Dropping or cancelling the result stream stops the query.
 //!
+//! # Contract
+//!
+//! The caller selects the tenant by passing that tenant's [`Store`]. [`QueryEngine::execute`] pins
+//! the snapshot at the start of the call and returns an Arrow [`QueryBatchStream`]. Rows appended
+//! or published afterward stay out of that stream. The only table is `logs`, so SQL cannot name
+//! another tenant.
+//!
+//! ```sql
+//! SELECT wal_sequence, body
+//! FROM logs
+//! WHERE event_time_unix_nano >= 0
+//! ORDER BY wal_sequence
+//! LIMIT 100
+//! ```
+//!
+//! `LIMIT` applies to the ordered rows when `ORDER BY` is present. A dynamic column is
+//! `{source}_{normalized_path}_{type}` (for example `log_user_id_i64`). A generation that lacks
+//! that column contributes nulls. An event-time bound can skip whole hours; DataFusion still
+//! applies the nanosecond predicate.
+//!
 //! This crate does not expose an HTTP or gRPC query API.
 
 use std::path::Path;
@@ -1163,6 +1183,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sql_reads_only_the_store_passed_to_execute() {
+        let left = store();
+        let right = store();
+        left.append(&frame(0, 1, vec![attribute("user-id", 7)]))
+            .expect("append");
+        right.append(&frame(0, 1, Vec::new())).expect("append");
+        right.append(&frame(1, 2, Vec::new())).expect("append");
+
+        let left_rows = batches(
+            Arc::clone(&left),
+            "SELECT wal_sequence, log_user_id_i64 FROM logs ORDER BY wal_sequence",
+        )
+        .await;
+        assert_eq!(u64_column(&left_rows, "wal_sequence"), [0]);
+        assert_eq!(i64_column(&left_rows, "log_user_id_i64"), vec![Some(7)]);
+
+        let right_rows = batches(Arc::clone(&right), "SELECT count(*) AS rows FROM logs").await;
+        assert_eq!(i64_column(&right_rows, "rows"), vec![Some(2)]);
+
+        let crossed = batches(
+            Arc::clone(&left),
+            "SELECT wal_sequence FROM logs WHERE tenant_id = 'tenant-b'",
+        )
+        .await;
+        assert!(u64_column(&crossed, "wal_sequence").is_empty());
+
+        let missing_table = match engine()
+            .execute(left, "SELECT body FROM other", QueryOptions::default())
+            .await
+        {
+            Ok(_) => panic!("another table was accepted"),
+            Err(error) => error,
+        };
+        assert!(matches!(missing_table, QueryError::Planning(_)));
+    }
+
+    #[tokio::test]
     async fn sql_on_an_empty_snapshot_returns_no_rows() {
         let rows = batches(store(), "SELECT count(*) AS rows FROM logs").await;
         assert_eq!(i64_column(&rows, "rows"), vec![Some(0)]);
@@ -1173,6 +1230,7 @@ mod tests {
         let engine = engine();
         let store = store();
         for sql in [
+            "",
             "INSERT INTO logs VALUES (1)",
             "EXPLAIN SELECT * FROM logs",
             "SELECT * FROM logs; SELECT * FROM logs",
