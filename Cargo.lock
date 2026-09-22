@@ -2108,7 +2108,17 @@ dependencies = [
 name = "observer-query"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "async-trait",
+ "bytes",
  "datafusion",
+ "observer-protocol",
+ "observer-storage",
+ "observer-wal",
+ "prost",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

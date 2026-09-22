@@ -6,7 +6,19 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+arrow-schema.workspace = true
+async-trait = "0.1"
 datafusion.workspace = true
+observer-storage = { path = "../observer-storage" }
+
+[dev-dependencies]
+arrow-array.workspace = true
+bytes.workspace = true
+observer-protocol = { path = "../observer-protocol" }
+observer-wal = { path = "../observer-wal" }
+prost.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true
