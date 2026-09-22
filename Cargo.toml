@@ -2,6 +2,7 @@
 members = [
     "crates/observer-ingest",
     "crates/observer-protocol",
+    "crates/observer-query",
     "crates/observer-storage",
     "crates/observer-wal",
     "crates/observerd",
@@ -11,19 +12,20 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.98"
 license = "AGPL-3.0-only"
 
 [workspace.dependencies]
-arrow-array = "60"
-arrow-schema = "60"
+arrow-array = "59.3"
+arrow-schema = "59.3"
+datafusion = { version = "55.1.0", default-features = false, features = ["sql", "parquet"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 base64 = "0.23"
 blake3 = "1"
 bytes = "1"
 crc32c = "0.6"
 opentelemetry-proto = { version = "0.33.0", default-features = false, features = ["gen-tonic", "logs"] }
-parquet = { version = "60", default-features = false, features = ["arrow", "snap"] }
+parquet = { version = "59.3", default-features = false, features = ["arrow", "snap"] }
 proptest = "1"
 prost = "0.14.4"
 reqwest = { version = "0.12", default-features = false }

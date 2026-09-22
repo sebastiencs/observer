@@ -413,12 +413,14 @@ fn encode_type(body: &mut Vec<u8>, data_type: &DataType) -> Result<(), CommitErr
 
 fn write_metadata(
     body: &mut Vec<u8>,
-    metadata: &arrow_schema::Metadata,
+    metadata: &std::collections::HashMap<String, String>,
 ) -> Result<(), CommitError> {
     let count = u32::try_from(metadata.len())
         .map_err(|_| CommitError::Invalid("too much schema metadata".to_owned()))?;
     body.extend_from_slice(&count.to_le_bytes());
-    for (key, value) in metadata.iter() {
+    let mut entries: Vec<_> = metadata.iter().collect();
+    entries.sort_by(|left, right| left.0.cmp(right.0));
+    for (key, value) in entries {
         write_str(body, key);
         write_str(body, value);
     }
