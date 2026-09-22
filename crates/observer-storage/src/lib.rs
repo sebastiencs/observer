@@ -2,6 +2,7 @@
 
 mod canonical_json;
 mod decode;
+mod dynamic;
 mod memtable;
 mod schema;
 
@@ -9,6 +10,11 @@ pub use canonical_json::{
     CanonicalJsonError, MAX_JSON_DEPTH, canonical_any_value_json, canonical_attributes_json,
 };
 pub use decode::{DecodeError, DecodedLogs, DecodedPartition, decode_logs_frame};
+pub use dynamic::{
+    AttributeSource, DynamicColumn, DynamicError, DynamicIdentity, DynamicKind, DynamicLimits,
+    DynamicProjection, DynamicValue, FIELD_KIND, FIELD_PATH, FIELD_SOURCE, ordered_field_names,
+    project_dynamic_fields,
+};
 pub use memtable::{
     Appended, Clock, Generation, GenerationPartition, ManualClock, Memtable, MemtableConfig,
     MemtableError, Snapshot, SystemClock,

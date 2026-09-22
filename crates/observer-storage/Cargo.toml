@@ -9,6 +9,7 @@ license.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 base64.workspace = true
+blake3.workspace = true
 observer-protocol = { path = "../observer-protocol" }
 observer-wal = { path = "../observer-wal" }
 prost.workspace = true

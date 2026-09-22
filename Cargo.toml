@@ -19,6 +19,7 @@ arrow-array = "60"
 arrow-schema = "60"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 base64 = "0.23"
+blake3 = "1"
 bytes = "1"
 crc32c = "0.6"
 opentelemetry-proto = { version = "0.33.0", default-features = false, features = ["gen-tonic", "logs"] }
