@@ -414,7 +414,7 @@ mod tests {
         Appended, Clock, Generation, ManualClock, Memtable, MemtableConfig, MemtableError,
         SystemClock,
     };
-    use crate::{EventHour, decode_logs_frame};
+    use crate::{DynamicLimits, EventHour, decode_logs_frame};
     use arrow_array::{Array, StringArray};
     use bytes::Bytes;
     use observer_protocol::otlp::{
@@ -459,13 +459,19 @@ mod tests {
                 ..Default::default()
             }],
         };
-        decode_logs_frame(&Frame {
-            sequence,
-            signal: FrameSignal::Logs,
-            received_at_unix_nanos: 1,
-            tenant_id: "tenant-a".to_owned(),
-            payload: Bytes::from(request.encode_to_vec()),
-        })
+        decode_logs_frame(
+            &Frame {
+                sequence,
+                signal: FrameSignal::Logs,
+                received_at_unix_nanos: 1,
+                tenant_id: "tenant-a".to_owned(),
+                payload: Bytes::from(request.encode_to_vec()),
+            },
+            DynamicLimits {
+                max_depth: 4,
+                max_columns: 32,
+            },
+        )
         .expect("decode")
     }
 

@@ -80,13 +80,27 @@ impl EventHour {
     }
 }
 
-/// Stable logs schema shared by every decoded batch.
+/// Stable core and JSON fallback columns.
+///
+/// Dynamic attribute columns are appended by [`logs_batch_schema`]. A batch schema matches this
+/// value only when the frame admitted no dynamic fields.
 #[must_use]
 pub fn logs_schema() -> SchemaRef {
     static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
     SCHEMA
         .get_or_init(|| std::sync::Arc::new(Schema::new(schema_fields())))
         .clone()
+}
+
+/// Core columns followed by the frame's admitted dynamic fields.
+#[must_use]
+pub fn logs_batch_schema(dynamic: &[Field]) -> SchemaRef {
+    if dynamic.is_empty() {
+        return logs_schema();
+    }
+    let mut fields = schema_fields();
+    fields.extend(dynamic.iter().cloned());
+    std::sync::Arc::new(Schema::new(fields))
 }
 
 fn schema_fields() -> Vec<Field> {
@@ -149,7 +163,8 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{EventHour, logs_schema, schema_fields};
+    use super::{EventHour, logs_batch_schema, logs_schema, schema_fields};
+    use arrow_schema::{DataType, Field};
 
     fn nanos(seconds: u64) -> u64 {
         seconds * 1_000_000_000
@@ -165,6 +180,24 @@ mod tests {
             assert_eq!(field.name(), expected.name());
             assert_eq!(field.data_type(), expected.data_type());
             assert_eq!(field.is_nullable(), expected.is_nullable());
+        }
+    }
+
+    #[test]
+    fn batch_schema_keeps_core_fields_and_appends_dynamic_ones() {
+        assert!(std::sync::Arc::ptr_eq(
+            &logs_batch_schema(&[]),
+            &logs_schema()
+        ));
+        let extra = Field::new("log_status_i64", DataType::Int64, true);
+        let schema = logs_batch_schema(std::slice::from_ref(&extra));
+        assert_eq!(schema.fields().len(), logs_schema().fields().len() + 1);
+        assert_eq!(
+            schema.fields().last().map(std::convert::AsRef::as_ref),
+            Some(&extra)
+        );
+        for (index, field) in logs_schema().fields().iter().enumerate() {
+            assert_eq!(schema.field(index), field.as_ref());
         }
     }
 

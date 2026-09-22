@@ -11,9 +11,10 @@ pub use canonical_json::{
 };
 pub use decode::{DecodeError, DecodedLogs, DecodedPartition, decode_logs_frame};
 pub use dynamic::{
-    AttributeSource, DynamicColumn, DynamicError, DynamicIdentity, DynamicKind, DynamicLimits,
-    DynamicProjection, DynamicValue, FIELD_KIND, FIELD_PATH, FIELD_SOURCE, ordered_field_names,
-    project_dynamic_fields,
+    AttributeSource, DynamicColumn, DynamicError, DynamicField, DynamicIdentity, DynamicKind,
+    DynamicLimits, DynamicProjection, DynamicSchema, DynamicValue, FIELD_KIND, FIELD_PATH,
+    FIELD_SOURCE, discover_dynamic_schema, ordered_field_names, project_dynamic_fields,
+    record_dynamic_values,
 };
 pub use memtable::{
     Appended, Clock, Generation, GenerationPartition, ManualClock, Memtable, MemtableConfig,
@@ -26,5 +27,5 @@ pub use schema::{
     COLUMN_SERVICE_NAME, COLUMN_SEVERITY_NUMBER, COLUMN_SEVERITY_TEXT, COLUMN_SPAN_ID,
     COLUMN_TENANT_ID, COLUMN_TIME_UNIX_NANO, COLUMN_TRACE_ID, COLUMN_WAL_SEQUENCE, EventHour,
     SCHEMA_VERSION, SERVICE_NAME_ATTRIBUTE, SPAN_ID_BYTES, SPAN_ID_LEN, TRACE_ID_BYTES,
-    TRACE_ID_LEN, logs_schema,
+    TRACE_ID_LEN, logs_batch_schema, logs_schema,
 };

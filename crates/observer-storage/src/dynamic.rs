@@ -7,7 +7,11 @@
 //! [`DynamicLimits::max_columns`] stay out of the projection. This module does not build
 //! `RecordBatch` values and does not replace the canonical JSON attribute columns.
 
-use std::{collections::BTreeSet, error::Error, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+};
 
 use arrow_schema::{DataType, Field};
 use observer_protocol::otlp::{AnyValue, KeyValue, any_value};
@@ -167,22 +171,36 @@ impl DynamicColumn {
     /// Metadata preserves the original source, path, and type.
     #[must_use]
     pub fn arrow_field(&self) -> Field {
-        let mut metadata = std::collections::HashMap::new();
-        metadata.insert(
-            FIELD_SOURCE.to_owned(),
-            self.identity.source.as_str().to_owned(),
-        );
-        metadata.insert(
-            FIELD_PATH.to_owned(),
-            serde_json::to_string(&self.identity.path).expect("attribute path is JSON"),
-        );
-        metadata.insert(
-            FIELD_KIND.to_owned(),
-            self.identity.kind.as_str().to_owned(),
-        );
-        Field::new(&self.physical_name, self.identity.kind.data_type(), true)
-            .with_metadata(metadata)
+        arrow_field(&self.identity, &self.physical_name)
     }
+}
+
+/// Admitted dynamic field, without a row value.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct DynamicField {
+    /// Exact source, path, and type.
+    pub identity: DynamicIdentity,
+    /// Normalized physical field name, including a digest suffix when names collide.
+    pub physical_name: String,
+}
+
+impl DynamicField {
+    /// Nullable Arrow field for this column.
+    ///
+    /// Metadata preserves the original source, path, and type.
+    #[must_use]
+    pub fn arrow_field(&self) -> Field {
+        arrow_field(&self.identity, &self.physical_name)
+    }
+}
+
+/// Frame-wide dynamic fields admitted under a column cap.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicSchema {
+    /// Fields ordered by physical name, then exact identity.
+    pub fields: Vec<DynamicField>,
+    /// Fields excluded by the column cap, ordered by base name, then identity.
+    pub overflow: Vec<DynamicIdentity>,
 }
 
 /// How far nested maps flatten, and how many dynamic columns a projection may admit.
@@ -251,35 +269,93 @@ pub fn project_dynamic_fields<'a>(
     groups: impl IntoIterator<Item = (AttributeSource, &'a [KeyValue])>,
     limits: DynamicLimits,
 ) -> Result<DynamicProjection, DynamicError> {
+    let leaves = record_dynamic_values(groups, limits.max_depth)?;
+    let schema = discover_dynamic_schema(
+        leaves.iter().map(|(identity, _)| identity.clone()),
+        limits.max_columns,
+    )?;
+    let mut values: BTreeMap<DynamicIdentity, DynamicValue> = leaves.into_iter().collect();
+    let columns = schema
+        .fields
+        .into_iter()
+        .map(|field| DynamicColumn {
+            value: values
+                .remove(&field.identity)
+                .expect("admitted field has a value"),
+            identity: field.identity,
+            physical_name: field.physical_name,
+        })
+        .collect();
+    Ok(DynamicProjection {
+        columns,
+        overflow: schema.overflow,
+    })
+}
+
+/// Flatten one record's attribute lists into last-wins leaves.
+///
+/// The column cap and collision suffixes are applied later by [`discover_dynamic_schema`], so
+/// every record in a frame can share one naming decision.
+///
+/// # Errors
+///
+/// Returns [`DynamicError::CanonicalJson`] when a JSON leaf exceeds the canonical encoder depth.
+pub fn record_dynamic_values<'a>(
+    groups: impl IntoIterator<Item = (AttributeSource, &'a [KeyValue])>,
+    max_depth: usize,
+) -> Result<Vec<(DynamicIdentity, DynamicValue)>, DynamicError> {
     let mut collected = Vec::new();
     for (source, attributes) in groups {
-        collect_attributes(&mut collected, source, attributes, &[], 0, limits.max_depth)?;
+        collect_attributes(&mut collected, source, attributes, &[], 0, max_depth)?;
     }
-
-    let mut pending: Vec<PendingLeaf> = collected
+    Ok(collected
         .into_iter()
-        .map(PendingLeaf::from_collected)
-        .collect();
+        .map(|leaf| {
+            (
+                DynamicIdentity {
+                    source: leaf.source,
+                    path: leaf.path,
+                    kind: leaf.value.kind(),
+                },
+                leaf.value,
+            )
+        })
+        .collect())
+}
+
+/// Admit a deterministic subset of field identities and assign physical names.
+///
+/// Duplicate identities collapse. Collision suffixes are assigned only among admitted fields.
+///
+/// # Errors
+///
+/// Returns [`DynamicError::DigestCollision`] when a full digest does not separate a collision group.
+pub fn discover_dynamic_schema(
+    identities: impl IntoIterator<Item = DynamicIdentity>,
+    max_columns: usize,
+) -> Result<DynamicSchema, DynamicError> {
+    let mut pending: Vec<NamedIdentity> = identities.into_iter().map(NamedIdentity::new).collect();
     pending.sort_by(|left, right| {
         left.base_name
             .cmp(&right.base_name)
             .then_with(|| left.identity.cmp(&right.identity))
     });
-    let overflow = if pending.len() > limits.max_columns {
-        pending.split_off(limits.max_columns)
+    pending.dedup_by(|left, right| left.identity == right.identity);
+    let overflow = if pending.len() > max_columns {
+        pending.split_off(max_columns)
     } else {
         Vec::new()
     };
     assign_physical_names(&mut pending)?;
-    let mut columns: Vec<DynamicColumn> =
-        pending.into_iter().map(PendingLeaf::into_column).collect();
-    columns.sort_by(|left, right| {
+    let mut fields: Vec<DynamicField> =
+        pending.into_iter().map(NamedIdentity::into_field).collect();
+    fields.sort_by(|left, right| {
         left.physical_name
             .cmp(&right.physical_name)
             .then_with(|| left.identity.cmp(&right.identity))
     });
-    Ok(DynamicProjection {
-        columns,
+    Ok(DynamicSchema {
+        fields,
         overflow: overflow.into_iter().map(|leaf| leaf.identity).collect(),
     })
 }
@@ -299,36 +375,39 @@ struct Collected {
     value: DynamicValue,
 }
 
-struct PendingLeaf {
+struct NamedIdentity {
     identity: DynamicIdentity,
-    value: DynamicValue,
     base_name: String,
     physical_name: String,
 }
 
-impl PendingLeaf {
-    fn from_collected(leaf: Collected) -> Self {
-        let identity = DynamicIdentity {
-            source: leaf.source,
-            path: leaf.path,
-            kind: leaf.value.kind(),
-        };
+impl NamedIdentity {
+    fn new(identity: DynamicIdentity) -> Self {
         let base_name = base_name(&identity);
         Self {
             identity,
-            value: leaf.value,
             base_name,
             physical_name: String::new(),
         }
     }
 
-    fn into_column(self) -> DynamicColumn {
-        DynamicColumn {
+    fn into_field(self) -> DynamicField {
+        DynamicField {
             identity: self.identity,
-            value: self.value,
             physical_name: self.physical_name,
         }
     }
+}
+
+fn arrow_field(identity: &DynamicIdentity, physical_name: &str) -> Field {
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(FIELD_SOURCE.to_owned(), identity.source.as_str().to_owned());
+    metadata.insert(
+        FIELD_PATH.to_owned(),
+        serde_json::to_string(&identity.path).expect("attribute path is JSON"),
+    );
+    metadata.insert(FIELD_KIND.to_owned(), identity.kind.as_str().to_owned());
+    Field::new(physical_name, identity.kind.data_type(), true).with_metadata(metadata)
 }
 
 fn collect_attributes(
@@ -451,7 +530,7 @@ fn normalize_segment(segment: &str) -> String {
     normalized
 }
 
-fn assign_physical_names(leaves: &mut [PendingLeaf]) -> Result<(), DynamicError> {
+fn assign_physical_names(leaves: &mut [NamedIdentity]) -> Result<(), DynamicError> {
     let mut index = 0;
     while index < leaves.len() {
         let base = leaves[index].base_name.clone();
