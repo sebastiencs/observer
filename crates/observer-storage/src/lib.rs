@@ -1,13 +1,18 @@
-//! Arrow schema and OTLP log decoding for local storage.
+//! Arrow schema, OTLP log decoding, and in-memory generations.
 
 mod canonical_json;
 mod decode;
+mod memtable;
 mod schema;
 
 pub use canonical_json::{
     CanonicalJsonError, MAX_JSON_DEPTH, canonical_any_value_json, canonical_attributes_json,
 };
 pub use decode::{DecodeError, DecodedLogs, DecodedPartition, decode_logs_frame};
+pub use memtable::{
+    Appended, Clock, Generation, GenerationPartition, ManualClock, Memtable, MemtableConfig,
+    MemtableError, Snapshot, SystemClock,
+};
 pub use schema::{
     COLUMN_BODY, COLUMN_EVENT_TIME_UNIX_NANO, COLUMN_LOG_ATTRIBUTES,
     COLUMN_OBSERVED_TIME_UNIX_NANO, COLUMN_RECEIVED_TIME_UNIX_NANO, COLUMN_RECORD_INDEX,
