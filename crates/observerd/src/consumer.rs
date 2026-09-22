@@ -1,5 +1,8 @@
 //! One blocking WAL consumer per configured tenant.
 //!
+//! Each tenant store is created once. [`ConsumerSet`] keeps that [`Store`] and the consumer thread
+//! receives a clone. A later query uses [`ConsumerSet::store`] instead of opening the tenant again.
+//!
 //! Startup reconciles the published sequence with the WAL checkpoint. The worker then decodes
 //! complete logs frames into the memtable, publishes a frozen generation, and only afterwards
 //! checkpoints that generation's exclusive cursor and retains sealed WAL segments. Shutdown drains
@@ -7,6 +10,7 @@
 //! where the last durable commit put it.
 
 use std::{
+    collections::HashMap,
     io,
     path::PathBuf,
     sync::{
@@ -27,11 +31,23 @@ use observer_wal::{WalCheckpoint, WalError, WalReader, retain_committed};
 use crate::config::{Config, StorageConfig};
 
 /// Consumers for every configured tenant.
-#[derive(Debug)]
 pub struct ConsumerSet {
     failed: Arc<AtomicBool>,
     flush: Vec<Sender<()>>,
     joins: Vec<JoinHandle<Result<(), ConsumerError>>>,
+    stores: HashMap<String, Arc<Store>>,
+}
+
+impl std::fmt::Debug for ConsumerSet {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut tenants: Vec<_> = self.stores.keys().collect();
+        tenants.sort();
+        formatter
+            .debug_struct("ConsumerSet")
+            .field("failed", &self.failed.load(Ordering::Relaxed))
+            .field("tenants", &tenants)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Why a tenant consumer stopped before a clean flush.
@@ -155,21 +171,23 @@ impl ConsumerSet {
             if durable < committed {
                 return Err(ConsumerError::StorageBehind { durable, committed });
             }
-            prepared.push((directory, store));
+            prepared.push((tenant.to_owned(), directory, Arc::new(store)));
         }
 
         let mut flush: Vec<Sender<()>> = Vec::new();
         let mut joins: Vec<JoinHandle<Result<(), ConsumerError>>> = Vec::new();
-        for (directory, store) in prepared {
+        let mut stores = HashMap::new();
+        for (tenant, directory, store) in prepared {
             let (sender, receiver) = mpsc::channel();
             let failed = Arc::clone(&failed);
             let poll_interval = config.storage.poll_interval;
             let publish = publish.clone();
+            let worker = Arc::clone(&store);
             let handle = match thread::Builder::new()
                 .name("obs-consumer".to_owned())
                 .spawn(move || {
                     let result = run(
-                        store,
+                        worker,
                         directory,
                         receiver,
                         poll_interval,
@@ -195,12 +213,23 @@ impl ConsumerSet {
             };
             flush.push(sender);
             joins.push(handle);
+            stores.insert(tenant, store);
         }
         Ok(Self {
             failed,
             flush,
             joins,
+            stores,
         })
+    }
+
+    /// The live store for `tenant`, shared with that tenant's consumer.
+    ///
+    /// The daemon has no query listener yet, so only tests call this.
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn store(&self, tenant: &str) -> Option<Arc<Store>> {
+        self.stores.get(tenant).map(Arc::clone)
     }
 
     /// Shared flag set when any consumer returns an error.
@@ -261,7 +290,7 @@ fn dynamic_limits(storage: &StorageConfig) -> DynamicLimits {
 }
 
 fn run(
-    store: Store,
+    store: Arc<Store>,
     directory: PathBuf,
     flush: Receiver<()>,
     poll_interval: Duration,
@@ -431,6 +460,7 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+    use tokio_stream::StreamExt;
 
     fn config(root: &Path, max_rows: u64) -> Config {
         config_with(root, max_rows, 2)
@@ -637,6 +667,122 @@ min_free_bytes = 0
             bodies(&config.data_directory, "tenant-a"),
             vec![Some("late".to_owned())]
         );
+    }
+
+    fn live_bodies(store: &Store) -> Vec<Option<String>> {
+        let snapshot = store.snapshot().expect("snapshot");
+        let batches = store.scan(&snapshot, &Scan::default()).expect("scan");
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column_by_name(observer_storage::COLUMN_BODY)
+                    .expect("body")
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .expect("utf8");
+                (0..column.len())
+                    .map(|row| (!column.is_null(row)).then(|| column.value(row).to_owned()))
+            })
+            .collect()
+    }
+
+    fn wait_for_bodies(store: &Store, expected: &[Option<String>]) {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            if live_bodies(store) == expected {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "store rows were {:?}, expected {expected:?}",
+            live_bodies(store)
+        );
+    }
+
+    fn query_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime")
+    }
+
+    async fn collect_bodies(mut stream: observer_query::QueryBatchStream) -> Vec<String> {
+        let mut bodies = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.expect("batch");
+            let column = batch
+                .column_by_name("body")
+                .expect("body")
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .expect("utf8");
+            for row in 0..column.len() {
+                bodies.push(column.value(row).to_owned());
+            }
+        }
+        bodies
+    }
+
+    fn query_bodies(runtime: &tokio::runtime::Runtime, store: Arc<Store>) -> Vec<String> {
+        let engine =
+            observer_query::QueryEngine::new(observer_query::QueryEngine::MEMORY_POOL_BYTES)
+                .expect("engine");
+        runtime.block_on(async move {
+            let stream = engine
+                .execute(
+                    store,
+                    "SELECT body FROM logs ORDER BY body",
+                    observer_query::QueryOptions::default(),
+                )
+                .await
+                .expect("execute");
+            collect_bodies(stream).await
+        })
+    }
+
+    #[test]
+    fn a_query_uses_the_live_store_and_keeps_its_snapshot() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = config(root.path(), 100);
+        let directory = tenant_dir(root.path(), "tenant-a");
+        let consumers = ConsumerSet::start(&config, ["tenant-a"]).expect("start");
+        assert!(consumers.store("tenant-b").is_none());
+        let store = consumers.store("tenant-a").expect("live store");
+        let runtime = query_runtime();
+        let engine =
+            observer_query::QueryEngine::new(observer_query::QueryEngine::MEMORY_POOL_BYTES)
+                .expect("engine");
+
+        write_payload(&directory, "tenant-a", logs_at("active", 1));
+        wait_for_bodies(&store, &[Some("active".to_owned())]);
+        assert_eq!(store.durable_sequence().expect("durable"), None);
+
+        let pinned = runtime
+            .block_on(engine.execute(
+                Arc::clone(&store),
+                "SELECT body FROM logs ORDER BY body",
+                observer_query::QueryOptions::default(),
+            ))
+            .expect("pin");
+        write_payload(&directory, "tenant-a", logs_at("later", 2));
+        wait_for_bodies(
+            &store,
+            &[Some("active".to_owned()), Some("later".to_owned())],
+        );
+        assert_eq!(store.durable_sequence().expect("durable"), None);
+
+        consumers.shutdown().expect("flush");
+        assert_eq!(
+            runtime.block_on(collect_bodies(pinned)),
+            vec!["active".to_owned()]
+        );
+        assert_eq!(
+            query_bodies(&runtime, Arc::clone(&store)),
+            vec!["active".to_owned(), "later".to_owned()]
+        );
+        assert_eq!(store.durable_sequence().expect("durable"), Some(2));
     }
 
     #[test]

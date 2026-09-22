@@ -2166,6 +2166,7 @@ dependencies = [
  "nix",
  "observer-ingest",
  "observer-protocol",
+ "observer-query",
  "observer-storage",
  "observer-wal",
  "proptest",

@@ -24,6 +24,7 @@ observer-storage = { path = "../observer-storage" }
 tonic.workspace = true
 bytes.workspace = true
 observer-protocol = { path = "../observer-protocol" }
+observer-query = { path = "../observer-query" }
 observer-wal = { path = "../observer-wal" }
 proptest.workspace = true
 prost.workspace = true
