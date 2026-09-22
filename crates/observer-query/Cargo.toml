@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+arrow-array.workspace = true
 arrow-schema.workspace = true
 async-trait = "0.1"
 datafusion.workspace = true

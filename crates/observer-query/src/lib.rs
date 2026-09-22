@@ -1,24 +1,36 @@
 //! Internal SQL execution over one tenant snapshot.
 //!
 //! [`QueryEngine::execute`] pins one [`Store`] snapshot, registers a single `logs` table, and
-//! returns an Arrow stream. Rows come from the active and frozen generations, with one DataFusion
-//! partition per event hour. Published Parquet files are not read yet.
+//! returns an Arrow stream. Each event hour is one partition. That partition unions the hour's
+//! active and frozen batches with the Parquet files named by published commits. A file that is not
+//! named by a commit is not read.
 //!
 //! Results have no order unless the SQL contains `ORDER BY`. The tenant is the store passed to
 //! `execute`, never a value inside the SQL. Only one `SELECT` statement is accepted.
 //!
 //! This crate does not expose an HTTP or gRPC query API.
 
+use std::path::Path;
 use std::sync::Arc;
 
+use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::MemTable;
+use datafusion::datasource::listing::PartitionedFile;
+use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::{SessionConfig, SessionContext};
+use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::logical_expr::{Expr, TableType};
-use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::union::UnionExec;
+use datafusion::physical_plan::{
+    ExecutionPlan, ExecutionPlanProperties, SendableRecordBatchStream,
+};
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::Statement;
 use observer_storage::{Scan, Store, StoreError, StoreSnapshot, align_batch};
@@ -88,7 +100,7 @@ impl QueryEngine {
         &self.runtime
     }
 
-    /// Run one `SELECT` against the active and frozen rows visible in `store` at call time.
+    /// Run one `SELECT` against the rows visible in `store` at call time.
     ///
     /// The returned stream has no order unless `sql` contains `ORDER BY`.
     ///
@@ -114,14 +126,22 @@ impl QueryEngine {
     }
 }
 
+/// One event hour's visible batches and commit-referenced Parquet files.
+struct HourPartition {
+    files: Vec<std::path::PathBuf>,
+    batches: Vec<RecordBatch>,
+}
+
 /// DataFusion table for one pinned tenant snapshot.
 ///
-/// Memory batches are aligned to [`StoreSnapshot::schema`] and grouped into one partition per
-/// event hour. The provider keeps the store so a later scan can add the snapshot's Parquet files.
+/// Each [`HourPartition`] becomes one output partition. Within that partition, memory batches and
+/// commit-referenced Parquet files are aligned to [`StoreSnapshot::schema`]. Missing nullable
+/// columns are typed nulls.
 pub struct ObserverTableProvider {
     store: Arc<Store>,
     snapshot: StoreSnapshot,
-    table: MemTable,
+    schema: SchemaRef,
+    hours: Vec<HourPartition>,
 }
 
 impl std::fmt::Debug for ObserverTableProvider {
@@ -129,51 +149,51 @@ impl std::fmt::Debug for ObserverTableProvider {
         formatter
             .debug_struct("ObserverTableProvider")
             .field("epoch", &self.snapshot.epoch)
+            .field("hours", &self.hours.len())
             .field("store", &Arc::as_ptr(&self.store))
             .finish_non_exhaustive()
     }
 }
 
 impl ObserverTableProvider {
-    /// Align the snapshot's in-memory batches and build the DataFusion memory table.
+    /// Align the snapshot's in-memory batches and keep the commit-referenced Parquet paths.
     ///
     /// # Errors
     ///
     /// Returns [`QueryError::Storage`] when the snapshot schema is incompatible or a batch cannot
-    /// be aligned. Returns [`QueryError::Planning`] when DataFusion rejects those partitions.
+    /// be aligned.
     pub fn new(store: Arc<Store>, snapshot: StoreSnapshot) -> Result<Self, QueryError> {
         let schema = snapshot.schema().map_err(QueryError::Storage)?;
-        let mut partitions = Vec::new();
+        let mut hours = Vec::new();
         for hour in store.sources(&snapshot, &Scan::default()) {
-            if hour.batches.is_empty() {
+            if hour.files.is_empty() && hour.batches.is_empty() {
                 continue;
             }
-            let mut aligned = Vec::with_capacity(hour.batches.len());
+            let mut batches = Vec::with_capacity(hour.batches.len());
             for batch in &hour.batches {
-                aligned.push(
+                batches.push(
                     align_batch(batch, Arc::clone(&schema))
                         .map_err(|error| QueryError::Storage(StoreError::from(error)))?,
                 );
             }
-            partitions.push(aligned);
+            hours.push(HourPartition {
+                files: hour.files,
+                batches,
+            });
         }
-        if partitions.is_empty() {
-            partitions.push(Vec::new());
-        }
-        let table =
-            MemTable::try_new(Arc::clone(&schema), partitions).map_err(QueryError::Planning)?;
         Ok(Self {
             store,
             snapshot,
-            table,
+            schema,
+            hours,
         })
     }
 }
 
 #[async_trait]
 impl TableProvider for ObserverTableProvider {
-    fn schema(&self) -> arrow_schema::SchemaRef {
-        self.table.schema()
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
     }
 
     fn table_type(&self) -> TableType {
@@ -184,10 +204,75 @@ impl TableProvider for ObserverTableProvider {
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        self.table.scan(state, projection, filters, limit).await
+        if self.hours.is_empty() {
+            let table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![]])?;
+            return table.scan(state, projection, &[], None).await;
+        }
+        let mut hour_plans = Vec::with_capacity(self.hours.len());
+        for hour in &self.hours {
+            hour_plans.push(hour_plan(state, &self.schema, hour, projection).await?);
+        }
+        UnionExec::try_new(hour_plans)
+    }
+}
+
+async fn hour_plan(
+    state: &dyn Session,
+    schema: &SchemaRef,
+    hour: &HourPartition,
+    projection: Option<&Vec<usize>>,
+) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+    let mut inputs = Vec::new();
+    if !hour.files.is_empty() {
+        inputs.push(parquet_plan(schema, &hour.files, projection)?);
+    }
+    if !hour.batches.is_empty() {
+        let table = MemTable::try_new(Arc::clone(schema), vec![hour.batches.clone()])?;
+        inputs.push(table.scan(state, projection, &[], None).await?);
+    }
+    one_partition(UnionExec::try_new(inputs)?)
+}
+
+fn parquet_plan(
+    schema: &SchemaRef,
+    files: &[std::path::PathBuf],
+    projection: Option<&Vec<usize>>,
+) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+    let mut groups = Vec::with_capacity(files.len());
+    for file in files {
+        groups.push(FileGroup::new(vec![partitioned_file(file)?]));
+    }
+    let source = Arc::new(ParquetSource::new(Arc::clone(schema)));
+    let mut builder = FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source)
+        .with_file_groups(groups);
+    if let Some(indices) = projection {
+        builder = builder.with_projection_indices(Some(indices.clone()))?;
+    }
+    Ok(DataSourceExec::from_data_source(builder.build()))
+}
+
+fn partitioned_file(path: &Path) -> datafusion::error::Result<PartitionedFile> {
+    let metadata =
+        std::fs::metadata(path).map_err(|error| DataFusionError::External(Box::new(error)))?;
+    let path = path.to_str().ok_or_else(|| {
+        DataFusionError::External(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "parquet path is not utf-8",
+        )))
+    })?;
+    Ok(PartitionedFile::new(path, metadata.len()))
+}
+
+fn one_partition(
+    plan: Arc<dyn ExecutionPlan>,
+) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+    if plan.output_partitioning().partition_count() > 1 {
+        Ok(Arc::new(CoalescePartitionsExec::new(plan)))
+    } else {
+        Ok(plan)
     }
 }
 
@@ -219,6 +304,7 @@ fn ensure_query(sql: &str) -> Result<(), QueryError> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -228,7 +314,9 @@ mod tests {
     use observer_protocol::otlp::{
         AnyValue, ExportLogsServiceRequest, KeyValue, LogRecord, ResourceLogs, ScopeLogs, any_value,
     };
-    use observer_storage::{DynamicLimits, ManualClock, MemtableConfig, Store, decode_logs_frame};
+    use observer_storage::{
+        DynamicLimits, ManualClock, MemtableConfig, PublishOptions, Scan, Store, decode_logs_frame,
+    };
     use observer_wal::{Frame, FrameSignal};
     use prost::Message;
 
@@ -236,10 +324,9 @@ mod tests {
 
     const HOUR: u64 = 3_600_000_000_000;
 
-    fn store() -> Arc<Store> {
-        let directory = tempfile::tempdir().expect("tempdir");
+    fn open_at(path: &Path) -> Arc<Store> {
         let opened = Store::open(
-            directory.keep(),
+            path,
             "tenant-a",
             MemtableConfig {
                 max_rows: 100,
@@ -252,6 +339,11 @@ mod tests {
         )
         .expect("open");
         Arc::new(opened)
+    }
+
+    fn store() -> Arc<Store> {
+        let directory = tempfile::tempdir().expect("tempdir");
+        open_at(&directory.keep())
     }
 
     fn frame(sequence: u64, time: u64, attributes: Vec<KeyValue>) -> observer_storage::DecodedLogs {
@@ -285,6 +377,23 @@ mod tests {
             },
         )
         .expect("decode")
+    }
+
+    fn empty_frame(sequence: u64) -> observer_storage::DecodedLogs {
+        decode_logs_frame(
+            &Frame {
+                sequence,
+                signal: FrameSignal::Logs,
+                received_at_unix_nanos: 1,
+                tenant_id: "tenant-a".to_owned(),
+                payload: Bytes::from(ExportLogsServiceRequest::default().encode_to_vec()),
+            },
+            DynamicLimits {
+                max_depth: 4,
+                max_columns: 32,
+            },
+        )
+        .expect("decode empty")
     }
 
     fn attribute(key: &str, value: i64) -> KeyValue {
@@ -426,6 +535,66 @@ mod tests {
         store.append(&frame(1, 0, Vec::new())).expect("later");
         let rows = collect(stream).await.expect("collect");
         assert_eq!(u64_column(&rows, "wal_sequence"), [0]);
+    }
+
+    #[tokio::test]
+    async fn sql_reads_each_snapshot_row_once() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = open_at(directory.path());
+        store.append(&frame(0, 0, Vec::new())).expect("append");
+        store.rotate().expect("rotate");
+        store.publish(&PublishOptions::default()).expect("publish");
+        store
+            .append(&frame(1, HOUR, vec![attribute("a", 1)]))
+            .expect("frozen");
+        store.rotate().expect("rotate");
+        store
+            .append(&frame(2, HOUR * 2, vec![attribute("b", 2)]))
+            .expect("active");
+
+        let rows = batches(
+            Arc::clone(&store),
+            "SELECT wal_sequence, log_a_i64, log_b_i64 FROM logs ORDER BY wal_sequence",
+        )
+        .await;
+        assert_eq!(u64_column(&rows, "wal_sequence"), [0, 1, 2]);
+        assert_eq!(i64_column(&rows, "log_a_i64"), vec![None, Some(1), None]);
+        assert_eq!(i64_column(&rows, "log_b_i64"), vec![None, None, Some(2)]);
+
+        let published = store.sources(&store.snapshot().expect("snapshot"), &Scan::default());
+        let committed = &published[0].files[0];
+        std::fs::copy(committed, committed.with_file_name("stray.parquet")).expect("stray");
+        let once = batches(Arc::clone(&store), "SELECT wal_sequence FROM logs").await;
+        let mut sequences = u64_column(&once, "wal_sequence");
+        sequences.sort_unstable();
+        assert_eq!(sequences, [0, 1, 2]);
+
+        drop(store);
+        let reopened = open_at(directory.path());
+        let durable = batches(
+            reopened,
+            "SELECT wal_sequence FROM logs ORDER BY wal_sequence",
+        )
+        .await;
+        assert_eq!(u64_column(&durable, "wal_sequence"), [0]);
+    }
+
+    #[tokio::test]
+    async fn sql_empty_commit_adds_no_rows() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = open_at(directory.path());
+        store.append(&empty_frame(4)).expect("append");
+        store.rotate().expect("rotate");
+        store.publish(&PublishOptions::default()).expect("publish");
+        let rows = batches(Arc::clone(&store), "SELECT count(*) AS rows FROM logs").await;
+        assert_eq!(i64_column(&rows, "rows"), vec![Some(0)]);
+        drop(store);
+        let reopened = batches(
+            open_at(directory.path()),
+            "SELECT count(*) AS rows FROM logs",
+        )
+        .await;
+        assert_eq!(i64_column(&reopened, "rows"), vec![Some(0)]);
     }
 
     #[tokio::test]
