@@ -12,10 +12,16 @@
 //! Results have no order unless the SQL contains `ORDER BY`. The tenant is the store passed to
 //! `execute`, never a value inside the SQL. Only one `SELECT` statement is accepted.
 //!
+//! One engine shares a bounded memory pool. Each query uses its own session and the timeout and
+//! returned-row cap in [`QueryOptions`]. Dropping or cancelling the result stream stops the query.
+//!
 //! This crate does not expose an HTTP or gRPC query API.
 
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -28,6 +34,7 @@ use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, Pa
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::{SessionConfig, SessionContext};
+use datafusion::execution::memory_pool::GreedyMemoryPool;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType};
@@ -38,6 +45,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::Statement;
+use futures::Stream;
 use observer_storage::{
     COLUMN_EVENT_TIME_UNIX_NANO, EventHour, Scan, Store, StoreError, StoreSnapshot, align_batch,
 };
@@ -50,10 +58,35 @@ pub struct QueryEngine {
     runtime: Arc<RuntimeEnv>,
 }
 
+/// Timeout and returned-row cap for one query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueryOptions {
+    /// Maximum time from the start of [`QueryEngine::execute`] until the result stream finishes.
+    pub timeout: Duration,
+    /// Maximum number of rows the result stream may yield.
+    pub max_rows: usize,
+}
+
+impl QueryOptions {
+    /// Default query timeout.
+    pub const TIMEOUT: Duration = Duration::from_secs(30);
+    /// Default maximum number of returned rows.
+    pub const MAX_ROWS: usize = 10_000;
+}
+
+impl Default for QueryOptions {
+    fn default() -> Self {
+        Self {
+            timeout: Self::TIMEOUT,
+            max_rows: Self::MAX_ROWS,
+        }
+    }
+}
+
 /// Why a query could not be planned or executed.
 #[derive(Debug)]
 pub enum QueryError {
-    /// The DataFusion runtime could not be built.
+    /// The runtime could not be built, or the shared memory pool is exhausted.
     Resources(String),
     /// The pinned snapshot could not be read or aligned.
     Storage(StoreError),
@@ -63,6 +96,15 @@ pub enum QueryError {
     Execution(DataFusionError),
     /// The SQL is not a single `SELECT` statement.
     Statement(String),
+    /// The query exceeded [`QueryOptions::timeout`].
+    Timeout,
+    /// The result stream was cancelled.
+    Cancelled,
+    /// The result would exceed [`QueryOptions::max_rows`].
+    RowLimit {
+        /// The cap that was exceeded.
+        max_rows: usize,
+    },
 }
 
 impl std::fmt::Display for QueryError {
@@ -73,6 +115,11 @@ impl std::fmt::Display for QueryError {
             Self::Planning(error) => write!(formatter, "query planning: {error}"),
             Self::Execution(error) => write!(formatter, "query execution: {error}"),
             Self::Statement(detail) => formatter.write_str(detail),
+            Self::Timeout => formatter.write_str("query timed out"),
+            Self::Cancelled => formatter.write_str("query cancelled"),
+            Self::RowLimit { max_rows } => {
+                write!(formatter, "query exceeded {max_rows} returned rows")
+            }
         }
     }
 }
@@ -82,19 +129,27 @@ impl std::error::Error for QueryError {
         match self {
             Self::Storage(error) => Some(error),
             Self::Planning(error) | Self::Execution(error) => Some(error),
-            Self::Resources(_) | Self::Statement(_) => None,
+            Self::Resources(_)
+            | Self::Statement(_)
+            | Self::Timeout
+            | Self::Cancelled
+            | Self::RowLimit { .. } => None,
         }
     }
 }
 
 impl QueryEngine {
-    /// Build a runtime with DataFusion's default memory pool.
+    /// Bytes available to every query that shares this engine.
+    pub const MEMORY_POOL_BYTES: usize = 256 * 1024 * 1024;
+
+    /// Build a runtime whose queries share one greedy memory pool of `memory_pool_bytes`.
     ///
     /// # Errors
     ///
     /// Returns [`QueryError::Resources`] when the runtime cannot be constructed.
-    pub fn new() -> Result<Self, QueryError> {
+    pub fn new(memory_pool_bytes: usize) -> Result<Self, QueryError> {
         let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(memory_pool_bytes)))
             .build()
             .map_err(|error| QueryError::Resources(error.to_string()))?;
         Ok(Self {
@@ -110,18 +165,29 @@ impl QueryEngine {
 
     /// Run one `SELECT` against the rows visible in `store` at call time.
     ///
-    /// The returned stream has no order unless `sql` contains `ORDER BY`.
+    /// The returned stream has no order unless `sql` contains `ORDER BY`. `options.timeout` covers
+    /// planning and reading the stream. `options.max_rows` is the most rows the stream yields
+    /// before it returns [`QueryError::RowLimit`].
     ///
     /// # Errors
     ///
     /// Returns [`QueryError::Statement`] for an empty string, multiple statements, or any statement
-    /// other than `SELECT`. Storage, planning, and execution failures use the matching variant.
+    /// other than `SELECT`. Storage, planning, execution, timeout, and resource failures use the
+    /// matching variant.
     pub async fn execute(
         &self,
         store: Arc<Store>,
         sql: &str,
-    ) -> Result<SendableRecordBatchStream, QueryError> {
+        options: QueryOptions,
+    ) -> Result<QueryBatchStream, QueryError> {
+        if options.timeout.is_zero() {
+            return Err(QueryError::Timeout);
+        }
+        let deadline = tokio::time::Instant::now() + options.timeout;
         ensure_query(sql)?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(QueryError::Timeout);
+        }
         let snapshot = store.snapshot().map_err(QueryError::Storage)?;
         let provider = ObserverTableProvider::new(Arc::clone(&store), snapshot)?;
         let context =
@@ -130,7 +196,103 @@ impl QueryEngine {
             .register_table(LOGS_TABLE, Arc::new(provider))
             .map_err(QueryError::Planning)?;
         let frame = context.sql(sql).await.map_err(QueryError::Planning)?;
-        frame.execute_stream().await.map_err(QueryError::Execution)
+        if tokio::time::Instant::now() >= deadline {
+            return Err(QueryError::Timeout);
+        }
+        let inner = frame.execute_stream().await.map_err(execution_error)?;
+        Ok(QueryBatchStream {
+            inner: Some(inner),
+            deadline: Box::pin(tokio::time::sleep_until(deadline)),
+            max_rows: options.max_rows,
+            emitted: 0,
+            pending: None,
+        })
+    }
+}
+
+/// Arrow batches for one query, with the engine's timeout and row cap applied.
+pub struct QueryBatchStream {
+    inner: Option<SendableRecordBatchStream>,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    max_rows: usize,
+    emitted: usize,
+    pending: Option<QueryError>,
+}
+
+impl QueryBatchStream {
+    /// Stop the query. The next poll returns [`QueryError::Cancelled`] and no further batches.
+    pub fn cancel(&mut self) {
+        if self.inner.take().is_some() {
+            self.pending = Some(QueryError::Cancelled);
+        }
+    }
+}
+
+impl Stream for QueryBatchStream {
+    type Item = Result<RecordBatch, QueryError>;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let stream = self.get_mut();
+        if let Some(error) = stream.pending.take() {
+            return Poll::Ready(Some(Err(error)));
+        }
+        if stream.inner.is_none() {
+            return Poll::Ready(None);
+        }
+        if stream.deadline.as_mut().poll(context).is_ready() {
+            stream.inner = None;
+            return Poll::Ready(Some(Err(QueryError::Timeout)));
+        }
+        let polled = stream
+            .inner
+            .as_mut()
+            .map(|inner| Pin::new(inner).poll_next(context));
+        match polled {
+            Some(Poll::Pending) => Poll::Pending,
+            None | Some(Poll::Ready(None)) => {
+                stream.inner = None;
+                Poll::Ready(None)
+            }
+            Some(Poll::Ready(Some(Err(error)))) => {
+                stream.inner = None;
+                Poll::Ready(Some(Err(execution_error(error))))
+            }
+            Some(Poll::Ready(Some(Ok(batch)))) => {
+                let rows = batch.num_rows();
+                if rows > 0 && stream.emitted.saturating_add(rows) > stream.max_rows {
+                    stream.inner = None;
+                    Poll::Ready(Some(Err(QueryError::RowLimit {
+                        max_rows: stream.max_rows,
+                    })))
+                } else {
+                    stream.emitted += rows;
+                    Poll::Ready(Some(Ok(batch)))
+                }
+            }
+        }
+    }
+}
+
+fn execution_error(error: DataFusionError) -> QueryError {
+    if memory_exhausted(&error) {
+        QueryError::Resources(error.to_string())
+    } else {
+        QueryError::Execution(error)
+    }
+}
+
+fn memory_exhausted(error: &DataFusionError) -> bool {
+    match error {
+        DataFusionError::ResourcesExhausted(_) => true,
+        DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => {
+            memory_exhausted(inner)
+        }
+        DataFusionError::Shared(inner) => memory_exhausted(inner),
+        DataFusionError::Collection(errors) => errors.iter().any(memory_exhausted),
+        DataFusionError::External(error) => error
+            .downcast_ref::<DataFusionError>()
+            .is_some_and(memory_exhausted),
+        _ => false,
     }
 }
 
@@ -450,7 +612,7 @@ async fn hour_plan(
 ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
     let mut inputs = Vec::new();
     if !hour.files.is_empty() {
-        inputs.push(parquet_plan(schema, &hour.files, projection)?);
+        inputs.push(parquet_plan(schema, &hour.files, projection).await?);
     }
     if !hour.batches.is_empty() {
         let table = MemTable::try_new(Arc::clone(schema), vec![hour.batches.clone()])?;
@@ -459,14 +621,14 @@ async fn hour_plan(
     one_partition(UnionExec::try_new(inputs)?)
 }
 
-fn parquet_plan(
+async fn parquet_plan(
     schema: &SchemaRef,
     files: &[std::path::PathBuf],
     projection: Option<&Vec<usize>>,
 ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
     let mut groups = Vec::with_capacity(files.len());
     for file in files {
-        groups.push(FileGroup::new(vec![partitioned_file(file)?]));
+        groups.push(FileGroup::new(vec![partitioned_file(file).await?]));
     }
     let source = Arc::new(ParquetSource::new(Arc::clone(schema)));
     let mut builder = FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source)
@@ -477,16 +639,23 @@ fn parquet_plan(
     Ok(DataSourceExec::from_data_source(builder.build()))
 }
 
-fn partitioned_file(path: &Path) -> datafusion::error::Result<PartitionedFile> {
-    let metadata =
-        std::fs::metadata(path).map_err(|error| DataFusionError::External(Box::new(error)))?;
-    let path = path.to_str().ok_or_else(|| {
-        DataFusionError::External(Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "parquet path is not utf-8",
-        )))
-    })?;
-    Ok(PartitionedFile::new(path, metadata.len()))
+async fn partitioned_file(path: &Path) -> datafusion::error::Result<PartitionedFile> {
+    let path = path.to_path_buf();
+    let text = path
+        .to_str()
+        .ok_or_else(|| {
+            DataFusionError::External(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "parquet path is not utf-8",
+            )))
+        })?
+        .to_owned();
+    let length =
+        tokio::task::spawn_blocking(move || std::fs::metadata(&path).map(|meta| meta.len()))
+            .await
+            .map_err(|error| DataFusionError::External(Box::new(error)))?
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    Ok(PartitionedFile::new(text, length))
 }
 
 fn one_partition(
@@ -537,7 +706,6 @@ mod tests {
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::execution::context::SessionContext;
     use datafusion::physical_plan::ExecutionPlan;
-    use datafusion::physical_plan::common::collect;
     use observer_protocol::otlp::{
         AnyValue, ExportLogsServiceRequest, KeyValue, LogRecord, ResourceLogs, ScopeLogs, any_value,
     };
@@ -546,8 +714,9 @@ mod tests {
     };
     use observer_wal::{Frame, FrameSignal};
     use prost::Message;
+    use tokio_stream::StreamExt;
 
-    use super::{ObserverTableProvider, QueryEngine, QueryError};
+    use super::{ObserverTableProvider, QueryEngine, QueryError, QueryOptions};
 
     const HOUR: u64 = 3_600_000_000_000;
 
@@ -633,10 +802,20 @@ mod tests {
         }
     }
 
+    fn engine() -> QueryEngine {
+        QueryEngine::new(QueryEngine::MEMORY_POOL_BYTES).expect("engine")
+    }
+
     async fn batches(store: Arc<Store>, sql: &str) -> Vec<arrow_array::RecordBatch> {
-        let engine = QueryEngine::new().expect("engine");
-        let stream = engine.execute(store, sql).await.expect("execute");
-        collect(stream).await.expect("collect")
+        let mut stream = engine()
+            .execute(store, sql, QueryOptions::default())
+            .await
+            .expect("execute");
+        let mut rows = Vec::new();
+        while let Some(batch) = stream.next().await {
+            rows.push(batch.expect("batch"));
+        }
+        rows
     }
 
     fn u64_column(batches: &[arrow_array::RecordBatch], name: &str) -> Vec<u64> {
@@ -754,13 +933,20 @@ mod tests {
     async fn sql_pins_the_snapshot_taken_at_execute() {
         let store = store();
         store.append(&frame(0, 0, Vec::new())).expect("append");
-        let engine = QueryEngine::new().expect("engine");
-        let stream = engine
-            .execute(Arc::clone(&store), "SELECT wal_sequence FROM logs")
+        let engine = engine();
+        let mut stream = engine
+            .execute(
+                Arc::clone(&store),
+                "SELECT wal_sequence FROM logs",
+                QueryOptions::default(),
+            )
             .await
             .expect("execute");
         store.append(&frame(1, 0, Vec::new())).expect("later");
-        let rows = collect(stream).await.expect("collect");
+        let mut rows = Vec::new();
+        while let Some(batch) = stream.next().await {
+            rows.push(batch.expect("batch"));
+        }
         assert_eq!(u64_column(&rows, "wal_sequence"), [0]);
     }
 
@@ -984,20 +1170,26 @@ mod tests {
 
     #[tokio::test]
     async fn sql_rejects_non_query_statements() {
-        let engine = QueryEngine::new().expect("engine");
+        let engine = engine();
         let store = store();
         for sql in [
             "INSERT INTO logs VALUES (1)",
             "EXPLAIN SELECT * FROM logs",
             "SELECT * FROM logs; SELECT * FROM logs",
         ] {
-            let error = match engine.execute(Arc::clone(&store), sql).await {
+            let error = match engine
+                .execute(Arc::clone(&store), sql, QueryOptions::default())
+                .await
+            {
                 Ok(_) => panic!("{sql} was accepted"),
                 Err(error) => error,
             };
             assert!(matches!(error, QueryError::Statement(_)), "{sql}: {error}");
         }
-        let missing = match engine.execute(store, "SELECT missing FROM logs").await {
+        let missing = match engine
+            .execute(store, "SELECT missing FROM logs", QueryOptions::default())
+            .await
+        {
             Ok(_) => panic!("missing column was accepted"),
             Err(error) => error,
         };
@@ -1006,7 +1198,114 @@ mod tests {
 
     #[test]
     fn builds_a_shared_runtime() {
-        let engine = QueryEngine::new().expect("runtime");
+        let engine = engine();
         assert_eq!(engine.runtime().memory_pool.reserved(), 0);
+        assert_eq!(engine.runtime().memory_pool.name(), "greedy");
+    }
+
+    #[tokio::test]
+    async fn timeout_and_row_limit_stop_the_query() {
+        let store = store();
+        store.append(&frame(0, 1, Vec::new())).expect("append");
+        store.append(&frame(1, 2, Vec::new())).expect("append");
+        let timed_out = engine()
+            .execute(
+                Arc::clone(&store),
+                "SELECT wal_sequence FROM logs",
+                QueryOptions {
+                    timeout: Duration::ZERO,
+                    max_rows: QueryOptions::MAX_ROWS,
+                },
+            )
+            .await;
+        assert!(matches!(timed_out, Err(QueryError::Timeout)));
+
+        let mut stream = engine()
+            .execute(
+                store,
+                "SELECT wal_sequence FROM logs",
+                QueryOptions {
+                    timeout: QueryOptions::TIMEOUT,
+                    max_rows: 1,
+                },
+            )
+            .await
+            .expect("execute");
+        let mut yielded = 0;
+        let mut limited = false;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(batch) => yielded += batch.num_rows(),
+                Err(QueryError::RowLimit { max_rows: 1 }) => {
+                    limited = true;
+                    break;
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+        assert!(yielded <= 1, "yielded {yielded} rows");
+        assert!(limited);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_query_times_out_while_its_stream_is_open() {
+        let store = store();
+        store.append(&frame(0, 1, Vec::new())).expect("append");
+        let mut stream = engine()
+            .execute(
+                store,
+                "SELECT wal_sequence FROM logs",
+                QueryOptions {
+                    timeout: Duration::from_secs(5),
+                    max_rows: QueryOptions::MAX_ROWS,
+                },
+            )
+            .await
+            .expect("execute");
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let expired = stream.next().await.expect("timeout");
+        assert!(matches!(expired, Err(QueryError::Timeout)));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_stream_stops_the_query() {
+        let store = store();
+        store.append(&frame(0, 1, Vec::new())).expect("append");
+        let engine = engine();
+        let mut stream = engine
+            .execute(
+                store,
+                "SELECT wal_sequence FROM logs ORDER BY wal_sequence",
+                QueryOptions::default(),
+            )
+            .await
+            .expect("execute");
+        stream.cancel();
+        let error = stream.next().await.expect("cancelled");
+        assert!(matches!(error, Err(QueryError::Cancelled)));
+        assert!(stream.next().await.is_none());
+        assert_eq!(engine.runtime().memory_pool.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_tiny_memory_pool_rejects_a_sorting_query() {
+        let store = store();
+        store.append(&frame(0, 1, Vec::new())).expect("append");
+        store.append(&frame(1, 2, Vec::new())).expect("append");
+        let engine = QueryEngine::new(1).expect("engine");
+        let executed = engine
+            .execute(
+                store,
+                "SELECT wal_sequence FROM logs ORDER BY wal_sequence",
+                QueryOptions::default(),
+            )
+            .await;
+        let error = match executed {
+            Ok(mut stream) => stream.next().await.expect("exhausted"),
+            Err(error) => Err(error),
+        };
+        assert!(matches!(error, Err(QueryError::Resources(_))), "{error:?}");
     }
 }

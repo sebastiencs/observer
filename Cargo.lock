@@ -2113,12 +2113,14 @@ dependencies = [
  "async-trait",
  "bytes",
  "datafusion",
+ "futures",
  "observer-protocol",
  "observer-storage",
  "observer-wal",
  "prost",
  "tempfile",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

@@ -10,7 +10,9 @@ arrow-array.workspace = true
 arrow-schema.workspace = true
 async-trait = "0.1"
 datafusion.workspace = true
+futures = { version = "0.3", default-features = false, features = ["std"] }
 observer-storage = { path = "../observer-storage" }
+tokio = { workspace = true, features = ["rt", "time"] }
 
 [dev-dependencies]
 arrow-array.workspace = true
@@ -19,7 +21,8 @@ observer-protocol = { path = "../observer-protocol" }
 observer-wal = { path = "../observer-wal" }
 prost.workspace = true
 tempfile = "3"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "time"] }
+tokio-stream.workspace = true
 
 [lints]
 workspace = true
