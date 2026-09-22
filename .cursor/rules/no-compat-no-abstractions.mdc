@@ -1,0 +1,46 @@
+---
+description: No compatibility layers and no unnecessary abstractions; the project is unreleased
+alwaysApply: true
+---
+
+# No compatibility layers, no extra abstractions
+
+Observer has not been released. There are no external callers, on-disk formats, or wire protocols that must keep working. Change the code to the shape it should have.
+
+## Do not keep a compatibility layer
+
+When a type, function, format, config key, or protocol field changes, update every caller and delete the old path in the same change.
+
+- Do not add shims, aliases, `#[deprecated]` wrappers, versioned codecs, feature flags, or dual read/write paths so old and new code coexist.
+- Do not preserve an old on-disk layout, frame, or API "just in case." Replace it.
+- Tests should cover the current behavior only.
+
+```rust
+// Bad: old constructor kept so nothing else has to move
+pub fn open(path: &Path) -> Result<Wal> {
+    Self::open_v2(path, WalOptions::default())
+}
+
+// Good: one constructor, callers updated
+pub fn open(path: &Path, options: WalOptions) -> Result<Wal> { /* ... */ }
+```
+
+## Do not add an abstraction you do not need
+
+Prefer a concrete type and a straight function. Add a trait, generic, newtype, or module split only when a second implementation exists or the split removes real duplication.
+
+- One implementor means no trait.
+- A parameter or a private function is enough when only call-site configuration changes.
+- Do not introduce a wrapper whose only job is to forward to the type it holds.
+
+```rust
+// Bad: trait with a single impl, plus a pass-through wrapper
+trait MemtableStore { fn insert(&mut self, key: Key, value: Value); }
+struct MemtableStoreImpl(Memtable);
+impl MemtableStore for MemtableStoreImpl {
+    fn insert(&mut self, key: Key, value: Value) { self.0.insert(key, value); }
+}
+
+// Good: call Memtable directly
+memtable.insert(key, value);
+```

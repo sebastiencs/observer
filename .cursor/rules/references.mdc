@@ -1,0 +1,9 @@
+---
+description: Other implementations
+alwaysApply: true
+---
+
+Here are the code to some other implementations:
+/home/sebastien/travaux/{parseable,VictoriaLogs,openobserve,quickwit,greptimedb,CLickHouse,lmnr}
+
+When designing our architecture, you can see how they're implemented, compare them, and learn from them
