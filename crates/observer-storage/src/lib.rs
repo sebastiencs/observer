@@ -34,14 +34,18 @@
 //!
 //! One active or frozen generation has one union schema and a BLAKE3 fingerprint of that schema.
 //! While it is active, individual batches can omit dynamic columns. Freezing reorders every batch
-//! to the union schema and fills the gaps with typed nulls. Generations that admitted the same
+//! to the union schema and fills the gaps with typed nulls. A frozen generation can be written as
+//! local Snappy Parquet at
+//! `tenants/<tenant>/date=YYYY-MM-DD/hour=HH/<first>-<next>.parquet`. Generations that admitted the same
 //! fields share a fingerprint. A later scan groups those generations together, skips a generation
 //! whose schema lacks a filtered column, and fills columns that generation lacks with typed nulls.
 
 mod canonical_json;
 mod decode;
 mod dynamic;
+mod layout;
 mod memtable;
+mod parquet;
 mod schema;
 
 pub use canonical_json::{
@@ -54,9 +58,15 @@ pub use dynamic::{
     FIELD_SOURCE, discover_dynamic_schema, dynamic_identity, ordered_field_names,
     project_dynamic_fields, record_dynamic_values,
 };
+pub use layout::{hour_directory, parquet_file_name, parquet_path};
 pub use memtable::{
     Appended, Clock, Generation, GenerationPartition, ManualClock, Memtable, MemtableConfig,
     MemtableError, Snapshot, SystemClock, align_batch,
+};
+pub use parquet::{
+    META_FINGERPRINT, META_HOUR_END_UNIX_NANO, META_HOUR_START_UNIX_NANO, META_PROJECTION_VERSION,
+    META_ROW_COUNT, META_WAL_FIRST_SEQUENCE, META_WAL_NEXT_SEQUENCE, ParquetError, ParquetFault,
+    ParquetFile, ParquetWriteOptions, read_parquet_batches, write_generation,
 };
 pub use schema::{
     COLUMN_BODY, COLUMN_EVENT_TIME_UNIX_NANO, COLUMN_LOG_ATTRIBUTES,
@@ -64,6 +74,6 @@ pub use schema::{
     COLUMN_RESOURCE_ATTRIBUTES, COLUMN_SCHEMA_VERSION, COLUMN_SCOPE_ATTRIBUTES,
     COLUMN_SERVICE_NAME, COLUMN_SEVERITY_NUMBER, COLUMN_SEVERITY_TEXT, COLUMN_SPAN_ID,
     COLUMN_TENANT_ID, COLUMN_TIME_UNIX_NANO, COLUMN_TRACE_ID, COLUMN_WAL_SEQUENCE, EventHour,
-    SCHEMA_VERSION, SERVICE_NAME_ATTRIBUTE, SPAN_ID_BYTES, SPAN_ID_LEN, TRACE_ID_BYTES,
-    TRACE_ID_LEN, core_logs_schema, logs_batch_schema,
+    PROJECTION_VERSION, SCHEMA_VERSION, SERVICE_NAME_ATTRIBUTE, SPAN_ID_BYTES, SPAN_ID_LEN,
+    TRACE_ID_BYTES, TRACE_ID_LEN, core_logs_schema, logs_batch_schema,
 };

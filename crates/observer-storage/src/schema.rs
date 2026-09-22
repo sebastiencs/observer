@@ -7,6 +7,9 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 /// Schema version stamped on every decoded row.
 pub const SCHEMA_VERSION: u16 = 1;
 
+/// Projection version stored in Parquet schema metadata.
+pub const PROJECTION_VERSION: u32 = 1;
+
 /// Resource attribute promoted into [`COLUMN_SERVICE_NAME`].
 pub const SERVICE_NAME_ATTRIBUTE: &str = "service.name";
 

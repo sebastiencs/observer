@@ -12,12 +12,14 @@ base64.workspace = true
 blake3.workspace = true
 observer-protocol = { path = "../observer-protocol" }
 observer-wal = { path = "../observer-wal" }
+parquet.workspace = true
 prost.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
 bytes.workspace = true
 proptest.workspace = true
+tempfile = "3"
 
 [lints]
 workspace = true
