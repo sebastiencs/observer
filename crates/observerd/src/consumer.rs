@@ -107,6 +107,14 @@ impl From<DecodeError> for ConsumerError {
     }
 }
 
+/// Fault injected after a commit descriptor is durable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StepFault {
+    None,
+    #[cfg(test)]
+    Retention,
+}
+
 impl ConsumerSet {
     /// Recover every tenant store, then start its consumer thread.
     ///
@@ -117,6 +125,15 @@ impl ConsumerSet {
     pub fn start(
         config: &Config,
         tenants: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<Self, ConsumerError> {
+        Self::start_with(config, tenants, PublishOptions::default(), StepFault::None)
+    }
+
+    fn start_with(
+        config: &Config,
+        tenants: impl IntoIterator<Item = impl AsRef<str>>,
+        publish: PublishOptions,
+        step: StepFault,
     ) -> Result<Self, ConsumerError> {
         let failed = Arc::new(AtomicBool::new(false));
         let limits = dynamic_limits(&config.storage);
@@ -147,10 +164,19 @@ impl ConsumerSet {
             let (sender, receiver) = mpsc::channel();
             let failed = Arc::clone(&failed);
             let poll_interval = config.storage.poll_interval;
+            let publish = publish.clone();
             let handle = match thread::Builder::new()
                 .name("obs-consumer".to_owned())
                 .spawn(move || {
-                    let result = run(store, directory, receiver, poll_interval, limits);
+                    let result = run(
+                        store,
+                        directory,
+                        receiver,
+                        poll_interval,
+                        limits,
+                        publish,
+                        step,
+                    );
                     if result.is_err() {
                         failed.store(true, Ordering::SeqCst);
                     }
@@ -240,6 +266,8 @@ fn run(
     flush: Receiver<()>,
     poll_interval: Duration,
     limits: DynamicLimits,
+    publish: PublishOptions,
+    step: StepFault,
 ) -> Result<(), ConsumerError> {
     let (mut checkpoint, mut reader) = reconcile(&directory, &store)?;
     let mut flushing = false;
@@ -247,10 +275,17 @@ fn run(
         match reader.next_record()? {
             Some(record) => {
                 let decoded = decode_logs_frame(&record.frame, limits)?;
-                ingest(&store, &decoded, &directory, &mut checkpoint)?;
+                ingest(
+                    &store,
+                    &decoded,
+                    &directory,
+                    &mut checkpoint,
+                    &publish,
+                    step,
+                )?;
             }
             None if flushing => {
-                finish(&store, &directory, &mut checkpoint)?;
+                finish(&store, &directory, &mut checkpoint, &publish, step)?;
                 return Ok(());
             }
             None => {
@@ -275,7 +310,7 @@ fn reconcile(
         return Err(ConsumerError::StorageBehind { durable, committed });
     }
     if durable > committed {
-        advance_checkpoint(directory, &mut checkpoint, durable)?;
+        advance_checkpoint(directory, &mut checkpoint, durable, StepFault::None)?;
     }
     let reader = WalReader::open_at(directory, checkpoint.cursor())?;
     Ok((checkpoint, reader))
@@ -286,17 +321,19 @@ fn ingest(
     decoded: &observer_storage::DecodedLogs,
     directory: &std::path::Path,
     checkpoint: &mut WalCheckpoint,
+    publish: &PublishOptions,
+    step: StepFault,
 ) -> Result<(), ConsumerError> {
     loop {
         match store.append(decoded) {
             Ok(appended) => {
                 if appended.sealed {
-                    publish_ready(store, directory, checkpoint)?;
+                    publish_ready(store, directory, checkpoint, publish, step)?;
                 }
                 return Ok(());
             }
             Err(StoreError::Memtable(MemtableError::FrozenLimit)) => {
-                if !publish_ready(store, directory, checkpoint)? {
+                if !publish_ready(store, directory, checkpoint, publish, step)? {
                     return Err(ConsumerError::FrozenStuck);
                 }
             }
@@ -309,19 +346,21 @@ fn finish(
     store: &Store,
     directory: &std::path::Path,
     checkpoint: &mut WalCheckpoint,
+    publish: &PublishOptions,
+    step: StepFault,
 ) -> Result<(), ConsumerError> {
     loop {
         match store.rotate() {
             Ok(_) => break,
             Err(StoreError::Memtable(MemtableError::FrozenLimit)) => {
-                if !publish_ready(store, directory, checkpoint)? {
+                if !publish_ready(store, directory, checkpoint, publish, step)? {
                     return Err(ConsumerError::FrozenStuck);
                 }
             }
             Err(error) => return Err(error.into()),
         }
     }
-    publish_ready(store, directory, checkpoint)?;
+    publish_ready(store, directory, checkpoint, publish, step)?;
     Ok(())
 }
 
@@ -329,13 +368,15 @@ fn publish_ready(
     store: &Store,
     directory: &std::path::Path,
     checkpoint: &mut WalCheckpoint,
+    publish: &PublishOptions,
+    step: StepFault,
 ) -> Result<bool, ConsumerError> {
     let mut published = false;
     loop {
-        match store.publish(&PublishOptions::default())? {
+        match store.publish(publish)? {
             None => return Ok(published),
             Some(commit) => {
-                advance_checkpoint(directory, checkpoint, commit.next_sequence)?;
+                advance_checkpoint(directory, checkpoint, commit.next_sequence, step)?;
                 published = true;
             }
         }
@@ -346,12 +387,21 @@ fn advance_checkpoint(
     directory: &std::path::Path,
     checkpoint: &mut WalCheckpoint,
     sequence: u64,
+    step: StepFault,
 ) -> Result<(), ConsumerError> {
     if checkpoint.cursor().next_sequence() == sequence {
         return Ok(());
     }
     let positioned = WalReader::open_from_sequence(directory, sequence)?;
     checkpoint.commit(positioned.cursor())?;
+    #[cfg(test)]
+    if step == StepFault::Retention {
+        return Err(ConsumerError::Wal(WalError::Io(io::Error::other(
+            "injected retention fault",
+        ))));
+    }
+    #[cfg(not(test))]
+    let _ = step;
     retain_committed(directory)?;
     Ok(())
 }
@@ -367,9 +417,13 @@ mod tests {
     };
     use observer_protocol::{AcceptedBatch, Signal};
     use observer_storage::{
-        DynamicLimits, PublishOptions, Scan, Store, SystemClock, decode_logs_frame,
+        CommitFault, CommitWriteOptions, DynamicLimits, EventHour, ParquetFault,
+        ParquetWriteOptions, PublishOptions, Scan, Store, SystemClock, decode_logs_frame,
     };
-    use observer_wal::{Wal, WalCheckpoint, WalConfig, WalReader, tenant_wal_directory};
+    use observer_wal::{
+        SEGMENT_HEADER_SIZE, Wal, WalCheckpoint, WalConfig, WalReader, encoded_frame_size,
+        tenant_wal_directory,
+    };
     use prost::Message;
     use std::{
         path::Path,
@@ -379,6 +433,10 @@ mod tests {
     };
 
     fn config(root: &Path, max_rows: u64) -> Config {
+        config_with(root, max_rows, 2)
+    }
+
+    fn config_with(root: &Path, max_rows: u64, max_frozen: usize) -> Config {
         Config::parse(&format!(
             r#"
 wal_directory = "{wal}"
@@ -394,7 +452,7 @@ admin = "127.0.0.1:3"
 max_rows = {max_rows}
 max_bytes = 67108864
 max_age_ms = 3600000
-max_frozen = 2
+max_frozen = {max_frozen}
 max_dynamic_columns = 32
 max_depth = 4
 poll_interval_ms = 10
@@ -424,11 +482,15 @@ min_free_bytes = 0
     }
 
     fn logs_payload(body: &str) -> Vec<u8> {
+        logs_at(body, 1)
+    }
+
+    fn logs_at(body: &str, time_unix_nano: u64) -> Vec<u8> {
         ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
                 scope_logs: vec![ScopeLogs {
                     log_records: vec![LogRecord {
-                        time_unix_nano: 1,
+                        time_unix_nano,
                         body: Some(AnyValue {
                             value: Some(any_value::Value::StringValue(body.to_owned())),
                         }),
@@ -475,6 +537,43 @@ min_free_bytes = 0
                     .map(|row| (!column.is_null(row)).then(|| column.value(row).to_owned()))
             })
             .collect()
+    }
+
+    fn sequences(data: &Path, tenant: &str) -> Vec<u64> {
+        let store = Store::open(
+            data,
+            tenant,
+            observer_storage::MemtableConfig {
+                max_rows: 100,
+                max_bytes: u64::MAX,
+                max_age: Duration::from_secs(60),
+                max_frozen: 2,
+                max_dynamic_columns: 32,
+            },
+            Arc::new(SystemClock),
+        )
+        .expect("store");
+        let snapshot = store.snapshot().expect("snapshot");
+        let batches = store.scan(&snapshot, &Scan::default()).expect("scan");
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column_by_name(observer_storage::COLUMN_WAL_SEQUENCE)
+                    .expect("sequence")
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt64Array>()
+                    .expect("u64");
+                (0..column.len()).map(|row| column.value(row))
+            })
+            .collect()
+    }
+
+    fn checkpoint_sequence(directory: &Path) -> u64 {
+        WalCheckpoint::load(directory)
+            .expect("checkpoint")
+            .cursor()
+            .next_sequence()
     }
 
     fn wait_for_sequence(directory: &Path, sequence: u64) {
@@ -626,5 +725,372 @@ min_free_bytes = 0
                 committed: 1
             }
         ));
+    }
+
+    #[test]
+    fn ingestion_during_flush_publishes_each_row_once() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = config(root.path(), 0);
+        let directory = tenant_dir(root.path(), "tenant-a");
+        let consumers = ConsumerSet::start(&config, ["tenant-a"]).expect("start");
+        let writer = thread::spawn(move || {
+            for index in 0..8 {
+                write_payload(
+                    &directory,
+                    "tenant-a",
+                    logs_payload(&format!("row-{index}")),
+                );
+            }
+        });
+        writer.join().expect("writer");
+        let directory = tenant_dir(root.path(), "tenant-a");
+        wait_for_sequence(&directory, 8);
+        consumers.shutdown().expect("flush");
+        assert_eq!(
+            sequences(&config.data_directory, "tenant-a"),
+            (0..8).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            bodies(&config.data_directory, "tenant-a"),
+            (0..8)
+                .map(|index| Some(format!("row-{index}")))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_full_frozen_queue_publishes_before_retrying_the_blocked_frame() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = config_with(root.path(), 0, 1);
+        let directory = tenant_dir(root.path(), "tenant-a");
+        write_payload(&directory, "tenant-a", logs_payload("first"));
+        write_payload(&directory, "tenant-a", logs_payload("second"));
+        let store = Store::open(
+            &config.data_directory,
+            "tenant-a",
+            super::memtable_config(&config.storage),
+            Arc::new(SystemClock),
+        )
+        .expect("store");
+        let mut reader = WalReader::open(&directory).expect("reader");
+        let first = reader.next_record().expect("read").expect("first");
+        let decoded = decode_logs_frame(&first.frame, super::dynamic_limits(&config.storage))
+            .expect("decode");
+        assert!(store.append(&decoded).expect("append").sealed);
+        let second = reader.next_record().expect("read").expect("second");
+        let decoded = decode_logs_frame(&second.frame, super::dynamic_limits(&config.storage))
+            .expect("decode");
+        let mut checkpoint = WalCheckpoint::load(&directory).expect("checkpoint");
+        super::ingest(
+            &store,
+            &decoded,
+            &directory,
+            &mut checkpoint,
+            &PublishOptions::default(),
+            super::StepFault::None,
+        )
+        .expect("retry");
+        drop(store);
+        assert_eq!(checkpoint_sequence(&directory), 2);
+        assert_eq!(
+            bodies(&config.data_directory, "tenant-a"),
+            vec![Some("first".to_owned()), Some("second".to_owned())]
+        );
+    }
+
+    #[test]
+    fn late_and_multi_hour_rows_scan_once() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = config(root.path(), 100);
+        let directory = tenant_dir(root.path(), "tenant-a");
+        let hour = 3_600_000_000_000;
+        write_payload(&directory, "tenant-a", logs_at("early", 1));
+        write_payload(&directory, "tenant-a", logs_at("late", hour));
+        let consumers = ConsumerSet::start(&config, ["tenant-a"]).expect("start");
+        consumers.shutdown().expect("flush");
+        assert_eq!(sequences(&config.data_directory, "tenant-a"), vec![0, 1]);
+        let store = Store::open(
+            &config.data_directory,
+            "tenant-a",
+            super::memtable_config(&config.storage),
+            Arc::new(SystemClock),
+        )
+        .expect("store");
+        let snapshot = store.snapshot().expect("snapshot");
+        let late = store
+            .scan(
+                &snapshot,
+                &Scan {
+                    columns: Some(vec![observer_storage::COLUMN_BODY.to_owned()]),
+                    from_hour: Some(EventHour::containing(hour)),
+                    to_hour: None,
+                },
+            )
+            .expect("scan");
+        let bodies = late
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column_by_name(observer_storage::COLUMN_BODY)
+                    .expect("body")
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .expect("utf8");
+                (0..column.len()).map(|row| column.value(row).to_owned())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bodies, vec!["late".to_owned()]);
+    }
+
+    #[test]
+    fn repeated_restart_keeps_one_copy_of_each_row() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = config(root.path(), 0);
+        let directory = tenant_dir(root.path(), "tenant-a");
+        write_payload(&directory, "tenant-a", logs_payload("one"));
+        let consumers = ConsumerSet::start(&config, ["tenant-a"]).expect("start");
+        consumers.shutdown().expect("flush");
+        write_payload(&directory, "tenant-a", logs_payload("two"));
+        let consumers = ConsumerSet::start(&config, ["tenant-a"]).expect("restart");
+        wait_for_sequence(&directory, 2);
+        consumers.shutdown().expect("flush");
+        let consumers = ConsumerSet::start(&config, ["tenant-a"]).expect("again");
+        consumers.shutdown().expect("idle");
+        assert_eq!(checkpoint_sequence(&directory), 2);
+        assert_eq!(
+            bodies(&config.data_directory, "tenant-a"),
+            vec![Some("one".to_owned()), Some("two".to_owned())]
+        );
+    }
+
+    #[test]
+    fn sealed_segments_behind_the_checkpoint_are_reclaimed() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = config(root.path(), 0);
+        let directory = tenant_dir(root.path(), "tenant-a");
+        write_rotated(
+            &directory,
+            &[logs_payload("sealed"), logs_payload("opened")],
+        );
+        let consumers = ConsumerSet::start(&config, ["tenant-a"]).expect("start");
+        consumers.shutdown().expect("flush");
+        assert_eq!(checkpoint_sequence(&directory), 2);
+        assert!(
+            lane_names(&directory)
+                .iter()
+                .any(|name| name.ends_with(".open"))
+        );
+        assert!(
+            lane_names(&directory)
+                .iter()
+                .all(|name| !name.ends_with(".wal"))
+        );
+        assert_eq!(
+            bodies(&config.data_directory, "tenant-a"),
+            vec![Some("sealed".to_owned()), Some("opened".to_owned())]
+        );
+    }
+
+    #[test]
+    fn publication_checkpoint_and_retention_crashes_keep_one_complete_generation() {
+        let cases = [
+            Crash::Parquet(ParquetFault::Create),
+            Crash::Parquet(ParquetFault::SyncFile),
+            Crash::Parquet(ParquetFault::Rename),
+            Crash::Parquet(ParquetFault::SyncDir),
+            Crash::Commit(CommitFault::Create),
+            Crash::Commit(CommitFault::SyncFile),
+            Crash::Commit(CommitFault::Rename),
+            Crash::Commit(CommitFault::SyncDir),
+            Crash::Checkpoint,
+            Crash::Retention,
+        ];
+        for crash in cases {
+            let root = tempfile::tempdir().expect("tempdir");
+            let config = config(root.path(), 0);
+            let directory = tenant_dir(root.path(), "tenant-a");
+            write_payload(&directory, "tenant-a", logs_payload("old"));
+            let consumers = ConsumerSet::start(&config, ["tenant-a"]).expect("start");
+            consumers.shutdown().expect("publish old");
+
+            write_payload(&directory, "tenant-a", logs_payload("new"));
+            if matches!(crash, Crash::Checkpoint) {
+                std::fs::create_dir(checkpoint_tmp(&directory)).expect("block checkpoint");
+            }
+            let consumers = ConsumerSet::start_with(
+                &config,
+                ["tenant-a"],
+                crash.publish_options(),
+                crash.step(),
+            )
+            .expect("start faulty");
+            let error = consumers.shutdown().expect_err("fault");
+            if matches!(crash, Crash::Checkpoint) {
+                std::fs::remove_dir(checkpoint_tmp(&directory)).expect("unblock checkpoint");
+                assert!(matches!(error, ConsumerError::Wal(_)), "{error}");
+            }
+            if matches!(crash, Crash::Retention) {
+                assert!(
+                    error.to_string().contains("injected retention fault"),
+                    "{error}"
+                );
+            }
+            assert_eq!(
+                bodies(&config.data_directory, "tenant-a"),
+                crash.bodies_after_fault(),
+                "{crash:?}"
+            );
+            assert_eq!(
+                checkpoint_sequence(&directory),
+                crash.checkpoint_after_fault(),
+                "{crash:?}"
+            );
+
+            let consumers = ConsumerSet::start(&config, ["tenant-a"]).expect("recover");
+            consumers.shutdown().expect("recover flush");
+            assert_eq!(
+                bodies(&config.data_directory, "tenant-a"),
+                vec![Some("old".to_owned()), Some("new".to_owned())],
+                "{crash:?}"
+            );
+            assert_eq!(
+                sequences(&config.data_directory, "tenant-a"),
+                vec![0, 1],
+                "{crash:?}"
+            );
+            assert_eq!(checkpoint_sequence(&directory), 2, "{crash:?}");
+        }
+    }
+
+    #[test]
+    fn retention_failure_keeps_the_sealed_segment_until_the_next_success() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = config(root.path(), 0);
+        let directory = tenant_dir(root.path(), "tenant-a");
+        write_rotated(
+            &directory,
+            &[logs_payload("sealed"), logs_payload("opened")],
+        );
+        let consumers = ConsumerSet::start_with(
+            &config,
+            ["tenant-a"],
+            PublishOptions::default(),
+            super::StepFault::Retention,
+        )
+        .expect("start");
+        let error = consumers.shutdown().expect_err("retention");
+        assert!(error.to_string().contains("injected retention fault"));
+        assert_eq!(checkpoint_sequence(&directory), 1);
+        assert!(
+            lane_names(&directory)
+                .iter()
+                .any(|name| name.ends_with(".wal"))
+        );
+        assert_eq!(
+            bodies(&config.data_directory, "tenant-a"),
+            vec![Some("sealed".to_owned())]
+        );
+
+        let consumers = ConsumerSet::start(&config, ["tenant-a"]).expect("recover");
+        consumers.shutdown().expect("flush");
+        assert_eq!(checkpoint_sequence(&directory), 2);
+        assert!(
+            lane_names(&directory)
+                .iter()
+                .all(|name| !name.ends_with(".wal"))
+        );
+        assert_eq!(
+            bodies(&config.data_directory, "tenant-a"),
+            vec![Some("sealed".to_owned()), Some("opened".to_owned())]
+        );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Crash {
+        Parquet(ParquetFault),
+        Commit(CommitFault),
+        Checkpoint,
+        Retention,
+    }
+
+    impl Crash {
+        fn publish_options(self) -> PublishOptions {
+            match self {
+                Self::Parquet(fault) => PublishOptions {
+                    parquet: ParquetWriteOptions { fault: Some(fault) },
+                    ..PublishOptions::default()
+                },
+                Self::Commit(fault) => PublishOptions {
+                    commit: CommitWriteOptions { fault: Some(fault) },
+                    ..PublishOptions::default()
+                },
+                Self::Checkpoint | Self::Retention => PublishOptions::default(),
+            }
+        }
+
+        fn step(self) -> super::StepFault {
+            match self {
+                Self::Retention => super::StepFault::Retention,
+                _ => super::StepFault::None,
+            }
+        }
+
+        fn bodies_after_fault(self) -> Vec<Option<String>> {
+            match self {
+                Self::Commit(CommitFault::SyncDir) | Self::Checkpoint | Self::Retention => {
+                    vec![Some("old".to_owned()), Some("new".to_owned())]
+                }
+                _ => vec![Some("old".to_owned())],
+            }
+        }
+
+        fn checkpoint_after_fault(self) -> u64 {
+            match self {
+                Self::Retention => 2,
+                _ => 1,
+            }
+        }
+    }
+
+    fn checkpoint_tmp(directory: &Path) -> std::path::PathBuf {
+        directory.join("lane-0000").join("consumer.checkpoint.tmp")
+    }
+
+    fn lane_names(directory: &Path) -> Vec<String> {
+        let mut names = std::fs::read_dir(directory.join("lane-0000"))
+            .expect("lane")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn write_rotated(directory: &Path, payloads: &[Vec<u8>]) {
+        let frame_len =
+            encoded_frame_size("tenant-a".len(), payloads[0].len()).expect("frame size");
+        let target = u64::try_from(SEGMENT_HEADER_SIZE).expect("header")
+            + u64::try_from(frame_len).expect("frame")
+            + 1;
+        let mut wal = Wal::open(WalConfig {
+            directory: directory.to_path_buf(),
+            max_entry_bytes: 1024 * 1024,
+            target_segment_bytes: target,
+        })
+        .expect("wal");
+        for payload in payloads {
+            wal.append(AcceptedBatch {
+                tenant_id: "tenant-a".to_owned(),
+                signal: Signal::Logs,
+                received_at_unix_nanos: 1,
+                payload: Bytes::from(payload.clone()),
+            })
+            .expect("append");
+        }
     }
 }

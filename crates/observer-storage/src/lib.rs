@@ -43,6 +43,26 @@
 //! generation lacks with typed nulls. Generations that admitted the same
 //! fields share a fingerprint. A later filtered scan skips a generation whose schema lacks a
 //! filtered column.
+//!
+//! # Durability
+//!
+//! An ingest acknowledgement means the raw OTLP frame is durable in the WAL. It does not mean the
+//! row is visible in a storage scan. A row becomes durable storage when every Parquet file for its
+//! generation has been synced and the commit descriptor has been renamed into place. The WAL
+//! checkpoint moves only after that descriptor is durable. Retention then deletes sealed WAL
+//! segments whose exclusive end is at or before the checkpoint; the open segment stays.
+//!
+//! A crash during Parquet creation, file sync, rename, or directory sync leaves the previous
+//! complete generation. A crash after the commit descriptor is durable but before the checkpoint
+//! moves exposes the new generation, and restart advances the checkpoint without appending those
+//! rows again. A crash while writing the checkpoint leaves a complete old or new checkpoint. A
+//! crash during retention never deletes a segment past the checkpoint. Startup fails when the
+//! catalog is behind the checkpoint.
+//!
+//! # Deferred
+//!
+//! This crate does not start DataFusion, expose an HTTP query API, upload files to object storage,
+//! compact Parquet, or promote JSON fallback fields into typed columns automatically.
 
 mod canonical_json;
 mod catalog;

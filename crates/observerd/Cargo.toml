@@ -20,6 +20,8 @@ tonic.workspace = true
 [dev-dependencies]
 arrow-array.workspace = true
 nix = { version = "0.30", default-features = false, features = ["signal"] }
+observer-storage = { path = "../observer-storage" }
+tonic.workspace = true
 bytes.workspace = true
 observer-protocol = { path = "../observer-protocol" }
 observer-wal = { path = "../observer-wal" }

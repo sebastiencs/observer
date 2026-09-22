@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::{
     fs,
     net::{SocketAddr, TcpListener},
@@ -50,10 +52,24 @@ pub fn reserve_ports() -> ListenAddrs {
     addrs
 }
 
+pub fn data_directory(wal_directory: &Path) -> std::path::PathBuf {
+    wal_directory.parent().unwrap_or(wal_directory).join("data")
+}
+
 pub fn write_config(path: &Path, wal_directory: &Path, listen: ListenAddrs) {
+    write_tuned(path, wal_directory, listen, 100_000, 1);
+}
+
+pub fn write_tuned(
+    path: &Path,
+    wal_directory: &Path,
+    listen: ListenAddrs,
+    max_rows: u64,
+    min_free_bytes: u64,
+) {
+    let data_directory = data_directory(wal_directory);
     let contents = format!(
-        "wal_directory = {wal_directory:?}\ndata_directory = {data_directory:?}\n\n[listen]\ngrpc = \"{grpc}\"\nhttp = \"{http}\"\nadmin = \"{admin}\"\n\n[tokens]\n\"{SECRET}\" = \"{TENANT}\"\n\"{SECOND_SECRET}\" = \"{SECOND_TENANT}\"\n\n[storage]\nmax_rows = 100000\nmax_bytes = 67108864\nmax_age_ms = 60000\nmax_frozen = 4\nmax_dynamic_columns = 256\nmax_depth = 4\npoll_interval_ms = 20\n\n[readiness]\nmin_free_bytes = 1\n",
-        data_directory = wal_directory.parent().unwrap_or(wal_directory).join("data"),
+        "wal_directory = {wal_directory:?}\ndata_directory = {data_directory:?}\n\n[listen]\ngrpc = \"{grpc}\"\nhttp = \"{http}\"\nadmin = \"{admin}\"\n\n[tokens]\n\"{SECRET}\" = \"{TENANT}\"\n\"{SECOND_SECRET}\" = \"{SECOND_TENANT}\"\n\n[storage]\nmax_rows = {max_rows}\nmax_bytes = 67108864\nmax_age_ms = 60000\nmax_frozen = 4\nmax_dynamic_columns = 256\nmax_depth = 4\npoll_interval_ms = 20\n\n[readiness]\nmin_free_bytes = {min_free_bytes}\n",
         grpc = listen.grpc,
         http = listen.http,
         admin = listen.admin,
@@ -99,6 +115,17 @@ impl Observerd {
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    pub async fn wait_exit(&mut self) -> std::process::ExitStatus {
+        match timeout(TEST_TIMEOUT, self.child.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => panic!(
+                "{}",
+                self.exit_context(format!("wait failed: {error}")).await
+            ),
+            Err(_) => panic!("{}", self.exit_context("timed out waiting for exit").await),
         }
     }
 

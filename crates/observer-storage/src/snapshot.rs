@@ -613,6 +613,24 @@ mod tests {
     }
 
     #[test]
+    fn scan_reads_active_frozen_and_published_rows_once() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = open_store(&directory);
+        seal(&store, frame(0, 0, Vec::new()));
+        store.publish(&PublishOptions::default()).expect("publish");
+        seal(&store, frame(1, 0, Vec::new()));
+        store.append(&frame(2, 0, Vec::new())).expect("active");
+        let snapshot = store.snapshot().expect("snapshot");
+        assert_eq!(snapshot.published.len(), 1);
+        assert_eq!(snapshot.frozen.len(), 1);
+        assert!(snapshot.active.is_some());
+        assert_eq!(
+            sequences(&store.scan(&snapshot, &Scan::default()).expect("scan")),
+            [0, 1, 2]
+        );
+    }
+
+    #[test]
     fn publication_moves_rows_from_memory_to_parquet_exactly_once() {
         let directory = tempfile::tempdir().expect("tempdir");
         let store = open_store(&directory);
