@@ -1,7 +1,8 @@
 //! Durable local Parquet files for one frozen generation.
 //!
-//! Each hour partition becomes one Snappy file. Batches are aligned to the generation schema
-//! before they are written, so missing dynamic columns are typed nulls. The file is flushed and
+//! Each hour partition becomes one Snappy file. Batches are aligned to the generation schema,
+//! then sorted by `event_time_unix_nano DESC, wal_sequence DESC`, so missing dynamic columns are
+//! typed nulls and the stored row order is the newest event first. The file is flushed and
 //! `sync_data`'d, renamed into place, and then every directory down from the hour directory to the
 //! data root is fsynced. Nothing here checkpoints the WAL.
 
@@ -13,7 +14,10 @@ use std::{
 };
 
 use arrow_array::RecordBatch;
+use arrow_ord::sort::{SortColumn, SortOptions, lexsort_to_indices};
 use arrow_schema::{Schema, SchemaRef};
+use arrow_select::concat::concat_batches;
+use arrow_select::take::take_record_batch;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
@@ -22,7 +26,10 @@ use parquet::file::properties::WriterProperties;
 use crate::FileStatistics;
 use crate::layout::{hour_end_unix_nano, sync_ancestors};
 use crate::statistics::file_statistics;
-use crate::{EventHour, Generation, MemtableError, PROJECTION_VERSION, align_batch, parquet_path};
+use crate::{
+    COLUMN_EVENT_TIME_UNIX_NANO, COLUMN_WAL_SEQUENCE, EventHour, Generation, MemtableError,
+    PROJECTION_VERSION, align_batch, parquet_path,
+};
 
 /// Arrow schema metadata key for [`PROJECTION_VERSION`].
 pub const META_PROJECTION_VERSION: &str = "observer.projection_version";
@@ -44,6 +51,12 @@ pub const META_HOUR_START_UNIX_NANO: &str = "observer.hour_start_unix_nano";
 
 /// Arrow schema metadata key for the exclusive UTC hour end.
 pub const META_HOUR_END_UNIX_NANO: &str = "observer.hour_end_unix_nano";
+
+/// Arrow schema metadata key for the row order stored in the file.
+pub const META_SORT_ORDER: &str = "observer.sort";
+
+/// Value of [`META_SORT_ORDER`] for files written by [`write_generation`].
+pub const SORT_ORDER_NEWEST_EVENT: &str = "event_time_unix_nano desc,wal_sequence desc";
 
 /// Where a durability test stops a write.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -163,13 +176,19 @@ pub fn write_generation(
             .iter()
             .map(|batch| align_batch(batch, Arc::clone(&schema)).map_err(ParquetError::Align))
             .collect::<Result<Vec<_>, _>>()?;
-        write_hour(root, &path, &schema, &batches, options)?;
+        let sorted = sort_by_newest_event(&schema, &batches)?;
+        let batches = std::slice::from_ref(&sorted);
+        write_hour(root, &path, &schema, batches, options)?;
         let size_bytes = fs::metadata(&path)?.len();
+        let mut statistics = file_statistics(schema.as_ref(), batches, size_bytes);
+        if let Some(statistics) = statistics.as_mut() {
+            statistics.ordered = true;
+        }
         written.push(ParquetFile {
             hour: partition.hour,
             path,
             rows,
-            statistics: file_statistics(schema.as_ref(), &batches, size_bytes),
+            statistics,
         });
     }
     Ok(written)
@@ -236,7 +255,57 @@ fn file_schema(generation: &Generation, hour: EventHour, rows: u64) -> SchemaRef
         META_HOUR_END_UNIX_NANO.to_owned(),
         hour_end_unix_nano(hour).to_string(),
     );
+    metadata.insert(
+        META_SORT_ORDER.to_owned(),
+        SORT_ORDER_NEWEST_EVENT.to_owned(),
+    );
     Arc::new(Schema::clone(generation.schema.as_ref()).with_metadata(metadata))
+}
+
+/// Sort `batches` by `event_time_unix_nano DESC, wal_sequence DESC`.
+///
+/// # Errors
+///
+/// Returns [`ParquetError`] when the sort columns are missing or Arrow cannot reorder the rows.
+pub fn sort_by_newest_event(
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+) -> Result<RecordBatch, ParquetError> {
+    let batch = if batches.len() == 1 {
+        batches[0].clone()
+    } else {
+        concat_batches(schema, batches).map_err(|error| ParquetError::Storage(error.to_string()))?
+    };
+    if batch.num_rows() <= 1 {
+        return Ok(batch);
+    }
+    let descending = SortOptions {
+        descending: true,
+        nulls_first: true,
+    };
+    let event = batch
+        .column_by_name(COLUMN_EVENT_TIME_UNIX_NANO)
+        .cloned()
+        .ok_or_else(|| ParquetError::Storage("event time column is missing".to_owned()))?;
+    let wal = batch
+        .column_by_name(COLUMN_WAL_SEQUENCE)
+        .cloned()
+        .ok_or_else(|| ParquetError::Storage("wal sequence column is missing".to_owned()))?;
+    let indices = lexsort_to_indices(
+        &[
+            SortColumn {
+                values: event,
+                options: Some(descending),
+            },
+            SortColumn {
+                values: wal,
+                options: Some(descending),
+            },
+        ],
+        None,
+    )
+    .map_err(|error| ParquetError::Storage(error.to_string()))?;
+    take_record_batch(&batch, &indices).map_err(|error| ParquetError::Storage(error.to_string()))
 }
 
 fn row_count(batches: &[Arc<RecordBatch>]) -> Result<u64, ParquetError> {
@@ -308,9 +377,9 @@ mod tests {
     use crate::{
         COLUMN_BODY, COLUMN_WAL_SEQUENCE, DynamicLimits, EventHour, META_FINGERPRINT,
         META_HOUR_END_UNIX_NANO, META_HOUR_START_UNIX_NANO, META_PROJECTION_VERSION,
-        META_ROW_COUNT, META_WAL_FIRST_SEQUENCE, META_WAL_NEXT_SEQUENCE, ManualClock, Memtable,
-        MemtableConfig, PROJECTION_VERSION, decode_logs_frame, hour_directory, parquet_file_name,
-        parquet_path,
+        META_ROW_COUNT, META_SORT_ORDER, META_WAL_FIRST_SEQUENCE, META_WAL_NEXT_SEQUENCE,
+        ManualClock, Memtable, MemtableConfig, PROJECTION_VERSION, SORT_ORDER_NEWEST_EVENT,
+        decode_logs_frame, hour_directory, parquet_file_name, parquet_path,
     };
     use arrow_array::{Array, Int64Array, StringArray, UInt64Array};
     use bytes::Bytes;
@@ -501,7 +570,7 @@ mod tests {
         let first = read_parquet_batches(&written[0].path).expect("read");
         assert_eq!(
             string_values(&first, COLUMN_BODY),
-            vec![Some("row-0".to_owned()), Some("row-1".to_owned())]
+            vec![Some("row-1".to_owned()), Some("row-0".to_owned())]
         );
         let sequences: Vec<u64> = first
             .iter()
@@ -515,9 +584,15 @@ mod tests {
                 (0..column.len()).map(|row| column.value(row))
             })
             .collect();
-        assert_eq!(sequences, [0, 1]);
-        assert_eq!(i64_values(&first, "log_a_i64"), vec![Some(1), None]);
-        assert_eq!(i64_values(&first, "log_b_i64"), vec![None, Some(2)]);
+        assert_eq!(sequences, [1, 0]);
+        assert_eq!(i64_values(&first, "log_a_i64"), vec![None, Some(1)]);
+        assert_eq!(i64_values(&first, "log_b_i64"), vec![Some(2), None]);
+        assert!(
+            written[0]
+                .statistics
+                .as_ref()
+                .is_some_and(|stats| stats.ordered)
+        );
         let schema = first[0].schema();
         let metadata = schema.metadata();
         assert_eq!(
@@ -547,6 +622,10 @@ mod tests {
             metadata.get(META_HOUR_END_UNIX_NANO).map(String::as_str),
             Some(hour_end.as_str())
         );
+        assert_eq!(
+            metadata.get(META_SORT_ORDER).map(String::as_str),
+            Some(SORT_ORDER_NEWEST_EVENT)
+        );
         let field = schema.field_with_name("log_a_i64").expect("field");
         assert_eq!(
             field.metadata().get(crate::FIELD_PATH).map(String::as_str),
@@ -569,7 +648,7 @@ mod tests {
                 &read_parquet_batches(&written[0].path).expect("reread"),
                 COLUMN_BODY
             ),
-            vec![Some("row-0".to_owned()), Some("row-1".to_owned())]
+            vec![Some("row-1".to_owned()), Some("row-0".to_owned())]
         );
         assert!(!written[0].path.with_extension("parquet.tmp").exists());
     }

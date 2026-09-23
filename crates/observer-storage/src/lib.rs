@@ -102,8 +102,9 @@ pub use memtable::{
 };
 pub use parquet::{
     META_FINGERPRINT, META_HOUR_END_UNIX_NANO, META_HOUR_START_UNIX_NANO, META_PROJECTION_VERSION,
-    META_ROW_COUNT, META_WAL_FIRST_SEQUENCE, META_WAL_NEXT_SEQUENCE, ParquetError, ParquetFault,
-    ParquetFile, ParquetWriteOptions, read_parquet_batches, write_generation,
+    META_ROW_COUNT, META_SORT_ORDER, META_WAL_FIRST_SEQUENCE, META_WAL_NEXT_SEQUENCE, ParquetError,
+    ParquetFault, ParquetFile, ParquetWriteOptions, SORT_ORDER_NEWEST_EVENT, read_parquet_batches,
+    sort_by_newest_event, write_generation,
 };
 pub use recovery::{Recovered, RecoveryError, recover};
 pub use schema::{

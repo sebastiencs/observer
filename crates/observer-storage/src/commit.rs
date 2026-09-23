@@ -472,6 +472,7 @@ fn encode_statistics(body: &mut Vec<u8>, statistics: Option<&FileStatistics>) {
     body.extend_from_slice(&statistics.event_time_max.to_le_bytes());
     body.extend_from_slice(&statistics.wal_min.to_le_bytes());
     body.extend_from_slice(&statistics.wal_max.to_le_bytes());
+    body.push(u8::from(statistics.ordered));
     let count = u32::try_from(statistics.columns.len()).expect("column statistics count");
     body.extend_from_slice(&count.to_le_bytes());
     for column in &statistics.columns {
@@ -644,6 +645,7 @@ impl Reader<'_> {
                 event_time_max: self.u64()?,
                 wal_min: self.u64()?,
                 wal_max: self.u64()?,
+                ordered: self.u8()? != 0,
                 columns: {
                     let count = self.u32()?;
                     let mut columns = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
@@ -769,6 +771,7 @@ mod tests {
                     event_time_max: 1,
                     wal_min: 4,
                     wal_max: 4,
+                    ordered: true,
                     columns: Vec::new(),
                 }),
             }],

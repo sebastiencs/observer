@@ -10,8 +10,10 @@
 //! DataFusion then prunes Parquet row groups and pages with the same predicates. Every pushed
 //! filter still runs again above the scan.
 //!
-//! Results have no order unless the SQL contains `ORDER BY`. The tenant is the store passed to
-//! `execute`, never a value inside the SQL. Only one `SELECT` statement is accepted.
+//! Published files and in-memory batches are ordered by `event_time_unix_nano DESC`, then
+//! `wal_sequence DESC`. A newest-event `ORDER BY ... LIMIT` with no other predicate can skip older
+//! hours and files. Results have no order unless the SQL contains `ORDER BY`. The tenant is the
+//! store passed to `execute`, never a value inside the SQL. Only one `SELECT` statement is accepted.
 //!
 //! One engine shares a bounded memory pool, a spill directory, a Parquet metadata cache, a query
 //! runtime, and a limit on how many queries run at once. Each query uses its own session and the
@@ -34,7 +36,8 @@
 //! LIMIT 100
 //! ```
 //!
-//! `LIMIT` applies to the ordered rows when `ORDER BY` is present. A dynamic column is
+//! `LIMIT` applies to the ordered rows when `ORDER BY` is present. A newest-event order can satisfy
+//! that limit from the newest hours and files when the scan has no other predicate. A dynamic column is
 //! `{source}_{normalized_path}_{type}` (for example `log_user_id_i64`). A generation that lacks
 //! that column contributes nulls. An event-time bound can skip whole hours; DataFusion still
 //! applies the nanosecond predicate.
@@ -49,10 +52,13 @@ use std::task::{Context, Poll};
 use std::thread;
 use std::time::Duration;
 
-use arrow_array::RecordBatch;
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
+use arrow_array::{Array, RecordBatch};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
+use datafusion::common::tree_node::Transformed;
 use datafusion::common::{DFSchema, ScalarValue};
 use datafusion::datasource::MemTable;
 use datafusion::datasource::listing::PartitionedFile;
@@ -64,9 +70,14 @@ use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::execution::memory_pool::FairSpillPool;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
-use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType};
-use datafusion::physical_expr::PhysicalExpr;
+use datafusion::logical_expr::{
+    Expr, LogicalPlan, Operator, Sort, SortExpr, TableProviderFilterPushDown, TableType, col,
+};
+use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
     ExecutionPlan, ExecutionPlanProperties, SendableRecordBatchStream,
@@ -75,8 +86,9 @@ use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::Statement;
 use futures::{Stream, StreamExt};
 use observer_storage::{
-    COLUMN_EVENT_TIME_UNIX_NANO, ColumnStatistics, EventHour, FileStatistics, PublishedFile, Scan,
-    StatValue, Store, StoreError, StoreSnapshot, align_batch,
+    COLUMN_EVENT_TIME_UNIX_NANO, COLUMN_WAL_SEQUENCE, ColumnStatistics, EventHour, FileStatistics,
+    PublishedFile, Scan, StatValue, Store, StoreError, StoreSnapshot, align_batch,
+    sort_by_newest_event,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -574,6 +586,7 @@ async fn prepare(
     let prepared = tokio::time::timeout_at(deadline, async move {
         let provider = table_provider(input)?;
         let context = SessionContext::new_with_config_rt(session, runtime);
+        context.add_optimizer_rule(Arc::new(NewestEventLimit));
         context
             .register_table(LOGS_TABLE, provider)
             .map_err(QueryError::Planning)?;
@@ -930,29 +943,72 @@ impl TableProvider for ObserverTableProvider {
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let window = hour_window(filters);
-        let selected: Vec<_> = self
-            .hours
-            .iter()
-            .filter(|hour| window.contains(hour.hour))
-            .collect();
-        if selected.is_empty() {
-            let table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![]])?;
-            return table.scan(state, projection, &[], None).await;
-        }
-        let mut hour_plans = Vec::with_capacity(selected.len());
-        for hour in selected {
-            if let Some(plan) = hour_plan(state, &self.schema, hour, projection, filters).await? {
-                hour_plans.push(plan);
+        let mut pieces = Vec::new();
+        for hour in &self.hours {
+            if !window.contains(hour.hour) {
+                continue;
             }
+            pieces.extend(hour_pieces(hour, filters)?);
         }
-        if hour_plans.is_empty() {
+        let pieces = keep_newest_prefix(pieces, limit, filters.is_empty());
+        if pieces.is_empty() {
             let table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![]])?;
             return table.scan(state, projection, &[], None).await;
         }
-        UnionExec::try_new(hour_plans)
+        let advertise = pieces.iter().all(|piece| piece.ordered)
+            && order_columns_projected(self.schema.as_ref(), projection);
+        let read_limit = filters.is_empty().then_some(limit).flatten();
+        let files_only = pieces
+            .iter()
+            .all(|piece| matches!(piece.source, ScanSource::File(_)));
+        if advertise && files_only {
+            let files = pieces
+                .into_iter()
+                .filter_map(|piece| match piece.source {
+                    ScanSource::File(file) => Some(file),
+                    ScanSource::Memory(_) => None,
+                })
+                .collect::<Vec<_>>();
+            let file_limit = (files.len() == 1).then_some(read_limit).flatten();
+            let plan = parquet_plan(
+                state,
+                &self.schema,
+                &files,
+                projection,
+                filters,
+                file_limit,
+                true,
+            )
+            .await?;
+            if files.len() > 1
+                && let Some(ordering) = projected_newest_ordering(self.schema.as_ref(), projection)
+            {
+                return Ok(Arc::new(
+                    SortPreservingMergeExec::new(ordering, plan)
+                        .with_round_robin_repartition(false),
+                ));
+            }
+            return Ok(plan);
+        }
+        let mut plans = Vec::with_capacity(pieces.len());
+        for piece in pieces {
+            plans.push(
+                piece
+                    .plan(
+                        state,
+                        &self.schema,
+                        projection,
+                        filters,
+                        read_limit,
+                        advertise,
+                    )
+                    .await?,
+            );
+        }
+        one_partition(UnionExec::try_new(plans)?)
     }
 }
 
@@ -1371,43 +1427,259 @@ fn flip_comparison(operator: Operator) -> Option<Operator> {
     }
 }
 
-async fn hour_plan(
-    state: &dyn Session,
-    schema: &SchemaRef,
+struct KnownSpan {
+    rows: u64,
+    event_min: u64,
+    event_max: u64,
+}
+
+enum ScanSource {
+    File(PublishedFile),
+    Memory(Vec<RecordBatch>),
+}
+
+struct ScanPiece {
+    span: Option<KnownSpan>,
+    ordered: bool,
+    source: ScanSource,
+}
+
+impl ScanPiece {
+    async fn plan(
+        self,
+        state: &dyn Session,
+        schema: &SchemaRef,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+        advertise_order: bool,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        match self.source {
+            ScanSource::File(file) => {
+                parquet_plan(
+                    state,
+                    schema,
+                    std::slice::from_ref(&file),
+                    projection,
+                    filters,
+                    limit,
+                    advertise_order,
+                )
+                .await
+            }
+            ScanSource::Memory(batches) => {
+                let batches = limit_batches(batches, limit);
+                let mut table = MemTable::try_new(Arc::clone(schema), vec![batches])?;
+                if advertise_order {
+                    table = table.with_sort_order(vec![newest_sort_exprs()]);
+                }
+                table.scan(state, projection, &[], None).await
+            }
+        }
+    }
+}
+
+fn hour_pieces(
     hour: &HourPartition,
-    projection: Option<&Vec<usize>>,
     filters: &[Expr],
-) -> datafusion::error::Result<Option<Arc<dyn ExecutionPlan>>> {
-    let mut inputs = Vec::new();
-    let files: Vec<_> = hour
-        .files
-        .iter()
-        .filter(|file| file_may_match(file.statistics.as_ref(), filters))
-        .collect();
-    if !files.is_empty() {
-        inputs.push(parquet_plan(state, schema, &files, projection, filters).await?);
+) -> datafusion::error::Result<Vec<ScanPiece>> {
+    let mut pieces = Vec::new();
+    for file in &hour.files {
+        if !file_may_match(file.statistics.as_ref(), filters) {
+            continue;
+        }
+        let span = file.statistics.as_ref().and_then(|statistics| {
+            statistics.ordered.then_some(KnownSpan {
+                rows: statistics.rows,
+                event_min: statistics.event_time_min,
+                event_max: statistics.event_time_max,
+            })
+        });
+        pieces.push(ScanPiece {
+            ordered: span.is_some(),
+            span,
+            source: ScanSource::File(file.clone()),
+        });
     }
     if !hour.batches.is_empty() {
-        let table = MemTable::try_new(Arc::clone(schema), vec![hour.batches.clone()])?;
-        inputs.push(table.scan(state, projection, &[], None).await?);
+        let schema = hour.batches[0].schema();
+        let sorted = sort_by_newest_event(&schema, &hour.batches)
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        let span = batch_span(&sorted);
+        pieces.push(ScanPiece {
+            ordered: span.is_some(),
+            span,
+            source: ScanSource::Memory(split_sorted(sorted, &hour.batches)),
+        });
     }
-    if inputs.is_empty() {
-        return Ok(None);
+    Ok(pieces)
+}
+
+fn split_sorted(sorted: RecordBatch, originals: &[RecordBatch]) -> Vec<RecordBatch> {
+    let mut offset = 0;
+    let mut batches = Vec::new();
+    for original in originals {
+        let rows = original.num_rows();
+        if rows == 0 {
+            continue;
+        }
+        batches.push(sorted.slice(offset, rows));
+        offset += rows;
     }
-    Ok(Some(one_partition(UnionExec::try_new(inputs)?)?))
+    if batches.is_empty() {
+        batches.push(sorted);
+    }
+    batches
+}
+
+fn limit_batches(batches: Vec<RecordBatch>, limit: Option<usize>) -> Vec<RecordBatch> {
+    let Some(limit) = limit else {
+        return batches;
+    };
+    let mut remaining = limit;
+    let mut limited = Vec::new();
+    for batch in batches {
+        if remaining == 0 {
+            break;
+        }
+        if batch.num_rows() <= remaining {
+            remaining -= batch.num_rows();
+            limited.push(batch);
+        } else {
+            limited.push(batch.slice(0, remaining));
+            break;
+        }
+    }
+    limited
+}
+
+fn batch_span(batch: &RecordBatch) -> Option<KnownSpan> {
+    let rows = u64::try_from(batch.num_rows()).ok()?;
+    if rows == 0 {
+        return None;
+    }
+    let event = batch
+        .column_by_name(COLUMN_EVENT_TIME_UNIX_NANO)?
+        .as_primitive::<UInt64Type>();
+    if event.null_count() != 0 {
+        return None;
+    }
+    Some(KnownSpan {
+        rows,
+        event_max: event.value(0),
+        event_min: event.value(event.len() - 1),
+    })
+}
+
+fn keep_newest_prefix(
+    mut pieces: Vec<ScanPiece>,
+    limit: Option<usize>,
+    exact: bool,
+) -> Vec<ScanPiece> {
+    let Some(limit) = limit else {
+        return pieces;
+    };
+    if !exact || pieces.iter().any(|piece| piece.span.is_none()) {
+        return pieces;
+    }
+    let limit = u64::try_from(limit).unwrap_or(u64::MAX);
+    let mut order: Vec<usize> = (0..pieces.len()).collect();
+    order.sort_by(|&left, &right| {
+        let left = pieces[left].span.as_ref().expect("span");
+        let right = pieces[right].span.as_ref().expect("span");
+        right.event_max.cmp(&left.event_max)
+    });
+    let mut covered = 0_u64;
+    let mut prefix_min = u64::MAX;
+    let mut keep = vec![false; pieces.len()];
+    for index in order {
+        let span = pieces[index].span.as_ref().expect("span");
+        if covered >= limit && span.event_max < prefix_min {
+            continue;
+        }
+        prefix_min = prefix_min.min(span.event_min);
+        covered = covered.saturating_add(span.rows);
+        keep[index] = true;
+    }
+    let mut kept = Vec::new();
+    for (piece, keep) in pieces.drain(..).zip(keep) {
+        if keep {
+            kept.push(piece);
+        }
+    }
+    kept
+}
+
+fn newest_sort_exprs() -> Vec<SortExpr> {
+    vec![
+        SortExpr {
+            expr: col(COLUMN_EVENT_TIME_UNIX_NANO),
+            asc: false,
+            nulls_first: true,
+        },
+        SortExpr {
+            expr: col(COLUMN_WAL_SEQUENCE),
+            asc: false,
+            nulls_first: true,
+        },
+    ]
+}
+
+fn newest_ordering(schema: &arrow_schema::Schema) -> Option<LexOrdering> {
+    let event = schema.index_of(COLUMN_EVENT_TIME_UNIX_NANO).ok()?;
+    let wal = schema.index_of(COLUMN_WAL_SEQUENCE).ok()?;
+    sort_ordering(event, wal)
+}
+
+fn projected_newest_ordering(
+    schema: &arrow_schema::Schema,
+    projection: Option<&Vec<usize>>,
+) -> Option<LexOrdering> {
+    let event = schema.index_of(COLUMN_EVENT_TIME_UNIX_NANO).ok()?;
+    let wal = schema.index_of(COLUMN_WAL_SEQUENCE).ok()?;
+    let (event, wal) = match projection {
+        None => (event, wal),
+        Some(indices) => (
+            indices.iter().position(|index| *index == event)?,
+            indices.iter().position(|index| *index == wal)?,
+        ),
+    };
+    sort_ordering(event, wal)
+}
+
+fn sort_ordering(event: usize, wal: usize) -> Option<LexOrdering> {
+    LexOrdering::new(vec![
+        PhysicalSortExpr::new_default(Arc::new(Column::new(COLUMN_EVENT_TIME_UNIX_NANO, event)))
+            .desc()
+            .nulls_first(),
+        PhysicalSortExpr::new_default(Arc::new(Column::new(COLUMN_WAL_SEQUENCE, wal)))
+            .desc()
+            .nulls_first(),
+    ])
+}
+
+fn order_columns_projected(schema: &arrow_schema::Schema, projection: Option<&Vec<usize>>) -> bool {
+    let Some(projection) = projection else {
+        return true;
+    };
+    [COLUMN_EVENT_TIME_UNIX_NANO, COLUMN_WAL_SEQUENCE]
+        .into_iter()
+        .all(|name| {
+            schema
+                .index_of(name)
+                .is_ok_and(|index| projection.contains(&index))
+        })
 }
 
 async fn parquet_plan(
     state: &dyn Session,
     schema: &SchemaRef,
-    files: &[&PublishedFile],
+    files: &[PublishedFile],
     projection: Option<&Vec<usize>>,
     filters: &[Expr],
+    limit: Option<usize>,
+    advertise_order: bool,
 ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-    let mut groups = Vec::with_capacity(files.len());
-    for file in files {
-        groups.push(FileGroup::new(vec![partitioned_file(&file.path).await?]));
-    }
     let url = ObjectStoreUrl::local_filesystem();
     let store = state.runtime_env().object_store(&url)?;
     let cache = state.runtime_env().cache_manager.get_file_metadata_cache();
@@ -1426,11 +1698,120 @@ async fn parquet_plan(
     if let Some(predicate) = parquet_predicate(state, schema, filters)? {
         source = source.with_predicate(predicate);
     }
-    let mut builder = FileScanConfigBuilder::new(url, Arc::new(source)).with_file_groups(groups);
+    let mut groups = Vec::with_capacity(files.len());
+    for file in files {
+        groups.push(FileGroup::new(vec![partitioned_file(&file.path).await?]));
+    }
+    let mut builder = FileScanConfigBuilder::new(url, Arc::new(source))
+        .with_file_groups(groups)
+        .with_limit(limit);
+    if advertise_order && let Some(ordering) = newest_ordering(schema.as_ref()) {
+        builder = builder.with_output_ordering(vec![ordering]);
+    }
     if let Some(indices) = projection {
         builder = builder.with_projection_indices(Some(indices.clone()))?;
     }
     Ok(DataSourceExec::from_data_source(builder.build()))
+}
+
+#[derive(Debug)]
+struct NewestEventLimit;
+
+impl OptimizerRule for NewestEventLimit {
+    fn name(&self) -> &str {
+        "newest_event_limit"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::TopDown)
+    }
+
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>, DataFusionError> {
+        let LogicalPlan::Sort(sort) = plan else {
+            return Ok(Transformed::no(plan));
+        };
+        let Sort { expr, input, fetch } = sort;
+        let Some(fetch) = fetch else {
+            return Ok(Transformed::no(LogicalPlan::Sort(Sort {
+                expr,
+                input,
+                fetch,
+            })));
+        };
+        if !newest_event_sort(&expr) {
+            return Ok(Transformed::no(LogicalPlan::Sort(Sort {
+                expr,
+                input,
+                fetch: Some(fetch),
+            })));
+        }
+        let (pushed, changed) = push_newest_fetch(Arc::unwrap_or_clone(input), fetch)?;
+        if !changed {
+            return Ok(Transformed::no(LogicalPlan::Sort(Sort {
+                expr,
+                input: Arc::new(pushed),
+                fetch: Some(fetch),
+            })));
+        }
+        Ok(Transformed::yes(LogicalPlan::Sort(Sort {
+            expr,
+            input: Arc::new(pushed),
+            fetch: Some(fetch),
+        })))
+    }
+}
+
+fn newest_event_sort(expr: &[SortExpr]) -> bool {
+    let Some(event_time) = expr.first() else {
+        return false;
+    };
+    if !descending_column(event_time, COLUMN_EVENT_TIME_UNIX_NANO) {
+        return false;
+    }
+    match expr.get(1) {
+        None => true,
+        Some(wal) => expr.len() == 2 && descending_column(wal, COLUMN_WAL_SEQUENCE),
+    }
+}
+
+fn descending_column(sort: &SortExpr, name: &str) -> bool {
+    !sort.asc
+        && sort
+            .expr
+            .try_as_col()
+            .is_some_and(|column| column.name == name)
+}
+
+fn push_newest_fetch(
+    plan: LogicalPlan,
+    fetch: usize,
+) -> Result<(LogicalPlan, bool), DataFusionError> {
+    match plan {
+        LogicalPlan::TableScan(mut scan) if scan.filters.is_empty() => {
+            let next = Some(scan.fetch.map_or(fetch, |current| current.min(fetch)));
+            if scan.fetch == next {
+                return Ok((LogicalPlan::TableScan(scan), false));
+            }
+            scan.fetch = next;
+            Ok((LogicalPlan::TableScan(scan), true))
+        }
+        LogicalPlan::Projection(mut projection) => {
+            let (input, changed) =
+                push_newest_fetch(Arc::unwrap_or_clone(projection.input), fetch)?;
+            projection.input = Arc::new(input);
+            Ok((LogicalPlan::Projection(projection), changed))
+        }
+        LogicalPlan::SubqueryAlias(mut alias) => {
+            let (input, changed) = push_newest_fetch(Arc::unwrap_or_clone(alias.input), fetch)?;
+            alias.input = Arc::new(input);
+            Ok((LogicalPlan::SubqueryAlias(alias), changed))
+        }
+        other => Ok((other, false)),
+    }
 }
 
 async fn partitioned_file(path: &Path) -> datafusion::error::Result<PartitionedFile> {
@@ -1851,6 +2232,7 @@ mod tests {
         let snapshot = store.snapshot().expect("snapshot");
         let provider = ObserverTableProvider::new(store, snapshot).expect("provider");
         let context = SessionContext::new();
+        context.add_optimizer_rule(Arc::new(super::NewestEventLimit));
         context
             .register_table("logs", Arc::new(provider))
             .expect("register");
@@ -2013,6 +2395,7 @@ mod tests {
             event_time_max: 1,
             wal_min: 0,
             wal_max: 0,
+            ordered: true,
             columns: vec![ColumnStatistics {
                 name: "log_a_i64".to_owned(),
                 null_count: 0,
@@ -2231,6 +2614,7 @@ mod tests {
         let provider = ObserverTableProvider::new(store, snapshot).expect("provider");
         let context =
             SessionContext::new_with_config(super::session_config(&QueryEngineConfig::default()));
+        context.add_optimizer_rule(Arc::new(super::NewestEventLimit));
         context
             .register_table("logs", Arc::new(provider))
             .expect("register");
@@ -2245,6 +2629,105 @@ mod tests {
             }
         }
         (rows, plan)
+    }
+
+    #[tokio::test]
+    async fn newest_limit_skips_older_hours_until_a_filter_is_present() {
+        let store = store();
+        publish_row(&store, frame(0, 1, Vec::new()));
+        publish_row(&store, frame(1, HOUR + 1, Vec::new()));
+
+        let newest = "SELECT wal_sequence FROM logs ORDER BY event_time_unix_nano DESC, wal_sequence DESC LIMIT 1";
+        let files = scan_files(&physical_plan(Arc::clone(&store), newest).await);
+        assert!(
+            files.iter().any(|file| file.contains("1-2.parquet")),
+            "{files:?}"
+        );
+        assert!(
+            files.iter().all(|file| !file.contains("0-1.parquet")),
+            "{files:?}"
+        );
+        assert_eq!(
+            u64_column(&batches(Arc::clone(&store), newest).await, "wal_sequence"),
+            [1]
+        );
+
+        let oldest = "SELECT wal_sequence FROM logs ORDER BY event_time_unix_nano ASC, wal_sequence ASC LIMIT 1";
+        let files = scan_files(&physical_plan(Arc::clone(&store), oldest).await);
+        assert!(
+            files.iter().any(|file| file.contains("0-1.parquet")),
+            "{files:?}"
+        );
+        assert!(
+            files.iter().any(|file| file.contains("1-2.parquet")),
+            "{files:?}"
+        );
+        assert_eq!(
+            u64_column(&batches(Arc::clone(&store), oldest).await, "wal_sequence"),
+            [0]
+        );
+
+        let filtered = "SELECT wal_sequence FROM logs WHERE event_time_unix_nano >= 1 ORDER BY event_time_unix_nano DESC, wal_sequence DESC LIMIT 1";
+        let files = scan_files(&physical_plan(Arc::clone(&store), filtered).await);
+        assert!(
+            files.iter().any(|file| file.contains("0-1.parquet")),
+            "{files:?}"
+        );
+        assert!(
+            files.iter().any(|file| file.contains("1-2.parquet")),
+            "{files:?}"
+        );
+        assert_eq!(
+            u64_column(&batches(store, filtered).await, "wal_sequence"),
+            [1]
+        );
+    }
+
+    #[tokio::test]
+    async fn equal_event_time_breaks_ties_with_wal_sequence() {
+        let store = store();
+        store.append(&frame(0, 5, Vec::new())).expect("append");
+        store.append(&frame(1, 5, Vec::new())).expect("append");
+        store.rotate().expect("rotate");
+        store.publish(&PublishOptions::default()).expect("publish");
+        let descending =
+            "SELECT wal_sequence FROM logs ORDER BY event_time_unix_nano DESC, wal_sequence DESC";
+        assert_eq!(
+            u64_column(
+                &batches(Arc::clone(&store), descending).await,
+                "wal_sequence"
+            ),
+            [1, 0]
+        );
+        let ascending =
+            "SELECT wal_sequence FROM logs ORDER BY event_time_unix_nano ASC, wal_sequence ASC";
+        assert_eq!(
+            u64_column(&batches(store, ascending).await, "wal_sequence"),
+            [0, 1]
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_memory_and_parquet_follow_newest_event_order() {
+        let store = store();
+        publish_row(&store, frame(0, 1, Vec::new()));
+        store
+            .append(&frame(1, HOUR + 1, Vec::new()))
+            .expect("active");
+        let ordered =
+            "SELECT wal_sequence FROM logs ORDER BY event_time_unix_nano DESC, wal_sequence DESC";
+        assert_eq!(
+            u64_column(&batches(Arc::clone(&store), ordered).await, "wal_sequence"),
+            [1, 0]
+        );
+        let limited = "SELECT wal_sequence FROM logs ORDER BY event_time_unix_nano DESC, wal_sequence DESC LIMIT 1";
+        let shape = scan_shape(&physical_plan(Arc::clone(&store), limited).await);
+        assert!(shape.files.is_empty(), "{:?}", shape.files);
+        assert!(shape.memory_scans > 0);
+        assert_eq!(
+            u64_column(&batches(store, limited).await, "wal_sequence"),
+            [1]
+        );
     }
 
     fn row_groups_pruned(plan: &Arc<dyn ExecutionPlan>) -> usize {

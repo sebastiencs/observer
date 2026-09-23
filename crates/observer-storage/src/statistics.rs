@@ -113,6 +113,8 @@ pub struct FileStatistics {
     pub wal_min: u64,
     /// Inclusive maximum `wal_sequence`.
     pub wal_max: u64,
+    /// Rows are ordered by `event_time_unix_nano DESC, wal_sequence DESC`.
+    pub ordered: bool,
     /// One entry per schema field, in schema order.
     pub columns: Vec<ColumnStatistics>,
 }
@@ -142,6 +144,7 @@ pub fn file_statistics(
         event_time_max: event_time.1,
         wal_min: wal.0,
         wal_max: wal.1,
+        ordered: false,
         columns,
     })
 }

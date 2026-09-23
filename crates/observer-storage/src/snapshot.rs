@@ -840,6 +840,7 @@ mod tests {
         assert_eq!(statistics.rows, 2);
         assert_eq!(statistics.wal_min, 0);
         assert_eq!(statistics.wal_max, 1);
+        assert!(statistics.ordered);
         assert!(mixed_sources[1].files.is_empty());
         assert_eq!(sequences(&mixed_sources[1].batches), [2]);
 
