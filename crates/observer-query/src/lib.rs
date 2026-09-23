@@ -12,9 +12,10 @@
 //! Results have no order unless the SQL contains `ORDER BY`. The tenant is the store passed to
 //! `execute`, never a value inside the SQL. Only one `SELECT` statement is accepted.
 //!
-//! One engine shares a bounded memory pool and a query runtime. Each query uses its own session and
-//! the timeout and returned-row cap in [`QueryOptions`]. That timeout bounds planning and reading.
-//! Dropping or cancelling the result stream stops the query.
+//! One engine shares a bounded memory pool, a query runtime, and a limit on how many queries run at
+//! once. Each query uses its own session and the timeout and returned-row cap in [`QueryOptions`].
+//! That timeout bounds planning and reading. A query that cannot obtain a permit before the deadline
+//! is busy. Dropping or cancelling the result stream stops the query and releases its permit.
 //!
 //! # Contract
 //!
@@ -72,7 +73,7 @@ use futures::{Stream, StreamExt};
 use observer_storage::{
     COLUMN_EVENT_TIME_UNIX_NANO, EventHour, Scan, Store, StoreError, StoreSnapshot, align_batch,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 const LOGS_TABLE: &str = "logs";
@@ -82,6 +83,32 @@ const NANOS_PER_HOUR: u64 = 3_600_000_000_000;
 pub struct QueryEngine {
     runtime: Arc<RuntimeEnv>,
     threads: Arc<QueryThreads>,
+    admission: Arc<Semaphore>,
+    target_partitions: usize,
+}
+
+/// Shared limits for every query on one engine.
+///
+/// [`Default`] derives the concurrency and partition cap once from the process parallelism.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueryEngineConfig {
+    /// Bytes available to every query that shares this engine.
+    pub memory_pool_bytes: usize,
+    /// Queries that may plan and read at the same time.
+    pub max_concurrent_queries: usize,
+    /// DataFusion partition target for each query.
+    pub target_partitions_per_query: usize,
+}
+
+impl Default for QueryEngineConfig {
+    fn default() -> Self {
+        let parallelism = query_worker_threads();
+        Self {
+            memory_pool_bytes: QueryEngine::MEMORY_POOL_BYTES,
+            max_concurrent_queries: parallelism,
+            target_partitions_per_query: parallelism,
+        }
+    }
 }
 
 /// Timeout and returned-row cap for one query.
@@ -124,6 +151,8 @@ pub enum QueryError {
     Statement(String),
     /// The query exceeded [`QueryOptions::timeout`].
     Timeout,
+    /// The query could not obtain an admission permit before its deadline.
+    Busy,
     /// The result stream was cancelled.
     Cancelled,
     /// The result would exceed [`QueryOptions::max_rows`].
@@ -142,6 +171,7 @@ impl std::fmt::Display for QueryError {
             Self::Execution(error) => write!(formatter, "query execution: {error}"),
             Self::Statement(detail) => formatter.write_str(detail),
             Self::Timeout => formatter.write_str("query timed out"),
+            Self::Busy => formatter.write_str("query engine is busy"),
             Self::Cancelled => formatter.write_str("query cancelled"),
             Self::RowLimit { max_rows } => {
                 write!(formatter, "query exceeded {max_rows} returned rows")
@@ -158,6 +188,7 @@ impl std::error::Error for QueryError {
             Self::Resources(_)
             | Self::Statement(_)
             | Self::Timeout
+            | Self::Busy
             | Self::Cancelled
             | Self::RowLimit { .. } => None,
         }
@@ -168,26 +199,31 @@ impl QueryEngine {
     /// Bytes available to every query that shares this engine.
     pub const MEMORY_POOL_BYTES: usize = 256 * 1024 * 1024;
 
-    /// Build a runtime whose queries share one greedy memory pool of `memory_pool_bytes`.
+    /// Build a runtime from `config`.
     ///
-    /// Planning and execution run on threads named `observer-query`. A result stream keeps those
-    /// threads alive until it is dropped.
+    /// Planning and execution run on threads named `observer-query`. At most
+    /// [`QueryEngineConfig::max_concurrent_queries`] queries hold an admission permit at once.
+    /// A result stream keeps the query threads and its permit alive until the query finishes or
+    /// the stream is dropped.
     ///
     /// # Errors
     ///
-    /// Returns [`QueryError::Resources`] when the runtime cannot be constructed.
-    pub fn new(memory_pool_bytes: usize) -> Result<Self, QueryError> {
-        Self::with_threads(memory_pool_bytes, QueryThreads::start()?)
+    /// Returns [`QueryError::Resources`] when the runtime cannot be constructed, or when a
+    /// concurrency setting is zero.
+    pub fn new(config: QueryEngineConfig) -> Result<Self, QueryError> {
+        Self::with_threads(config.checked()?, QueryThreads::start()?)
     }
 
-    fn with_threads(memory_pool_bytes: usize, threads: QueryThreads) -> Result<Self, QueryError> {
+    fn with_threads(config: QueryEngineConfig, threads: QueryThreads) -> Result<Self, QueryError> {
         let runtime = RuntimeEnvBuilder::new()
-            .with_memory_pool(Arc::new(GreedyMemoryPool::new(memory_pool_bytes)))
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(config.memory_pool_bytes)))
             .build()
             .map_err(|error| QueryError::Resources(error.to_string()))?;
         Ok(Self {
             runtime: Arc::new(runtime),
             threads: Arc::new(threads),
+            admission: Arc::new(Semaphore::new(config.max_concurrent_queries)),
+            target_partitions: config.target_partitions_per_query,
         })
     }
 
@@ -195,10 +231,11 @@ impl QueryEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`QueryError::Resources`] when the runtime cannot be constructed.
+    /// Returns [`QueryError::Resources`] when the runtime cannot be constructed, or when a
+    /// concurrency setting is zero.
     #[cfg(test)]
-    fn paused(memory_pool_bytes: usize) -> Result<Self, QueryError> {
-        Self::with_threads(memory_pool_bytes, QueryThreads::start_paused()?)
+    fn paused(config: QueryEngineConfig) -> Result<Self, QueryError> {
+        Self::with_threads(config.checked()?, QueryThreads::start_paused()?)
     }
 
     /// Advance the query runtime's clock.
@@ -227,7 +264,8 @@ impl QueryEngine {
     /// # Errors
     ///
     /// Returns [`QueryError::Statement`] for an empty string, multiple statements, or any statement
-    /// other than `SELECT`. Storage, planning, execution, timeout, and resource failures use the
+    /// other than `SELECT`. [`QueryError::Busy`] means the admission permit was not available
+    /// before the deadline. Storage, planning, execution, timeout, and resource failures use the
     /// matching variant. Failures that happen before the stream is ready are returned here.
     pub async fn execute(
         &self,
@@ -263,16 +301,18 @@ impl QueryEngine {
         let (ready_tx, ready_rx) = oneshot::channel();
         let (pull_tx, pull_rx) = mpsc::channel(1);
         let runtime = Arc::clone(&self.runtime);
+        let admission = Arc::clone(&self.admission);
+        let target_partitions = self.target_partitions;
         let sql = sql.to_owned();
         let max_rows = options.max_rows;
         let timeout = options.timeout;
         let mut task = TaskGuard(Some(self.threads.spawn(async move {
-            match prepare(runtime, input, sql, timeout).await {
+            match prepare(runtime, admission, target_partitions, input, sql, timeout).await {
                 Err(error) => {
                     let _ = ready_tx.send(Err(error));
                 }
-                Ok((stream, deadline)) => {
-                    if ready_tx.send(Ok(())).is_err() {
+                Ok((stream, deadline, permit)) => {
+                    if ready_tx.send(Ok(permit)).is_err() {
                         return;
                     }
                     forward(stream, pull_rx, deadline, max_rows).await;
@@ -280,12 +320,13 @@ impl QueryEngine {
             }
         })));
         match ready_rx.await {
-            Ok(Ok(())) => Ok(QueryBatchStream {
+            Ok(Ok(permit)) => Ok(QueryBatchStream {
                 pull_tx: Some(pull_tx),
                 pending: None,
                 task: task.0.take(),
                 terminal: None,
                 finished: false,
+                permit: Some(permit),
                 threads: Arc::clone(&self.threads),
             }),
             Ok(Err(error)) => Err(error),
@@ -408,15 +449,35 @@ fn query_worker_threads() -> usize {
 
 async fn prepare(
     runtime: Arc<RuntimeEnv>,
+    admission: Arc<Semaphore>,
+    target_partitions: usize,
     input: QueryInput,
     sql: String,
     timeout: Duration,
-) -> Result<(SendableRecordBatchStream, tokio::time::Instant), QueryError> {
+) -> Result<
+    (
+        SendableRecordBatchStream,
+        tokio::time::Instant,
+        OwnedSemaphorePermit,
+    ),
+    QueryError,
+> {
     let deadline = tokio::time::Instant::now() + timeout;
+    ensure_query(&sql)?;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(QueryError::Timeout);
+    }
+    let permit = match tokio::time::timeout_at(deadline, admission.acquire_owned()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_closed)) => return Err(QueryError::Busy),
+        Err(_elapsed) => return Err(QueryError::Busy),
+    };
     let prepared = tokio::time::timeout_at(deadline, async move {
-        ensure_query(&sql)?;
         let provider = table_provider(input)?;
-        let context = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
+        let context = SessionContext::new_with_config_rt(
+            SessionConfig::new().with_target_partitions(target_partitions),
+            runtime,
+        );
         context
             .register_table(LOGS_TABLE, provider)
             .map_err(QueryError::Planning)?;
@@ -425,8 +486,24 @@ async fn prepare(
     })
     .await;
     match prepared {
-        Ok(stream) => stream.map(|stream| (stream, deadline)),
+        Ok(stream) => stream.map(|stream| (stream, deadline, permit)),
         Err(_elapsed) => Err(QueryError::Timeout),
+    }
+}
+
+impl QueryEngineConfig {
+    fn checked(self) -> Result<Self, QueryError> {
+        if self.max_concurrent_queries == 0 {
+            return Err(QueryError::Resources(
+                "max_concurrent_queries must be at least 1".to_owned(),
+            ));
+        }
+        if self.target_partitions_per_query == 0 {
+            return Err(QueryError::Resources(
+                "target_partitions_per_query must be at least 1".to_owned(),
+            ));
+        }
+        Ok(self)
     }
 }
 
@@ -519,6 +596,7 @@ pub struct QueryBatchStream {
     task: Option<JoinHandle<()>>,
     terminal: Option<QueryError>,
     finished: bool,
+    permit: Option<OwnedSemaphorePermit>,
     /// Keeps the query threads alive until this stream is dropped.
     #[allow(dead_code)]
     threads: Arc<QueryThreads>,
@@ -531,6 +609,7 @@ impl QueryBatchStream {
             return;
         }
         self.terminal = Some(QueryError::Cancelled);
+        self.permit.take();
         self.stop_task();
     }
 
@@ -543,6 +622,7 @@ impl QueryBatchStream {
 
     fn finish(&mut self) {
         self.finished = true;
+        self.permit.take();
         self.stop_task();
     }
 }
@@ -1026,7 +1106,7 @@ mod tests {
     use std::path::Path;
     use std::pin::Pin;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use std::time::Duration;
 
@@ -1060,7 +1140,7 @@ mod tests {
     use prost::Message;
     use tokio_stream::StreamExt;
 
-    use super::{ObserverTableProvider, QueryEngine, QueryError, QueryOptions};
+    use super::{ObserverTableProvider, QueryEngine, QueryEngineConfig, QueryError, QueryOptions};
 
     const HOUR: u64 = 3_600_000_000_000;
 
@@ -1147,11 +1227,19 @@ mod tests {
     }
 
     fn engine() -> QueryEngine {
-        QueryEngine::new(QueryEngine::MEMORY_POOL_BYTES).expect("engine")
+        QueryEngine::new(QueryEngineConfig::default()).expect("engine")
+    }
+
+    fn engine_with(max_concurrent_queries: usize) -> QueryEngine {
+        QueryEngine::new(QueryEngineConfig {
+            max_concurrent_queries,
+            ..QueryEngineConfig::default()
+        })
+        .expect("engine")
     }
 
     fn paused_engine() -> QueryEngine {
-        QueryEngine::paused(QueryEngine::MEMORY_POOL_BYTES).expect("paused engine")
+        QueryEngine::paused(QueryEngineConfig::default()).expect("paused engine")
     }
 
     async fn batches(store: Arc<Store>, sql: &str) -> Vec<arrow_array::RecordBatch> {
@@ -1763,6 +1851,241 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_query_is_busy_when_admission_expires_before_work_starts() {
+        let engine = engine_with(1);
+        let held = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        let hold = engine.execute_provider(
+            blocking_provider(BlockStage::Scan, &held, &Arc::new(AtomicBool::new(false))),
+            "SELECT wal_sequence FROM logs",
+            QueryOptions::default(),
+        );
+        tokio::pin!(hold);
+        wait_until_blocked(&held, &mut hold).await;
+        let error = engine
+            .execute_provider(
+                blocking_provider(
+                    BlockStage::Enter,
+                    &started,
+                    &Arc::new(AtomicBool::new(false)),
+                ),
+                "SELECT wal_sequence FROM logs",
+                brief_timeout(),
+            )
+            .await;
+        let error = match error {
+            Ok(_stream) => panic!("query started"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, QueryError::Busy), "{error}");
+        assert!(!started.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn the_next_query_starts_after_the_permit_is_released() {
+        let engine = engine_with(1);
+        let held = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        let second = engine.execute_provider(
+            blocking_provider(
+                BlockStage::Enter,
+                &started,
+                &Arc::new(AtomicBool::new(false)),
+            ),
+            "SELECT wal_sequence FROM logs",
+            QueryOptions::default(),
+        );
+        tokio::pin!(second);
+        {
+            let hold = engine.execute_provider(
+                blocking_provider(BlockStage::Scan, &held, &Arc::new(AtomicBool::new(false))),
+                "SELECT wal_sequence FROM logs",
+                QueryOptions::default(),
+            );
+            tokio::pin!(hold);
+            wait_until_blocked(&held, &mut hold).await;
+            let deadline = std::time::Instant::now() + Duration::from_millis(50);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut second => panic!("second query started while the permit was held"),
+                    () = tokio::task::yield_now() => {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                    }
+                }
+            }
+            assert!(!started.load(Ordering::SeqCst));
+        }
+        second.await.expect("second query");
+        assert!(started.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_finished_query_releases_its_permit() {
+        let engine = engine_with(1);
+        let store = store();
+        store.append(&frame(0, 1, Vec::new())).expect("append");
+        let mut stream = engine
+            .execute(
+                store,
+                "SELECT wal_sequence FROM logs",
+                QueryOptions::default(),
+            )
+            .await
+            .expect("execute");
+        while stream.next().await.transpose().expect("batch").is_some() {}
+        assert!(following_query_starts(&engine).await);
+    }
+
+    #[tokio::test]
+    async fn a_planning_error_releases_its_permit() {
+        let engine = engine_with(1);
+        let error = engine
+            .execute(store(), "SELECT missing FROM logs", QueryOptions::default())
+            .await;
+        let error = match error {
+            Ok(_stream) => panic!("missing column was accepted"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, QueryError::Planning(_)), "{error}");
+        assert!(following_query_starts(&engine).await);
+    }
+
+    #[tokio::test]
+    async fn a_planning_timeout_releases_its_permit() {
+        let engine = engine_with(1);
+        let error = engine
+            .execute_provider(
+                blocking_provider(
+                    BlockStage::Scan,
+                    &Arc::new(AtomicBool::new(false)),
+                    &Arc::new(AtomicBool::new(false)),
+                ),
+                "SELECT wal_sequence FROM logs",
+                brief_timeout(),
+            )
+            .await;
+        let error = match error {
+            Ok(_stream) => panic!("blocked scan finished"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, QueryError::Timeout), "{error}");
+        assert!(following_query_starts(&engine).await);
+    }
+
+    #[tokio::test]
+    async fn cancelling_or_dropping_releases_the_permit() {
+        let engine = engine_with(1);
+        let mut stream = engine
+            .execute_provider(
+                blocking_provider(
+                    BlockStage::BeforeBatch,
+                    &Arc::new(AtomicBool::new(false)),
+                    &Arc::new(AtomicBool::new(false)),
+                ),
+                "SELECT wal_sequence FROM logs",
+                QueryOptions::default(),
+            )
+            .await
+            .expect("execute");
+        stream.cancel();
+        assert!(following_query_starts(&engine).await);
+
+        let stream = engine
+            .execute_provider(
+                blocking_provider(
+                    BlockStage::BeforeBatch,
+                    &Arc::new(AtomicBool::new(false)),
+                    &Arc::new(AtomicBool::new(false)),
+                ),
+                "SELECT wal_sequence FROM logs",
+                QueryOptions::default(),
+            )
+            .await
+            .expect("execute");
+        drop(stream);
+        assert!(following_query_starts(&engine).await);
+    }
+
+    #[tokio::test]
+    async fn invalid_sql_does_not_take_a_permit() {
+        let engine = engine_with(1);
+        let held = Arc::new(AtomicBool::new(false));
+        let hold = engine.execute_provider(
+            blocking_provider(BlockStage::Scan, &held, &Arc::new(AtomicBool::new(false))),
+            "SELECT wal_sequence FROM logs",
+            QueryOptions::default(),
+        );
+        tokio::pin!(hold);
+        wait_until_blocked(&held, &mut hold).await;
+        let error = engine.execute(store(), "", brief_timeout()).await;
+        let error = match error {
+            Ok(_stream) => panic!("empty SQL was accepted"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, QueryError::Statement(_)), "{error}");
+    }
+
+    #[test]
+    fn concurrency_settings_must_be_at_least_one() {
+        let no_queries = QueryEngine::new(QueryEngineConfig {
+            max_concurrent_queries: 0,
+            ..QueryEngineConfig::default()
+        });
+        assert!(matches!(no_queries, Err(QueryError::Resources(_))));
+        let no_partitions = QueryEngine::new(QueryEngineConfig {
+            target_partitions_per_query: 0,
+            ..QueryEngineConfig::default()
+        });
+        assert!(matches!(no_partitions, Err(QueryError::Resources(_))));
+    }
+
+    #[tokio::test]
+    async fn each_query_uses_the_configured_partition_cap() {
+        let partitions = Arc::new(AtomicUsize::new(0));
+        let engine = QueryEngine::new(QueryEngineConfig {
+            target_partitions_per_query: 3,
+            ..QueryEngineConfig::default()
+        })
+        .expect("engine");
+        engine
+            .execute_provider(
+                provider_with(
+                    BlockStage::Enter,
+                    &Arc::new(AtomicBool::new(false)),
+                    &Arc::new(AtomicBool::new(false)),
+                    Arc::clone(&partitions),
+                ),
+                "SELECT wal_sequence FROM logs",
+                QueryOptions::default(),
+            )
+            .await
+            .expect("execute");
+        assert_eq!(partitions.load(Ordering::SeqCst), 3);
+    }
+
+    async fn following_query_starts(engine: &QueryEngine) -> bool {
+        let started = Arc::new(AtomicBool::new(false));
+        let executed = engine
+            .execute_provider(
+                blocking_provider(
+                    BlockStage::Enter,
+                    &started,
+                    &Arc::new(AtomicBool::new(false)),
+                ),
+                "SELECT wal_sequence FROM logs",
+                QueryOptions {
+                    timeout: Duration::from_secs(2),
+                    max_rows: QueryOptions::MAX_ROWS,
+                },
+            )
+            .await;
+        executed.is_ok() && started.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
     async fn cancelling_the_stream_stops_the_query() {
         let store = store();
         store.append(&frame(0, 1, Vec::new())).expect("append");
@@ -1787,7 +2110,11 @@ mod tests {
         let store = store();
         store.append(&frame(0, 1, Vec::new())).expect("append");
         store.append(&frame(1, 2, Vec::new())).expect("append");
-        let engine = QueryEngine::new(1).expect("engine");
+        let engine = QueryEngine::new(QueryEngineConfig {
+            memory_pool_bytes: 1,
+            ..QueryEngineConfig::default()
+        })
+        .expect("engine");
         let executed = engine
             .execute(
                 store,
@@ -1800,6 +2127,13 @@ mod tests {
             Err(error) => Err(error),
         };
         assert!(matches!(error, Err(QueryError::Resources(_))), "{error:?}");
+    }
+
+    fn brief_timeout() -> QueryOptions {
+        QueryOptions {
+            timeout: Duration::from_millis(50),
+            max_rows: QueryOptions::MAX_ROWS,
+        }
     }
 
     fn short_timeout() -> QueryOptions {
@@ -1847,6 +2181,15 @@ mod tests {
         blocked: &Arc<AtomicBool>,
         stopped: &Arc<AtomicBool>,
     ) -> Arc<dyn TableProvider> {
+        provider_with(stage, blocked, stopped, Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn provider_with(
+        stage: BlockStage,
+        blocked: &Arc<AtomicBool>,
+        stopped: &Arc<AtomicBool>,
+        partitions: Arc<AtomicUsize>,
+    ) -> Arc<dyn TableProvider> {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "wal_sequence",
             DataType::UInt64,
@@ -1863,12 +2206,14 @@ mod tests {
             stage,
             blocked: Arc::clone(blocked),
             stopped: Arc::clone(stopped),
+            partitions,
         })
     }
 
     #[derive(Clone, Copy, Debug)]
     enum BlockStage {
         Scan,
+        Enter,
         BeforeBatch,
         AfterBatch,
     }
@@ -1888,6 +2233,7 @@ mod tests {
         stage: BlockStage,
         blocked: Arc<AtomicBool>,
         stopped: Arc<AtomicBool>,
+        partitions: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -1907,11 +2253,17 @@ mod tests {
             _filters: &[Expr],
             _limit: Option<usize>,
         ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-            if matches!(self.stage, BlockStage::Scan) {
+            self.partitions.store(
+                state.config().options().execution.target_partitions,
+                Ordering::SeqCst,
+            );
+            if matches!(self.stage, BlockStage::Scan | BlockStage::Enter) {
                 self.blocked.store(true, Ordering::SeqCst);
-                let stop = StopGuard(Arc::clone(&self.stopped));
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                drop(stop);
+                if matches!(self.stage, BlockStage::Scan) {
+                    let stop = StopGuard(Arc::clone(&self.stopped));
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    drop(stop);
+                }
                 let table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![]])?;
                 return table.scan(state, projection, &[], None).await;
             }

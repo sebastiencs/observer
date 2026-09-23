@@ -726,9 +726,8 @@ min_free_bytes = 0
     }
 
     fn query_bodies(runtime: &tokio::runtime::Runtime, store: Arc<Store>) -> Vec<String> {
-        let engine =
-            observer_query::QueryEngine::new(observer_query::QueryEngine::MEMORY_POOL_BYTES)
-                .expect("engine");
+        let engine = observer_query::QueryEngine::new(observer_query::QueryEngineConfig::default())
+            .expect("engine");
         runtime.block_on(async move {
             let stream = engine
                 .execute(
@@ -751,9 +750,8 @@ min_free_bytes = 0
         assert!(consumers.store("tenant-b").is_none());
         let store = consumers.store("tenant-a").expect("live store");
         let runtime = query_runtime();
-        let engine =
-            observer_query::QueryEngine::new(observer_query::QueryEngine::MEMORY_POOL_BYTES)
-                .expect("engine");
+        let engine = observer_query::QueryEngine::new(observer_query::QueryEngineConfig::default())
+            .expect("engine");
 
         write_payload(&directory, "tenant-a", logs_at("active", 1));
         wait_for_bodies(&store, &[Some("active".to_owned())]);
