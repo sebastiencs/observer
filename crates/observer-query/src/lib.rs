@@ -21,7 +21,10 @@
 //! runtime, and a limit on how many queries run at once. Each query uses its own session and the
 //! timeout and returned-row cap in [`QueryOptions`]. That timeout bounds planning and reading. A
 //! query that cannot obtain a permit before the deadline is busy. Dropping or cancelling the result
-//! stream stops the query and releases its permit.
+//! stream stops the query and releases its permit. [`QueryBatchStream::metrics`] reports the
+//! admission wait, planning and execution time, files and row groups skipped, rows returned, the
+//! shared pool's memory high-water mark, spill bytes, and whether the query timed out or was
+//! cancelled.
 //!
 //! # Contract
 //!
@@ -49,6 +52,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::thread;
@@ -69,7 +73,7 @@ use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, Pa
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::{SessionConfig, SessionContext};
-use datafusion::execution::memory_pool::FairSpillPool;
+use datafusion::execution::memory_pool::{FairSpillPool, MemoryPool, PeakRecordingPool};
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::logical_expr::{
@@ -79,6 +83,7 @@ use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::metrics::MetricValue;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
@@ -308,8 +313,11 @@ impl QueryEngine {
         let spill = Arc::new(SpillDirectory {
             path: config.spill_directory.clone(),
         });
+        let pool: Arc<dyn MemoryPool> = Arc::new(PeakRecordingPool::new(Arc::new(
+            FairSpillPool::new(config.memory_pool_bytes),
+        )));
         let runtime = RuntimeEnvBuilder::new()
-            .with_memory_pool(Arc::new(FairSpillPool::new(config.memory_pool_bytes)))
+            .with_memory_pool(pool)
             .with_temp_file_path(config.spill_directory.clone())
             .with_max_temp_directory_size(config.spill_budget_bytes)
             .with_metadata_cache_limit(config.metadata_cache_bytes)
@@ -411,17 +419,30 @@ impl QueryEngine {
         let sql = sql.to_owned();
         let max_rows = options.max_rows;
         let timeout = options.timeout;
+        let record = Arc::new(QueryRecord::default());
+        let recorded = Arc::clone(&record);
         let mut task = TaskGuard(Some(self.threads.spawn(async move {
             let _keepalive = keepalive;
-            match prepare(runtime, admission, session, input, sql, timeout).await {
+            match prepare(
+                Arc::clone(&runtime),
+                admission,
+                session,
+                input,
+                sql,
+                timeout,
+                Arc::clone(&recorded),
+            )
+            .await
+            {
                 Err(error) => {
                     let _ = ready_tx.send(Err(error));
                 }
-                Ok((stream, deadline, permit)) => {
+                Ok((stream, deadline, permit, plan)) => {
                     if ready_tx.send(Ok(permit)).is_err() {
+                        recorded.mark_cancelled();
                         return;
                     }
-                    forward(stream, pull_rx, deadline, max_rows).await;
+                    forward(stream, pull_rx, deadline, max_rows, plan, recorded, runtime).await;
                 }
             }
         })));
@@ -434,6 +455,7 @@ impl QueryEngine {
                 finished: false,
                 permit: Some(permit),
                 threads: Arc::clone(&self.threads),
+                record,
             }),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(query_task_stopped()),
@@ -567,15 +589,18 @@ async fn prepare(
     input: QueryInput,
     sql: String,
     timeout: Duration,
+    record: Arc<QueryRecord>,
 ) -> Result<
     (
         SendableRecordBatchStream,
         tokio::time::Instant,
         OwnedSemaphorePermit,
+        Arc<dyn ExecutionPlan>,
     ),
     QueryError,
 > {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let started = tokio::time::Instant::now();
+    let deadline = started + timeout;
     ensure_query(&sql)?;
     if tokio::time::Instant::now() >= deadline {
         return Err(QueryError::Timeout);
@@ -585,19 +610,33 @@ async fn prepare(
         Ok(Err(_closed)) => return Err(QueryError::Busy),
         Err(_elapsed) => return Err(QueryError::Busy),
     };
+    let admitted = tokio::time::Instant::now();
+    let admission_wait = admitted.saturating_duration_since(started);
     let prepared = tokio::time::timeout_at(deadline, async move {
-        let provider = table_provider(input)?;
+        let (provider, files) = table_provider(input)?;
         let context = SessionContext::new_with_config_rt(session, runtime);
         context.add_optimizer_rule(Arc::new(NewestEventLimit));
         context
             .register_table(LOGS_TABLE, provider)
             .map_err(QueryError::Planning)?;
         let frame = context.sql(&sql).await.map_err(QueryError::Planning)?;
-        frame.execute_stream().await.map_err(execution_error)
+        let plan = frame
+            .create_physical_plan()
+            .await
+            .map_err(execution_error)?;
+        let stream = datafusion::physical_plan::execute_stream(
+            Arc::clone(&plan),
+            Arc::new(frame.task_ctx()),
+        )
+        .map_err(execution_error)?;
+        let (scanned, pruned) = files.snapshot();
+        record.set_planned(admission_wait, admitted.elapsed(), scanned, pruned);
+        Ok((stream, plan))
     })
     .await;
     match prepared {
-        Ok(stream) => stream.map(|stream| (stream, deadline, permit)),
+        Ok(Ok((stream, plan))) => Ok((stream, deadline, permit, plan)),
+        Ok(Err(error)) => Err(error),
         Err(_elapsed) => Err(QueryError::Timeout),
     }
 }
@@ -646,14 +685,18 @@ fn session_config(config: &QueryEngineConfig) -> SessionConfig {
     session
 }
 
-fn table_provider(input: QueryInput) -> Result<Arc<dyn TableProvider>, QueryError> {
+fn table_provider(
+    input: QueryInput,
+) -> Result<(Arc<dyn TableProvider>, Arc<FileCounts>), QueryError> {
     match input {
         QueryInput::Store(store) => {
             let snapshot = store.snapshot().map_err(QueryError::Storage)?;
-            Ok(Arc::new(ObserverTableProvider::new(store, snapshot)?))
+            let provider = ObserverTableProvider::new(store, snapshot)?;
+            let files = Arc::clone(&provider.files);
+            Ok((Arc::new(provider), files))
         }
         #[cfg(test)]
-        QueryInput::Provider(provider) => Ok(provider),
+        QueryInput::Provider(provider) => Ok((provider, Arc::new(FileCounts::default()))),
     }
 }
 
@@ -662,23 +705,31 @@ async fn forward(
     mut pulls: mpsc::Receiver<Pull>,
     deadline: tokio::time::Instant,
     max_rows: usize,
+    plan: Arc<dyn ExecutionPlan>,
+    record: Arc<QueryRecord>,
+    runtime: Arc<RuntimeEnv>,
 ) {
+    let started = tokio::time::Instant::now();
+    record.note_execution_start(started);
     let mut emitted = 0usize;
     loop {
         let pull = tokio::select! {
             biased;
             () = tokio::time::sleep_until(deadline) => {
+                record.finish(QueryStop::Timeout, emitted, &plan, &runtime, started);
                 deliver_timeout(&mut pulls).await;
                 return;
             }
             pull = pulls.recv() => {
                 let Some(pull) = pull else {
+                    record.finish(QueryStop::Cancelled, emitted, &plan, &runtime, started);
                     return;
                 };
                 pull
             }
         };
         if tokio::time::Instant::now() >= deadline {
+            record.finish(QueryStop::Timeout, emitted, &plan, &runtime, started);
             let _ = pull.reply.send(Some(Err(QueryError::Timeout)));
             return;
         }
@@ -689,6 +740,7 @@ async fn forward(
             () = tokio::time::sleep_until(deadline) => Err(QueryError::Timeout),
             batch = &mut next => match batch {
                 None => {
+                    record.finish(QueryStop::Finished, emitted, &plan, &runtime, started);
                     let _ = pull.reply.send(None);
                     return;
                 }
@@ -700,17 +752,26 @@ async fn forward(
             Ok(batch) => {
                 let rows = batch.num_rows();
                 if rows > 0 && emitted.saturating_add(rows) > max_rows {
+                    record.finish(QueryStop::Finished, emitted, &plan, &runtime, started);
                     let _ = pull
                         .reply
                         .send(Some(Err(QueryError::RowLimit { max_rows })));
                     return;
                 }
                 emitted += rows;
+                record.observe(emitted, &plan, &runtime, started);
                 if pull.reply.send(Some(Ok(batch))).is_err() {
+                    record.finish(QueryStop::Cancelled, emitted, &plan, &runtime, started);
                     return;
                 }
             }
             Err(error) => {
+                let stop = if matches!(error, QueryError::Timeout) {
+                    QueryStop::Timeout
+                } else {
+                    QueryStop::Finished
+                };
+                record.finish(stop, emitted, &plan, &runtime, started);
                 let _ = pull.reply.send(Some(Err(error)));
                 return;
             }
@@ -728,6 +789,182 @@ fn query_task_stopped() -> QueryError {
     QueryError::Execution(DataFusionError::Execution("query task stopped".into()))
 }
 
+/// Counters for one query.
+///
+/// `memory_peak_bytes` is the high-water mark of the engine's shared pool since the engine was
+/// built. Concurrent queries share that pool, so the mark is not isolated to this query. Spill
+/// bytes and pruned row groups are the totals DataFusion recorded on the physical plan. File
+/// counts are the Parquet files this scan kept or dropped before reading.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct QueryMetrics {
+    /// Time spent waiting for an admission permit.
+    pub admission_wait: Duration,
+    /// Time from acquiring the permit until the stream is ready.
+    pub planning: Duration,
+    /// Time spent reading after the stream is ready.
+    pub execution: Duration,
+    /// Parquet files included in the scan.
+    pub files_scanned: u64,
+    /// Parquet files dropped before the scan.
+    pub files_pruned: u64,
+    /// Parquet row groups DataFusion skipped with statistics.
+    pub row_groups_pruned: u64,
+    /// Rows the stream has yielded.
+    pub rows_returned: u64,
+    /// High-water mark of the shared memory pool, in bytes.
+    pub memory_peak_bytes: u64,
+    /// Bytes DataFusion operators wrote to spill files.
+    pub spill_bytes: u64,
+    /// The query hit [`QueryOptions::timeout`].
+    pub timed_out: bool,
+    /// The caller cancelled the stream or dropped it before it finished.
+    pub cancelled: bool,
+}
+
+struct FileCounts {
+    scanned: AtomicU64,
+    pruned: AtomicU64,
+}
+
+impl Default for FileCounts {
+    fn default() -> Self {
+        Self {
+            scanned: AtomicU64::new(0),
+            pruned: AtomicU64::new(0),
+        }
+    }
+}
+
+impl FileCounts {
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.scanned.load(Ordering::Relaxed),
+            self.pruned.load(Ordering::Relaxed),
+        )
+    }
+}
+
+enum QueryStop {
+    Finished,
+    Timeout,
+    Cancelled,
+}
+
+struct QueryRecord {
+    metrics: Mutex<QueryMetrics>,
+    execution_started: Mutex<Option<tokio::time::Instant>>,
+}
+
+impl Default for QueryRecord {
+    fn default() -> Self {
+        Self {
+            metrics: Mutex::new(QueryMetrics::default()),
+            execution_started: Mutex::new(None),
+        }
+    }
+}
+
+impl QueryRecord {
+    fn lock(&self) -> std::sync::MutexGuard<'_, QueryMetrics> {
+        self.metrics
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn set_planned(&self, admission_wait: Duration, planning: Duration, scanned: u64, pruned: u64) {
+        let mut metrics = self.lock();
+        metrics.admission_wait = admission_wait;
+        metrics.planning = planning;
+        metrics.files_scanned = scanned;
+        metrics.files_pruned = pruned;
+    }
+
+    fn note_execution_start(&self, started: tokio::time::Instant) {
+        *self
+            .execution_started
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(started);
+    }
+
+    fn mark_cancelled(&self) {
+        if let Some(started) = *self
+            .execution_started
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+        {
+            self.lock().execution = started.elapsed();
+        }
+        self.finish_flags(QueryStop::Cancelled);
+    }
+
+    fn finish_flags(&self, stop: QueryStop) {
+        let mut metrics = self.lock();
+        match stop {
+            QueryStop::Finished => {}
+            QueryStop::Timeout => metrics.timed_out = true,
+            QueryStop::Cancelled if !metrics.timed_out => metrics.cancelled = true,
+            QueryStop::Cancelled => {}
+        }
+    }
+
+    fn observe(
+        &self,
+        rows: usize,
+        plan: &Arc<dyn ExecutionPlan>,
+        runtime: &RuntimeEnv,
+        started: tokio::time::Instant,
+    ) {
+        let mut metrics = self.lock();
+        metrics.rows_returned = u64::try_from(rows).unwrap_or(u64::MAX);
+        metrics.execution = started.elapsed();
+        apply_plan_metrics(&mut metrics, plan);
+        metrics.memory_peak_bytes = memory_peak(runtime);
+    }
+
+    fn finish(
+        &self,
+        stop: QueryStop,
+        rows: usize,
+        plan: &Arc<dyn ExecutionPlan>,
+        runtime: &RuntimeEnv,
+        started: tokio::time::Instant,
+    ) {
+        self.observe(rows, plan, runtime, started);
+        self.finish_flags(stop);
+    }
+}
+
+fn apply_plan_metrics(metrics: &mut QueryMetrics, plan: &Arc<dyn ExecutionPlan>) {
+    let mut spill = 0u64;
+    let mut row_groups = 0u64;
+    collect_operator_metrics(plan, &mut spill, &mut row_groups);
+    metrics.spill_bytes = spill;
+    metrics.row_groups_pruned = row_groups;
+}
+
+fn collect_operator_metrics(plan: &Arc<dyn ExecutionPlan>, spill: &mut u64, row_groups: &mut u64) {
+    if let Some(metrics) = plan.metrics() {
+        if let Some(bytes) = metrics.spilled_bytes() {
+            *spill += u64::try_from(bytes).unwrap_or(u64::MAX);
+        }
+        if let Some(MetricValue::PruningMetrics {
+            pruning_metrics, ..
+        }) = metrics.sum_by_name("row_groups_pruned_statistics")
+        {
+            *row_groups += u64::try_from(pruning_metrics.pruned()).unwrap_or(u64::MAX);
+        }
+    }
+    for child in plan.children() {
+        collect_operator_metrics(child, spill, row_groups);
+    }
+}
+
+fn memory_peak(runtime: &RuntimeEnv) -> u64 {
+    PeakRecordingPool::from_pool(runtime.memory_pool.as_ref())
+        .map(|pool| u64::try_from(pool.max_reserved()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 /// Arrow batches for one query, with the engine's timeout and row cap applied.
 pub struct QueryBatchStream {
     pull_tx: Option<mpsc::Sender<Pull>>,
@@ -739,14 +976,25 @@ pub struct QueryBatchStream {
     /// Keeps the query threads alive until this stream is dropped.
     #[allow(dead_code)]
     threads: Arc<QueryThreads>,
+    record: Arc<QueryRecord>,
 }
 
 impl QueryBatchStream {
+    /// Counters recorded for this query.
+    ///
+    /// Counts grow as batches are read. After the stream finishes, times out, or is cancelled,
+    /// the flags and the plan counters stay at the values recorded then.
+    #[must_use]
+    pub fn metrics(&self) -> QueryMetrics {
+        *self.record.lock()
+    }
+
     /// Stop the query. The next poll returns [`QueryError::Cancelled`] and no further batches.
     pub fn cancel(&mut self) {
         if self.finished || self.terminal.is_some() {
             return;
         }
+        self.record.mark_cancelled();
         self.terminal = Some(QueryError::Cancelled);
         self.permit.take();
         self.stop_task();
@@ -768,6 +1016,9 @@ impl QueryBatchStream {
 
 impl Drop for QueryBatchStream {
     fn drop(&mut self) {
+        if !self.finished && self.terminal.is_none() {
+            self.record.mark_cancelled();
+        }
         self.stop_task();
     }
 }
@@ -865,6 +1116,7 @@ pub struct ObserverTableProvider {
     snapshot: StoreSnapshot,
     schema: SchemaRef,
     hours: Vec<HourPartition>,
+    files: Arc<FileCounts>,
 }
 
 impl std::fmt::Debug for ObserverTableProvider {
@@ -902,7 +1154,24 @@ impl ObserverTableProvider {
             snapshot,
             schema,
             hours,
+            files: Arc::new(FileCounts::default()),
         })
+    }
+
+    fn record_files(&self, pieces: &[ScanPiece]) {
+        let scanned = pieces
+            .iter()
+            .filter(|piece| matches!(piece.source, ScanSource::File(_)))
+            .count();
+        let total: usize = self.hours.iter().map(|hour| hour.files.len()).sum();
+        self.files.scanned.store(
+            u64::try_from(scanned).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.files.pruned.store(
+            u64::try_from(total.saturating_sub(scanned)).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -948,6 +1217,7 @@ impl TableProvider for ObserverTableProvider {
             pieces.extend(hour_pieces(hour, filters, &self.schema, projection)?);
         }
         let pieces = keep_newest_prefix(pieces, limit, filters.is_empty());
+        self.record_files(&pieces);
         if pieces.is_empty() {
             let table = MemTable::try_new(output_schema(&self.schema, projection)?, vec![vec![]])?;
             return table.scan(state, None, &[], None).await;
@@ -2612,7 +2882,191 @@ mod tests {
             "pruned {}",
             row_groups_pruned(&plan)
         );
+        let mut streamed = engine()
+            .execute(Arc::clone(&store), sql, QueryOptions::default())
+            .await
+            .expect("execute");
+        while streamed.next().await.transpose().expect("batch").is_some() {}
+        assert!(streamed.metrics().row_groups_pruned >= 1);
         assert_eq!(u64_column(&batches(store, sql).await, "wal_sequence"), [0]);
+    }
+
+    #[tokio::test]
+    async fn query_metrics_count_pruned_files_rows_and_cancellation() {
+        let store = store();
+        publish_row(&store, frame(0, 1, vec![attribute("a", 1)]));
+        publish_row(&store, frame(1, 2, vec![attribute("a", 2)]));
+        let engine = engine();
+        let mut stream = engine
+            .execute(
+                Arc::clone(&store),
+                "SELECT wal_sequence FROM logs WHERE log_a_i64 = 1",
+                QueryOptions::default(),
+            )
+            .await
+            .expect("execute");
+        let mut rows = Vec::new();
+        while let Some(batch) = stream.next().await {
+            rows.push(batch.expect("batch"));
+        }
+        assert_eq!(u64_column(&rows, "wal_sequence"), [0]);
+        let metrics = stream.metrics();
+        assert_eq!(metrics.rows_returned, 1);
+        assert_eq!(metrics.files_scanned, 1);
+        assert_eq!(metrics.files_pruned, 1);
+        assert!(!metrics.timed_out);
+        assert!(!metrics.cancelled);
+
+        let mut cancelled = engine
+            .execute(
+                store,
+                "SELECT wal_sequence FROM logs",
+                QueryOptions::default(),
+            )
+            .await
+            .expect("execute");
+        cancelled.cancel();
+        let error = cancelled.next().await.expect("cancelled");
+        assert!(matches!(error, Err(QueryError::Cancelled)));
+        assert!(cancelled.metrics().cancelled);
+    }
+
+    #[tokio::test]
+    async fn concurrent_ingest_publish_and_queries_keep_each_row_once() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = open_at(directory.path());
+        let engine = engine_with(4);
+        let rows = 24u64;
+
+        let ingest = async {
+            for sequence in 0..rows {
+                store
+                    .append(&frame(sequence, sequence + 1, Vec::new()))
+                    .expect("append");
+                if sequence % 4 == 3 {
+                    store.rotate().expect("rotate");
+                    store.publish(&PublishOptions::default()).expect("publish");
+                }
+                tokio::task::yield_now().await;
+            }
+            store.rotate().expect("rotate");
+            store.publish(&PublishOptions::default()).expect("publish");
+        };
+
+        let read = async {
+            for _ in 0..6 {
+                let mut stream = engine
+                    .execute(
+                        Arc::clone(&store),
+                        "SELECT wal_sequence FROM logs",
+                        QueryOptions::default(),
+                    )
+                    .await
+                    .expect("execute");
+                let mut sequences = Vec::new();
+                while let Some(batch) = stream.next().await {
+                    sequences.extend(u64_column(&[batch.expect("batch")], "wal_sequence"));
+                }
+                let mut unique = sequences.clone();
+                unique.sort_unstable();
+                unique.dedup();
+                assert_eq!(unique.len(), sequences.len());
+                assert!(unique.iter().all(|sequence| *sequence < rows));
+                assert_eq!(stream.metrics().rows_returned, sequences.len() as u64);
+                tokio::task::yield_now().await;
+            }
+        };
+
+        let timeout_engine =
+            QueryEngine::new(QueryEngineConfig::default()).expect("timeout engine");
+        let timeout = async {
+            let error = timeout_engine
+                .execute(
+                    Arc::clone(&store),
+                    "SELECT wal_sequence FROM logs ORDER BY wal_sequence",
+                    QueryOptions {
+                        timeout: Duration::from_nanos(1),
+                        max_rows: QueryOptions::MAX_ROWS,
+                    },
+                )
+                .await;
+            assert!(matches!(error, Err(QueryError::Timeout)));
+        };
+
+        let cancel = async {
+            let mut stream = engine
+                .execute(
+                    Arc::clone(&store),
+                    "SELECT wal_sequence FROM logs",
+                    QueryOptions::default(),
+                )
+                .await
+                .expect("execute");
+            stream.cancel();
+            let error = stream.next().await.expect("cancelled");
+            assert!(matches!(error, Err(QueryError::Cancelled)));
+            assert!(stream.metrics().cancelled);
+        };
+
+        let spill = async {
+            spilled_sort_reports_bytes().await;
+        };
+
+        tokio::join!(ingest, read, timeout, cancel, spill);
+
+        let mut stream = engine
+            .execute(
+                store,
+                "SELECT wal_sequence FROM logs ORDER BY wal_sequence",
+                QueryOptions::default(),
+            )
+            .await
+            .expect("final");
+        let mut sequences = Vec::new();
+        while let Some(batch) = stream.next().await {
+            sequences.extend(u64_column(&[batch.expect("batch")], "wal_sequence"));
+        }
+        assert_eq!(sequences, (0..rows).collect::<Vec<_>>());
+        assert_eq!(stream.metrics().rows_returned, rows);
+        assert!(!stream.metrics().cancelled);
+    }
+
+    async fn spilled_sort_reports_bytes() {
+        let store = store();
+        for sequence in 0..40 {
+            store
+                .append(&frame_body(
+                    sequence,
+                    sequence + 1,
+                    &"x".repeat(64 * 1024),
+                    Vec::new(),
+                ))
+                .expect("append");
+        }
+        let spill = tempfile::tempdir().expect("spill");
+        let engine = QueryEngine::new(QueryEngineConfig {
+            memory_pool_bytes: 3 * 1024 * 1024,
+            sort_spill_reservation_bytes: 64 * 1024,
+            spill_directory: spill.path().to_path_buf(),
+            spill_budget_bytes: 64 * 1024 * 1024,
+            ..QueryEngineConfig::default()
+        })
+        .expect("engine");
+        let mut stream = engine
+            .execute(
+                store,
+                "SELECT body FROM logs ORDER BY body",
+                QueryOptions::default(),
+            )
+            .await
+            .expect("execute");
+        let mut rows = 0u64;
+        while let Some(batch) = stream.next().await {
+            rows += u64::try_from(batch.expect("batch").num_rows()).expect("rows");
+        }
+        assert_eq!(rows, 40);
+        assert!(stream.metrics().spill_bytes > 0);
+        assert_eq!(engine.runtime().disk_manager.used_disk_space(), 0);
     }
 
     fn scan_files(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
@@ -3619,6 +4073,12 @@ mod tests {
             rows += batch.expect("batch").num_rows();
         }
         assert_eq!(rows, 40);
+        let metrics = stream.metrics();
+        assert_eq!(metrics.rows_returned, 40);
+        assert!(metrics.spill_bytes > 0, "{}", metrics.spill_bytes);
+        assert!(metrics.memory_peak_bytes > 0);
+        assert!(!metrics.timed_out);
+        assert!(!metrics.cancelled);
         drop(stream);
         assert_eq!(engine.runtime().disk_manager.used_disk_space(), 0);
         assert_eq!(spill_file_count(spill.path()), 0);

@@ -44,6 +44,14 @@
 //! fields share a fingerprint. A later filtered scan skips a generation whose schema lacks a
 //! filtered column.
 //!
+//! # Published files
+//!
+//! Each Parquet file is written in `event_time_unix_nano` descending order, then `wal_sequence`
+//! descending order. The commit descriptor stores that order with the file size, row count, and
+//! conservative min/max statistics for scalar columns. Binary, JSON, and non-finite floats keep a
+//! null count and no bounds. Statistics that fail validation are discarded and the file stays
+//! visible. A storage scan still returns rows without imposing that order.
+//!
 //! # Durability
 //!
 //! An ingest acknowledgement means the raw OTLP frame is durable in the WAL. It does not mean the
