@@ -37,18 +37,21 @@ pub struct ListenAddrs {
     pub grpc: SocketAddr,
     pub http: SocketAddr,
     pub admin: SocketAddr,
+    pub query: SocketAddr,
 }
 
 pub fn reserve_ports() -> ListenAddrs {
     let grpc = TcpListener::bind("127.0.0.1:0").expect("reserve grpc");
     let http = TcpListener::bind("127.0.0.1:0").expect("reserve http");
     let admin = TcpListener::bind("127.0.0.1:0").expect("reserve admin");
+    let query = TcpListener::bind("127.0.0.1:0").expect("reserve query");
     let addrs = ListenAddrs {
         grpc: grpc.local_addr().expect("grpc addr"),
         http: http.local_addr().expect("http addr"),
         admin: admin.local_addr().expect("admin addr"),
+        query: query.local_addr().expect("query addr"),
     };
-    drop((grpc, http, admin));
+    drop((grpc, http, admin, query));
     addrs
 }
 
@@ -69,10 +72,11 @@ pub fn write_tuned(
 ) {
     let data_directory = data_directory(wal_directory);
     let contents = format!(
-        "wal_directory = {wal_directory:?}\ndata_directory = {data_directory:?}\n\n[listen]\ngrpc = \"{grpc}\"\nhttp = \"{http}\"\nadmin = \"{admin}\"\n\n[tokens]\n\"{SECRET}\" = \"{TENANT}\"\n\"{SECOND_SECRET}\" = \"{SECOND_TENANT}\"\n\n[storage]\nmax_rows = {max_rows}\nmax_bytes = 67108864\nmax_age_ms = 60000\nmax_frozen = 4\nmax_dynamic_columns = 256\nmax_depth = 4\npoll_interval_ms = 20\n\n[readiness]\nmin_free_bytes = {min_free_bytes}\n",
+        "wal_directory = {wal_directory:?}\ndata_directory = {data_directory:?}\n\n[listen]\ngrpc = \"{grpc}\"\nhttp = \"{http}\"\nadmin = \"{admin}\"\nquery = \"{query}\"\n\n[tokens]\n\"{SECRET}\" = \"{TENANT}\"\n\"{SECOND_SECRET}\" = \"{SECOND_TENANT}\"\n\n[storage]\nmax_rows = {max_rows}\nmax_bytes = 67108864\nmax_age_ms = 60000\nmax_frozen = 4\nmax_dynamic_columns = 256\nmax_depth = 4\npoll_interval_ms = 20\n\n[readiness]\nmin_free_bytes = {min_free_bytes}\n",
         grpc = listen.grpc,
         http = listen.http,
         admin = listen.admin,
+        query = listen.query,
     );
     fs::write(path, contents).expect("write config");
 }

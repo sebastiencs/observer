@@ -2162,7 +2162,9 @@ name = "observerd"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
+ "arrow-schema",
  "axum",
+ "base64 0.23.1",
  "bytes",
  "fs2",
  "nix",
@@ -2175,11 +2177,13 @@ dependencies = [
  "prost",
  "reqwest",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-stream",
  "toml",
  "tonic",
+ "tower-http",
 ]
 
 [[package]]

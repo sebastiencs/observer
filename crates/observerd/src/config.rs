@@ -8,10 +8,15 @@ use std::{
 };
 
 use observer_ingest::{AuthConfigError, TokenDirectory};
+use observer_query::{QueryEngineConfig, QueryOptions};
 use serde::Deserialize;
 
 /// Two target WAL segments (256 MiB each).
 pub const DEFAULT_MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
+/// Maximum JSON body accepted by `POST /v1/query`.
+pub const DEFAULT_QUERY_MAX_REQUEST_BYTES: usize = 64 * 1024;
+/// Maximum buffered JSON response produced by `POST /v1/query`.
+pub const DEFAULT_QUERY_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// File-backed daemon configuration.
 #[derive(Clone, Debug)]
@@ -22,6 +27,27 @@ pub struct Config {
     pub tokens: TokenDirectory,
     pub readiness: ReadinessConfig,
     pub storage: StorageConfig,
+    /// Query listener settings. The listener is not bound yet.
+    #[allow(dead_code)]
+    pub query: QueryConfig,
+}
+
+/// HTTP caps and the shared query runtime.
+///
+/// The query listener is not bound yet, so only configuration tests read these fields.
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryConfig {
+    /// Deadline applied when a request does not set a lower one.
+    pub timeout: Duration,
+    /// Returned-row cap applied when a request does not set a lower one.
+    pub max_rows: usize,
+    /// Maximum accepted query request body.
+    pub max_request_bytes: usize,
+    /// Maximum buffered JSON response.
+    pub max_response_bytes: usize,
+    /// Runtime settings, including the dedicated spill directory.
+    pub engine: QueryEngineConfig,
 }
 
 /// Memtable bounds and the consumer poll interval.
@@ -55,6 +81,9 @@ pub struct ListenConfig {
     pub grpc: SocketAddr,
     pub http: SocketAddr,
     pub admin: SocketAddr,
+    /// Separate query listener. It is not bound yet.
+    #[allow(dead_code)]
+    pub query: SocketAddr,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +94,22 @@ struct FileConfig {
     tokens: HashMap<String, String>,
     readiness: Option<FileReadiness>,
     storage: FileStorage,
+    query: Option<FileQuery>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FileQuery {
+    timeout_ms: Option<u64>,
+    max_rows: Option<u64>,
+    max_request_bytes: Option<u64>,
+    max_response_bytes: Option<u64>,
+    memory_pool_bytes: Option<u64>,
+    max_concurrent_queries: Option<u64>,
+    target_partitions_per_query: Option<u64>,
+    batch_size: Option<u64>,
+    metadata_cache_bytes: Option<u64>,
+    spill_budget_bytes: Option<u64>,
+    sort_spill_reservation_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,6 +170,7 @@ impl Config {
         if file.storage.max_frozen == 0 {
             return Err(ConfigError::Invalid("storage.max_frozen must be non-zero"));
         }
+        let query = query_config(file.query.unwrap_or_default(), &file.data_directory)?;
         Ok(Self {
             wal_directory: file.wal_directory,
             data_directory: file.data_directory,
@@ -145,8 +191,112 @@ impl Config {
                 max_depth: file.storage.max_depth,
                 poll_interval: Duration::from_millis(file.storage.poll_interval_ms),
             },
+            query,
         })
     }
+}
+
+fn query_config(file: FileQuery, data_directory: &Path) -> Result<QueryConfig, ConfigError> {
+    let defaults = QueryEngineConfig::default();
+    let engine = QueryEngineConfig {
+        memory_pool_bytes: optional_usize(
+            file.memory_pool_bytes,
+            defaults.memory_pool_bytes,
+            "query.memory_pool_bytes must be non-zero",
+            "query.memory_pool_bytes is too large",
+        )?,
+        max_concurrent_queries: optional_usize(
+            file.max_concurrent_queries,
+            defaults.max_concurrent_queries,
+            "query.max_concurrent_queries must be non-zero",
+            "query.max_concurrent_queries is too large",
+        )?,
+        target_partitions_per_query: optional_usize(
+            file.target_partitions_per_query,
+            defaults.target_partitions_per_query,
+            "query.target_partitions_per_query must be non-zero",
+            "query.target_partitions_per_query is too large",
+        )?,
+        batch_size: optional_usize(
+            file.batch_size,
+            defaults.batch_size,
+            "query.batch_size must be non-zero",
+            "query.batch_size is too large",
+        )?,
+        metadata_cache_bytes: optional_usize(
+            file.metadata_cache_bytes,
+            defaults.metadata_cache_bytes,
+            "query.metadata_cache_bytes must be non-zero",
+            "query.metadata_cache_bytes is too large",
+        )?,
+        spill_directory: data_directory.join("query-spill"),
+        spill_budget_bytes: match file.spill_budget_bytes {
+            None => defaults.spill_budget_bytes,
+            Some(0) => {
+                return Err(ConfigError::Invalid(
+                    "query.spill_budget_bytes must be non-zero",
+                ));
+            }
+            Some(bytes) => bytes,
+        },
+        sort_spill_reservation_bytes: optional_usize(
+            file.sort_spill_reservation_bytes,
+            defaults.sort_spill_reservation_bytes,
+            "query.sort_spill_reservation_bytes must be non-zero",
+            "query.sort_spill_reservation_bytes is too large",
+        )?,
+    };
+    Ok(QueryConfig {
+        timeout: match file.timeout_ms {
+            None => QueryOptions::TIMEOUT,
+            Some(millis) => timeout_from_millis(millis)?,
+        },
+        max_rows: optional_usize(
+            file.max_rows,
+            QueryOptions::MAX_ROWS,
+            "query.max_rows must be non-zero",
+            "query.max_rows is too large",
+        )?,
+        max_request_bytes: optional_usize(
+            file.max_request_bytes,
+            DEFAULT_QUERY_MAX_REQUEST_BYTES,
+            "query.max_request_bytes must be non-zero",
+            "query.max_request_bytes is too large",
+        )?,
+        max_response_bytes: optional_usize(
+            file.max_response_bytes,
+            DEFAULT_QUERY_MAX_RESPONSE_BYTES,
+            "query.max_response_bytes must be non-zero",
+            "query.max_response_bytes is too large",
+        )?,
+        engine,
+    })
+}
+
+fn optional_usize(
+    value: Option<u64>,
+    default: usize,
+    zero: &'static str,
+    overflow: &'static str,
+) -> Result<usize, ConfigError> {
+    match value {
+        None => Ok(default),
+        Some(0) => Err(ConfigError::Invalid(zero)),
+        Some(value) => usize::try_from(value).map_err(|_| ConfigError::Invalid(overflow)),
+    }
+}
+
+fn timeout_from_millis(millis: u64) -> Result<Duration, ConfigError> {
+    if millis == 0 {
+        return Err(ConfigError::Invalid("query.timeout_ms must be non-zero"));
+    }
+    let nanos = millis
+        .checked_mul(1_000_000)
+        .ok_or(ConfigError::Invalid("query.timeout_ms is too large"))?;
+    Ok(Duration::new(
+        nanos / 1_000_000_000,
+        (nanos % 1_000_000_000) as u32,
+    ))
 }
 
 #[cfg(test)]
@@ -161,6 +311,7 @@ data_directory = "/var/lib/observer/data"
 grpc = "0.0.0.0:4317"
 http = "0.0.0.0:4318"
 admin = "127.0.0.1:8080"
+query = "127.0.0.1:8081"
 
 [tokens]
 "secret-a" = "tenant-a"
@@ -190,6 +341,25 @@ poll_interval_ms = 50
         assert_eq!(config.listen.grpc, "0.0.0.0:4317".parse().unwrap());
         assert_eq!(config.listen.http, "0.0.0.0:4318".parse().unwrap());
         assert_eq!(config.listen.admin, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(config.listen.query, "127.0.0.1:8081".parse().unwrap());
+        assert_eq!(config.query.timeout, QueryOptions::TIMEOUT);
+        assert_eq!(config.query.max_rows, QueryOptions::MAX_ROWS);
+        assert_eq!(
+            config.query.max_request_bytes,
+            DEFAULT_QUERY_MAX_REQUEST_BYTES
+        );
+        assert_eq!(
+            config.query.max_response_bytes,
+            DEFAULT_QUERY_MAX_RESPONSE_BYTES
+        );
+        assert_eq!(
+            config.query.engine.spill_directory,
+            PathBuf::from("/var/lib/observer/data/query-spill")
+        );
+        assert_eq!(
+            config.query.engine.memory_pool_bytes,
+            QueryEngineConfig::default().memory_pool_bytes
+        );
         assert_eq!(
             config.tokens.authenticate(Some("Bearer secret-a")).unwrap(),
             "tenant-a"
@@ -211,6 +381,7 @@ data_directory = "/tmp/data"
 grpc = "127.0.0.1:4317"
 http = "127.0.0.1:4318"
 admin = "127.0.0.1:8080"
+query = "127.0.0.1:8081"
 [tokens]
 "secret-a" = "tenant-a"
 [storage]
@@ -236,6 +407,7 @@ data_directory = "/tmp/data"
 grpc = "127.0.0.1:4317"
 http = "127.0.0.1:4318"
 admin = "127.0.0.1:8080"
+query = "127.0.0.1:8081"
 [tokens]
 "secret-a" = "tenant-a"
 [storage]
@@ -264,6 +436,7 @@ data_directory = "/tmp/data"
 grpc = "127.0.0.1:4317"
 http = "127.0.0.1:4318"
 admin = "127.0.0.1:8080"
+query = "127.0.0.1:8081"
 [tokens]
 "secret-a" = "tenant-a"
 [storage]
@@ -292,6 +465,7 @@ data_directory = "/tmp/data"
 grpc = "127.0.0.1:4317"
 http = "127.0.0.1:4318"
 admin = "127.0.0.1:8080"
+query = "127.0.0.1:8081"
 [tokens]
 [storage]
 max_rows = 10
@@ -311,6 +485,142 @@ poll_interval_ms = 1
     }
 
     #[test]
+    fn query_settings_override_the_defaults() {
+        let config = Config::parse(
+            r#"
+wal_directory = "/tmp/wal"
+data_directory = "/tmp/data"
+[listen]
+grpc = "127.0.0.1:4317"
+http = "127.0.0.1:4318"
+admin = "127.0.0.1:8080"
+query = "127.0.0.1:8081"
+[tokens]
+"secret-a" = "tenant-a"
+[storage]
+max_rows = 10
+max_bytes = 10
+max_age_ms = 1
+max_frozen = 1
+max_dynamic_columns = 1
+max_depth = 1
+poll_interval_ms = 1
+[query]
+timeout_ms = 15000
+max_rows = 100
+max_request_bytes = 1024
+max_response_bytes = 2048
+memory_pool_bytes = 4096
+max_concurrent_queries = 2
+target_partitions_per_query = 3
+batch_size = 16
+metadata_cache_bytes = 32
+spill_budget_bytes = 64
+sort_spill_reservation_bytes = 8
+"#,
+        )
+        .expect("parse");
+        assert_eq!(config.query.timeout, Duration::from_millis(15_000));
+        assert_eq!(config.query.max_rows, 100);
+        assert_eq!(config.query.max_request_bytes, 1024);
+        assert_eq!(config.query.max_response_bytes, 2048);
+        assert_eq!(config.query.engine.memory_pool_bytes, 4096);
+        assert_eq!(config.query.engine.max_concurrent_queries, 2);
+        assert_eq!(config.query.engine.target_partitions_per_query, 3);
+        assert_eq!(config.query.engine.batch_size, 16);
+        assert_eq!(config.query.engine.metadata_cache_bytes, 32);
+        assert_eq!(config.query.engine.spill_budget_bytes, 64);
+        assert_eq!(config.query.engine.sort_spill_reservation_bytes, 8);
+        assert_eq!(
+            config.query.engine.spill_directory,
+            PathBuf::from("/tmp/data/query-spill")
+        );
+    }
+
+    #[test]
+    fn rejects_zero_query_limits() {
+        for (field, detail) in [
+            ("timeout_ms", "query.timeout_ms must be non-zero"),
+            ("max_rows", "query.max_rows must be non-zero"),
+            (
+                "max_request_bytes",
+                "query.max_request_bytes must be non-zero",
+            ),
+            (
+                "max_response_bytes",
+                "query.max_response_bytes must be non-zero",
+            ),
+            (
+                "memory_pool_bytes",
+                "query.memory_pool_bytes must be non-zero",
+            ),
+            (
+                "max_concurrent_queries",
+                "query.max_concurrent_queries must be non-zero",
+            ),
+            (
+                "target_partitions_per_query",
+                "query.target_partitions_per_query must be non-zero",
+            ),
+            ("batch_size", "query.batch_size must be non-zero"),
+            (
+                "metadata_cache_bytes",
+                "query.metadata_cache_bytes must be non-zero",
+            ),
+            (
+                "spill_budget_bytes",
+                "query.spill_budget_bytes must be non-zero",
+            ),
+            (
+                "sort_spill_reservation_bytes",
+                "query.sort_spill_reservation_bytes must be non-zero",
+            ),
+        ] {
+            let error = Config::parse(&query_config_with(field, 0)).expect_err(field);
+            assert!(
+                matches!(error, ConfigError::Invalid(message) if message == detail),
+                "{field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_timeout_that_does_not_fit() {
+        let error =
+            Config::parse(&query_config_with("timeout_ms", i64::MAX as u64)).expect_err("timeout");
+        assert!(matches!(
+            error,
+            ConfigError::Invalid("query.timeout_ms is too large")
+        ));
+    }
+
+    fn query_config_with(field: &str, value: u64) -> String {
+        format!(
+            r#"
+wal_directory = "/tmp/wal"
+data_directory = "/tmp/data"
+[listen]
+grpc = "127.0.0.1:4317"
+http = "127.0.0.1:4318"
+admin = "127.0.0.1:8080"
+query = "127.0.0.1:8081"
+[tokens]
+"secret-a" = "tenant-a"
+[storage]
+max_rows = 10
+max_bytes = 10
+max_age_ms = 1
+max_frozen = 1
+max_dynamic_columns = 1
+max_depth = 1
+poll_interval_ms = 1
+[query]
+{field} = {value}
+"#
+        )
+    }
+
+    #[test]
     fn rejects_zero_frozen_limit() {
         let error = Config::parse(
             r#"
@@ -320,6 +630,7 @@ data_directory = "/tmp/data"
 grpc = "127.0.0.1:4317"
 http = "127.0.0.1:4318"
 admin = "127.0.0.1:8080"
+query = "127.0.0.1:8081"
 [tokens]
 "secret-a" = "tenant-a"
 [storage]
@@ -370,6 +681,7 @@ mod properties {
             grpc in any::<SocketAddrV4>(),
             http in any::<SocketAddrV4>(),
             admin in any::<SocketAddrV4>(),
+            query in any::<SocketAddrV4>(),
             tokens in prop::collection::hash_map(token(), tenant(), 1..6),
             min_free_bytes in prop::option::of(0_u64..=i64::MAX as u64),
             max_rows in 0_u64..10_000,
@@ -381,7 +693,7 @@ mod properties {
             poll_interval_ms in 0_u64..1_000,
         ) {
             let mut body = format!(
-                "wal_directory = \"/tmp/observer-{suffix}\"\ndata_directory = \"/tmp/observer-data-{suffix}\"\n\n[listen]\ngrpc = \"{grpc}\"\nhttp = \"{http}\"\nadmin = \"{admin}\"\n\n[tokens]\n"
+                "wal_directory = \"/tmp/observer-{suffix}\"\ndata_directory = \"/tmp/observer-data-{suffix}\"\n\n[listen]\ngrpc = \"{grpc}\"\nhttp = \"{http}\"\nadmin = \"{admin}\"\nquery = \"{query}\"\n\n[tokens]\n"
             );
             for (token, tenant) in &tokens {
                 body.push_str(&format!("\"{token}\" = \"{tenant}\"\n"));
@@ -408,6 +720,13 @@ mod properties {
             prop_assert_eq!(config.listen.grpc, SocketAddr::V4(grpc));
             prop_assert_eq!(config.listen.http, SocketAddr::V4(http));
             prop_assert_eq!(config.listen.admin, SocketAddr::V4(admin));
+            prop_assert_eq!(config.listen.query, SocketAddr::V4(query));
+            prop_assert_eq!(config.query.timeout, QueryOptions::TIMEOUT);
+            prop_assert_eq!(config.query.max_rows, QueryOptions::MAX_ROWS);
+            prop_assert_eq!(
+                config.query.engine.spill_directory,
+                PathBuf::from(format!("/tmp/observer-data-{suffix}/query-spill"))
+            );
             prop_assert_eq!(
                 config.readiness.min_free_bytes,
                 min_free_bytes.unwrap_or(DEFAULT_MIN_FREE_BYTES)

@@ -475,6 +475,7 @@ data_directory = "{data}"
 grpc = "127.0.0.1:1"
 http = "127.0.0.1:2"
 admin = "127.0.0.1:3"
+query = "127.0.0.1:4"
 [tokens]
 "secret-a" = "tenant-a"
 "secret-b" = "tenant-b"
