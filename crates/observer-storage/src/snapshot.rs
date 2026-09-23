@@ -12,7 +12,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use arrow_array::RecordBatch;
+use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::{Field, Schema, SchemaRef};
 
 use crate::catalog::{Catalog, CatalogError};
@@ -534,6 +534,40 @@ fn union_schema<'a>(schemas: impl Iterator<Item = &'a SchemaRef>) -> Result<Sche
     Ok(Arc::new(Schema::new(fields)))
 }
 
+/// Align `batch` to `projection` of `schema`.
+///
+/// Columns that already exist are reused. A typed null array is created only for a projected
+/// column the batch does not contain. `None` aligns to every column of `schema`.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Incompatible`] when a projected index is outside `schema` or a present
+/// column has a different Arrow type, and [`StoreError::Memtable`] when a required column is
+/// missing.
+pub fn align_projected(
+    batch: &RecordBatch,
+    schema: SchemaRef,
+    projection: Option<&[usize]>,
+) -> Result<RecordBatch, StoreError> {
+    let schema = match projection {
+        Some(indices) => Arc::new(
+            schema
+                .project(indices)
+                .map_err(|error| StoreError::Incompatible(error.to_string()))?,
+        ),
+        None => schema,
+    };
+    if schema.fields().is_empty() {
+        return RecordBatch::try_new_with_options(
+            schema,
+            Vec::new(),
+            &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+        )
+        .map_err(|error| StoreError::Incompatible(error.to_string()));
+    }
+    align_batch(batch, schema).map_err(StoreError::from)
+}
+
 fn projected_schema(
     union: &SchemaRef,
     columns: Option<&[String]>,
@@ -560,7 +594,8 @@ mod tests {
         MemtableConfig, MemtableError, ParquetFault, ParquetWriteOptions, commit_path,
         decode_logs_frame,
     };
-    use arrow_array::{Array, Int64Array, StringArray, UInt64Array};
+    use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, UInt64Array};
+    use arrow_schema::{DataType, Field, Schema};
     use bytes::Bytes;
     use observer_protocol::otlp::{
         AnyValue, ExportLogsServiceRequest, KeyValue, LogRecord, ResourceLogs, ScopeLogs, any_value,
@@ -1013,5 +1048,54 @@ mod tests {
             .expect("scan");
         assert_eq!(sequences(&rows), [0]);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn align_projected_reuses_present_arrays_and_nulls_only_requested_columns() {
+        let keep = Arc::new(Int64Array::from(vec![Some(1), None]));
+        let skipped = Arc::new(Int64Array::from(vec![Some(3), Some(4)]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("keep", DataType::Int64, true),
+                Field::new("skip", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::clone(&keep) as ArrayRef,
+                Arc::clone(&skipped) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("keep", DataType::Int64, true),
+            Field::new("missing", DataType::Utf8, true),
+            Field::new("skip", DataType::Int64, true),
+        ]));
+        let keep_array: ArrayRef = Arc::clone(&keep) as ArrayRef;
+        let skipped_array: ArrayRef = Arc::clone(&skipped) as ArrayRef;
+        let skipped_count = Arc::strong_count(&skipped);
+        let aligned =
+            super::align_projected(&batch, Arc::clone(&schema), Some(&[0, 1])).expect("project");
+        assert_eq!(
+            aligned
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            ["keep", "missing"]
+        );
+        assert!(Arc::ptr_eq(aligned.column(0), &keep_array));
+        assert_eq!(aligned.column(1).null_count(), 2);
+        assert_eq!(Arc::strong_count(&skipped), skipped_count);
+
+        let full = super::align_projected(&batch, schema, None).expect("full");
+        assert_eq!(full.num_columns(), 3);
+        assert!(Arc::ptr_eq(full.column(0), &keep_array));
+        assert_eq!(full.column(1).null_count(), 2);
+        assert!(Arc::ptr_eq(full.column(2), &skipped_array));
+
+        let empty = super::align_projected(&batch, full.schema(), Some(&[])).expect("empty");
+        assert_eq!(empty.num_columns(), 0);
+        assert_eq!(empty.num_rows(), batch.num_rows());
     }
 }

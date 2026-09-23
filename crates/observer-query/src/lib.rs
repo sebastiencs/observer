@@ -5,8 +5,10 @@
 //! active and frozen batches with the Parquet files named by published commits. A file that is not
 //! named by a commit is not read.
 //!
-//! The scan projects only the physical columns DataFusion asks for. Event-time comparisons drop
-//! hours that cannot match, and committed file statistics drop Parquet files that cannot match.
+//! The scan projects only the physical columns DataFusion asks for. In-memory batches keep their
+//! generation arrays until that projection is known; typed nulls are then created only for selected
+//! columns a generation lacks. Event-time comparisons drop hours that cannot match, and committed
+//! file statistics drop Parquet files that cannot match.
 //! DataFusion then prunes Parquet row groups and pages with the same predicates. Every pushed
 //! filter still runs again above the scan.
 //!
@@ -87,7 +89,7 @@ use datafusion::sql::sqlparser::ast::Statement;
 use futures::{Stream, StreamExt};
 use observer_storage::{
     COLUMN_EVENT_TIME_UNIX_NANO, COLUMN_WAL_SEQUENCE, ColumnStatistics, EventHour, FileStatistics,
-    PublishedFile, Scan, StatValue, Store, StoreError, StoreSnapshot, align_batch,
+    PublishedFile, Scan, StatValue, Store, StoreError, StoreSnapshot, align_projected,
     sort_by_newest_event,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -850,14 +852,14 @@ fn spill_budget_exhausted(text: &str) -> bool {
 struct HourPartition {
     hour: EventHour,
     files: Vec<PublishedFile>,
-    batches: Vec<RecordBatch>,
+    batches: Vec<Arc<RecordBatch>>,
 }
 
 /// DataFusion table for one pinned tenant snapshot.
 ///
-/// Each [`HourPartition`] becomes one output partition. Within that partition, memory batches and
-/// commit-referenced Parquet files are aligned to [`StoreSnapshot::schema`]. Missing nullable
-/// columns are typed nulls.
+/// Each [`HourPartition`] becomes one output partition. Memory batches stay in the generation
+/// schema they were stored with. A scan aligns the columns DataFusion projects, after hours and
+/// files that cannot match have been dropped.
 pub struct ObserverTableProvider {
     store: Arc<Store>,
     snapshot: StoreSnapshot,
@@ -877,12 +879,11 @@ impl std::fmt::Debug for ObserverTableProvider {
 }
 
 impl ObserverTableProvider {
-    /// Align the snapshot's in-memory batches and keep the commit-referenced Parquet paths.
+    /// Keep the snapshot's in-memory batches and the commit-referenced Parquet paths.
     ///
     /// # Errors
     ///
-    /// Returns [`QueryError::Storage`] when the snapshot schema is incompatible or a batch cannot
-    /// be aligned.
+    /// Returns [`QueryError::Storage`] when the snapshot schema is incompatible.
     pub fn new(store: Arc<Store>, snapshot: StoreSnapshot) -> Result<Self, QueryError> {
         let schema = snapshot.schema().map_err(QueryError::Storage)?;
         let mut hours = Vec::new();
@@ -890,17 +891,10 @@ impl ObserverTableProvider {
             if hour.files.is_empty() && hour.batches.is_empty() {
                 continue;
             }
-            let mut batches = Vec::with_capacity(hour.batches.len());
-            for batch in &hour.batches {
-                batches.push(
-                    align_batch(batch, Arc::clone(&schema))
-                        .map_err(|error| QueryError::Storage(StoreError::from(error)))?,
-                );
-            }
             hours.push(HourPartition {
                 hour: hour.hour,
                 files: hour.files,
-                batches,
+                batches: hour.batches,
             });
         }
         Ok(Self {
@@ -951,12 +945,12 @@ impl TableProvider for ObserverTableProvider {
             if !window.contains(hour.hour) {
                 continue;
             }
-            pieces.extend(hour_pieces(hour, filters)?);
+            pieces.extend(hour_pieces(hour, filters, &self.schema, projection)?);
         }
         let pieces = keep_newest_prefix(pieces, limit, filters.is_empty());
         if pieces.is_empty() {
-            let table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![]])?;
-            return table.scan(state, projection, &[], None).await;
+            let table = MemTable::try_new(output_schema(&self.schema, projection)?, vec![vec![]])?;
+            return table.scan(state, None, &[], None).await;
         }
         let advertise = pieces.iter().all(|piece| piece.ordered)
             && order_columns_projected(self.schema.as_ref(), projection);
@@ -1469,11 +1463,15 @@ impl ScanPiece {
             }
             ScanSource::Memory(batches) => {
                 let batches = limit_batches(batches, limit);
-                let mut table = MemTable::try_new(Arc::clone(schema), vec![batches])?;
+                let memory_schema = match batches.first() {
+                    Some(batch) => batch.schema(),
+                    None => output_schema(schema, projection)?,
+                };
+                let mut table = MemTable::try_new(memory_schema, vec![batches])?;
                 if advertise_order {
                     table = table.with_sort_order(vec![newest_sort_exprs()]);
                 }
-                table.scan(state, projection, &[], None).await
+                table.scan(state, None, &[], None).await
             }
         }
     }
@@ -1482,6 +1480,8 @@ impl ScanPiece {
 fn hour_pieces(
     hour: &HourPartition,
     filters: &[Expr],
+    schema: &SchemaRef,
+    projection: Option<&Vec<usize>>,
 ) -> datafusion::error::Result<Vec<ScanPiece>> {
     let mut pieces = Vec::new();
     for file in &hour.files {
@@ -1502,20 +1502,72 @@ fn hour_pieces(
         });
     }
     if !hour.batches.is_empty() {
-        let schema = hour.batches[0].schema();
-        let sorted = sort_by_newest_event(&schema, &hour.batches)
+        let columns = projection.map(Vec::as_slice);
+        let working = alignment_projection(schema.as_ref(), columns);
+        let mut aligned = Vec::with_capacity(hour.batches.len());
+        for batch in &hour.batches {
+            aligned.push(project_batch(batch, schema, working.as_deref())?);
+        }
+        let sorted = sort_by_newest_event(&aligned[0].schema(), &aligned)
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
         let span = batch_span(&sorted);
+        let projected = if working.as_deref() == columns {
+            sorted
+        } else {
+            project_batch(&sorted, schema, columns)?
+        };
         pieces.push(ScanPiece {
             ordered: span.is_some(),
             span,
-            source: ScanSource::Memory(split_sorted(sorted, &hour.batches)),
+            source: ScanSource::Memory(split_sorted(projected, &hour.batches)),
         });
     }
     Ok(pieces)
 }
 
-fn split_sorted(sorted: RecordBatch, originals: &[RecordBatch]) -> Vec<RecordBatch> {
+fn alignment_projection(
+    schema: &arrow_schema::Schema,
+    projection: Option<&[usize]>,
+) -> Option<Vec<usize>> {
+    let projection = projection?;
+    let mut indices = projection.to_vec();
+    for name in [COLUMN_EVENT_TIME_UNIX_NANO, COLUMN_WAL_SEQUENCE] {
+        let Ok(index) = schema.index_of(name) else {
+            continue;
+        };
+        if !indices.contains(&index) {
+            indices.push(index);
+        }
+    }
+    Some(indices)
+}
+
+fn output_schema(
+    schema: &SchemaRef,
+    projection: Option<&Vec<usize>>,
+) -> datafusion::error::Result<SchemaRef> {
+    match projection {
+        None => Ok(Arc::clone(schema)),
+        Some(indices) => schema
+            .project(indices)
+            .map(Arc::new)
+            .map_err(|error| DataFusionError::ArrowError(Box::new(error), None)),
+    }
+}
+
+fn project_batch(
+    batch: &RecordBatch,
+    schema: &SchemaRef,
+    projection: Option<&[usize]>,
+) -> datafusion::error::Result<RecordBatch> {
+    align_projected(batch, Arc::clone(schema), projection)
+        .map_err(|error| DataFusionError::External(Box::new(error)))
+}
+
+fn split_sorted(sorted: RecordBatch, originals: &[Arc<RecordBatch>]) -> Vec<RecordBatch> {
+    if originals.len() == 1 && originals[0].num_rows() == sorted.num_rows() {
+        return vec![sorted];
+    }
     let mut offset = 0;
     let mut batches = Vec::new();
     for original in originals {
@@ -2728,6 +2780,156 @@ mod tests {
             u64_column(&batches(store, limited).await, "wal_sequence"),
             [1]
         );
+    }
+
+    #[test]
+    fn provider_keeps_generation_batches_until_a_scan_projects_them() {
+        let store = store();
+        let wide: Vec<_> = (0..6)
+            .map(|index| attribute(&format!("unused{index}"), index))
+            .chain(std::iter::once(attribute("keep", 1)))
+            .collect();
+        store
+            .append(&frame_body(0, 1, "old", wide))
+            .expect("append");
+        store.rotate().expect("rotate");
+        store
+            .append(&frame_body(1, HOUR + 1, "new", vec![attribute("keep", 2)]))
+            .expect("active");
+        let snapshot = store.snapshot().expect("snapshot");
+        let original = Arc::clone(
+            &snapshot
+                .frozen
+                .first()
+                .expect("frozen")
+                .partitions
+                .first()
+                .expect("partition")
+                .batches[0],
+        );
+        let old_body = Arc::clone(
+            original
+                .column_by_name(observer_storage::COLUMN_BODY)
+                .expect("body"),
+        );
+        let body_count = Arc::strong_count(&old_body);
+        let provider = ObserverTableProvider::new(Arc::clone(&store), snapshot).expect("provider");
+        assert!(Arc::ptr_eq(&provider.hours[0].batches[0], &original));
+        assert_eq!(Arc::strong_count(&old_body), body_count);
+
+        let body = provider
+            .schema
+            .index_of(observer_storage::COLUMN_BODY)
+            .expect("body");
+        let event = provider
+            .schema
+            .index_of(observer_storage::COLUMN_EVENT_TIME_UNIX_NANO)
+            .expect("event");
+        let keep = provider.schema.index_of("log_keep_i64").expect("keep");
+        let projection = vec![body, event, keep];
+        let selected = &provider.hours[1];
+        let selected_body = Arc::clone(
+            selected.batches[0]
+                .column_by_name(observer_storage::COLUMN_BODY)
+                .expect("body"),
+        );
+        let selected_keep = Arc::clone(
+            selected.batches[0]
+                .column_by_name("log_keep_i64")
+                .expect("keep"),
+        );
+        let pieces =
+            super::hour_pieces(selected, &[], &provider.schema, Some(&projection)).expect("pieces");
+        assert_eq!(Arc::strong_count(&old_body), body_count);
+        let super::ScanSource::Memory(batches) = &pieces[0].source else {
+            panic!("memory piece");
+        };
+        let names: Vec<_> = batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
+        assert!(names.contains(&"body".to_owned()));
+        assert!(names.contains(&"log_keep_i64".to_owned()));
+        assert!(names.iter().all(|name| !name.starts_with("log_unused")));
+        assert!(Arc::ptr_eq(
+            batches[0]
+                .column_by_name(observer_storage::COLUMN_BODY)
+                .expect("body"),
+            &selected_body
+        ));
+        assert!(Arc::ptr_eq(
+            batches[0].column_by_name("log_keep_i64").expect("keep"),
+            &selected_keep
+        ));
+        assert!(batches[0].column_by_name("log_unused0_i64").is_none());
+    }
+
+    #[tokio::test]
+    async fn projected_columns_match_for_active_frozen_and_published_rows() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = open_at(directory.path());
+        let wide: Vec<_> = (0..6)
+            .map(|index| attribute(&format!("unused{index}"), index))
+            .chain(std::iter::once(attribute("keep", 1)))
+            .collect();
+        store
+            .append(&frame_body(0, 1, "old", wide))
+            .expect("frozen");
+        store.rotate().expect("rotate");
+        store
+            .append(&frame_body(1, HOUR + 1, "new", vec![attribute("keep", 2)]))
+            .expect("active");
+        let sql = format!(
+            "SELECT body FROM logs WHERE event_time_unix_nano >= {HOUR} AND log_keep_i64 = 2"
+        );
+
+        let active = batches(Arc::clone(&store), &sql).await;
+        assert_eq!(utf8_column(&active, "body"), vec![Some("new".to_owned())]);
+        let shape = scan_shape(&physical_plan(Arc::clone(&store), &sql).await);
+        assert!(shape.files.is_empty(), "{:?}", shape.files);
+        assert!(shape.memory_scans > 0);
+        for schema in &shape.schemas {
+            assert!(schema.contains(&"body".to_owned()), "{schema:?}");
+            assert!(schema.contains(&"log_keep_i64".to_owned()), "{schema:?}");
+            assert!(
+                schema.iter().all(|name| !name.starts_with("log_unused")),
+                "{schema:?}"
+            );
+        }
+
+        store
+            .publish(&PublishOptions::default())
+            .expect("publish frozen");
+        let mixed = batches(Arc::clone(&store), &sql).await;
+        assert_eq!(utf8_column(&mixed, "body"), vec![Some("new".to_owned())]);
+
+        store.rotate().expect("rotate");
+        store
+            .publish(&PublishOptions::default())
+            .expect("publish active");
+        let published = batches(store, &sql).await;
+        assert_eq!(
+            utf8_column(&published, "body"),
+            vec![Some("new".to_owned())]
+        );
+    }
+
+    fn utf8_column(batches: &[arrow_array::RecordBatch], name: &str) -> Vec<Option<String>> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column_by_name(name)
+                    .expect("column")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("utf8");
+                (0..column.len())
+                    .map(move |row| (!column.is_null(row)).then(|| column.value(row).to_owned()))
+            })
+            .collect()
     }
 
     fn row_groups_pruned(plan: &Arc<dyn ExecutionPlan>) -> usize {

@@ -118,7 +118,7 @@ pub use schema::{
 };
 pub use snapshot::{
     HourSources, PublishFault, PublishOptions, PublishedFile, Scan, Store, StoreError,
-    StoreSnapshot,
+    StoreSnapshot, align_projected,
 };
 pub use statistics::{
     ColumnStatistics, FileStatistics, StatValue, file_statistics, statistics_usable,
