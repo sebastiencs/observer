@@ -2,17 +2,13 @@
 
 mod support;
 
-use std::time::Duration;
-
 use observer_protocol::otlp::ExportLogsServiceRequest;
 use prost::Message;
 use support::{
-    ListenAddrs, Observerd, SECOND_BEARER, SECOND_TENANT, TENANT, TEST_TIMEOUT, frames_on_disk,
-    logs_request, post_logs, post_logs_as, reserve_ports, write_config,
+    SECOND_BEARER, SECOND_TENANT, TENANT, TEST_TIMEOUT, frames_on_disk, logs_request, post_logs,
+    post_logs_as, restart_daemon, start_daemon,
 };
 use tokio::time::timeout;
-
-const START_ATTEMPTS: usize = 3;
 
 #[tokio::test]
 async fn acknowledged_http_logs_survive_sigterm_and_restart() {
@@ -30,12 +26,12 @@ async fn run_restart_scenario() {
     let other_first = logs_request("other-before-restart");
     let other_second = logs_request("other-after-restart");
 
-    let (listen, mut daemon) = start_with_retries(&config_path, &wal_directory).await;
+    let (listen, mut daemon) = start_daemon(&config_path, &wal_directory).await;
     post_logs(listen.http, &first).await;
     post_logs_as(listen.http, SECOND_BEARER, &other_first).await;
     daemon.terminate().await;
 
-    let mut daemon = restart(&config_path, listen).await;
+    let mut daemon = restart_daemon(&config_path, listen).await;
     post_logs(listen.http, &second).await;
     post_logs_as(listen.http, SECOND_BEARER, &other_second).await;
     daemon.terminate().await;
@@ -84,36 +80,4 @@ async fn run_restart_scenario() {
             .expect("other second payload"),
         other_second
     );
-}
-
-async fn start_with_retries(
-    config_path: &std::path::Path,
-    wal_directory: &std::path::Path,
-) -> (ListenAddrs, Observerd) {
-    let mut last_error = String::from("no attempts");
-    for _ in 0..START_ATTEMPTS {
-        let listen = reserve_ports();
-        write_config(config_path, wal_directory, listen);
-        let mut daemon = Observerd::spawn(config_path);
-        match timeout(TEST_TIMEOUT, daemon.wait_ready(listen.admin)).await {
-            Ok(Ok(())) => return (listen, daemon),
-            Ok(Err(error)) => last_error = error,
-            Err(_) => last_error = "timed out waiting for first /ready".to_owned(),
-        }
-    }
-    panic!("failed to start observerd after {START_ATTEMPTS} attempts: {last_error}");
-}
-
-async fn restart(config_path: &std::path::Path, listen: ListenAddrs) -> Observerd {
-    let mut last_error = String::from("no attempts");
-    for _ in 0..START_ATTEMPTS {
-        let mut daemon = Observerd::spawn(config_path);
-        match timeout(TEST_TIMEOUT, daemon.wait_ready(listen.admin)).await {
-            Ok(Ok(())) => return daemon,
-            Ok(Err(error)) => last_error = error,
-            Err(_) => last_error = "timed out waiting for restart /ready".to_owned(),
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("failed to restart observerd after {START_ATTEMPTS} attempts: {last_error}");
 }

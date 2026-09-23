@@ -2,11 +2,7 @@
 
 mod support;
 
-use std::{
-    fs,
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::{fs, path::Path, time::Duration};
 
 use arrow_array::{Array, StringArray};
 use observer_protocol::otlp::{
@@ -16,8 +12,8 @@ use observer_protocol::otlp::{
 use observer_storage::{Scan, Store, SystemClock};
 use observer_wal::{WalCheckpoint, tenant_wal_directory};
 use support::{
-    BEARER, ListenAddrs, Observerd, SECOND_BEARER, SECOND_TENANT, TENANT, TEST_TIMEOUT,
-    data_directory, post_logs, post_logs_as, reserve_ports, write_tuned,
+    BEARER, Observerd, SECOND_BEARER, SECOND_TENANT, TENANT, TEST_TIMEOUT, data_directory,
+    post_logs, post_logs_as, reserve_ports, start_ready, wait_checkpoint, write_tuned,
 };
 use tokio::time::timeout;
 use tonic::Request;
@@ -36,7 +32,7 @@ async fn lifecycle() {
     let listen = reserve_ports();
     write_tuned(&config_path, &wal_directory, listen, 0, 1);
 
-    let mut daemon = start(&config_path, listen).await;
+    let mut daemon = start_ready(&config_path, listen).await;
     post_logs(listen.http, &marked("http-before")).await;
     export_grpc(listen.grpc, BEARER, &marked("grpc-before")).await;
     post_logs_as(listen.http, SECOND_BEARER, &marked("other-before")).await;
@@ -65,7 +61,7 @@ async fn lifecycle() {
     ));
     daemon.terminate().await;
 
-    let mut daemon = start(&config_path, listen).await;
+    let mut daemon = start_ready(&config_path, listen).await;
     assert_eq!(
         bodies(&data_directory(&wal_directory), TENANT),
         vec![
@@ -77,7 +73,7 @@ async fn lifecycle() {
     wait_checkpoint(&wal_directory, TENANT, 3).await;
     daemon.terminate().await;
 
-    let mut daemon = start(&config_path, listen).await;
+    let mut daemon = start_ready(&config_path, listen).await;
     assert_eq!(
         bodies(&data_directory(&wal_directory), TENANT),
         vec![
@@ -111,7 +107,7 @@ async fn active_tail() {
     let config_path = root.path().join("observerd.toml");
     let listen = reserve_ports();
     write_tuned(&config_path, &wal_directory, listen, 100_000, 1);
-    let mut daemon = start(&config_path, listen).await;
+    let mut daemon = start_ready(&config_path, listen).await;
     post_logs(listen.http, &marked("still-active")).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(checkpoint(&wal_directory, TENANT), 0);
@@ -138,12 +134,6 @@ async fn startup_fails_when_either_filesystem_is_full() {
     let mut daemon = Observerd::spawn(&config_path);
     let status = daemon.wait_exit().await;
     assert!(!status.success(), "{status}");
-}
-
-async fn start(config: &Path, listen: ListenAddrs) -> Observerd {
-    let mut daemon = Observerd::spawn(config);
-    daemon.wait_ready(listen.admin).await.expect("ready");
-    daemon
 }
 
 fn marked(body: &str) -> ExportLogsServiceRequest {
@@ -183,18 +173,6 @@ async fn export_grpc(
         .expect("export")
         .into_inner();
     assert!(response.partial_success.is_none());
-}
-
-async fn wait_checkpoint(wal_directory: &Path, tenant: &str, sequence: u64) {
-    let directory = tenant_wal_directory(wal_directory, tenant);
-    let start = Instant::now();
-    while start.elapsed() < TEST_TIMEOUT {
-        if checkpoint_directory(&directory) == Some(sequence) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("checkpoint for {tenant} did not reach {sequence}");
 }
 
 fn checkpoint(wal_directory: &Path, tenant: &str) -> u64 {

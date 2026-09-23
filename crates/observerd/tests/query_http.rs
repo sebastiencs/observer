@@ -2,23 +2,19 @@
 
 mod support;
 
-use std::{
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use observer_protocol::otlp::{
     AnyValue, ExportLogsServiceRequest, LogRecord, ResourceLogs, ScopeLogs, any_value,
 };
-use observer_wal::{WalCheckpoint, tenant_wal_directory};
 use serde_json::{Value, json};
 use support::{
-    BEARER, ListenAddrs, Observerd, SECOND_BEARER, TEST_TIMEOUT, post_logs, post_logs_as,
-    post_query, reserve_ports, write_config, write_response_cap,
+    BEARER, SECOND_BEARER, TENANT, TEST_TIMEOUT, assert_metrics, column_strings, post_logs,
+    post_logs_as, post_query, reserve_ports, restart_daemon, sql_body, start_daemon, start_ready,
+    wait_checkpoint, wait_for_bodies, write_response_cap,
 };
 use tokio::time::timeout;
 
-const START_ATTEMPTS: usize = 3;
 const EVENT_TIME: &str = "1700000000000000000";
 const LATER_TIME: &str = "1700000000000000002";
 const OTHER_TIME: &str = "1700000000000000001";
@@ -49,7 +45,7 @@ async fn tenant_scope_and_restart() {
     let root = tempfile::tempdir().expect("tempdir");
     let wal_directory = root.path().join("wal");
     let config_path = root.path().join("observerd.toml");
-    let (listen, mut daemon) = start_with_retries(&config_path, &wal_directory).await;
+    let (listen, mut daemon) = start_daemon(&config_path, &wal_directory).await;
 
     post_logs(listen.http, &marked("alpha", 1_700_000_000_000_000_000)).await;
     post_logs_as(
@@ -114,7 +110,7 @@ async fn tenant_scope_and_restart() {
     }
 
     daemon.terminate().await;
-    let mut daemon = restart(&config_path, listen).await;
+    let mut daemon = restart_daemon(&config_path, listen).await;
     let restored = post_query(listen.query, Some(BEARER), &sql_body(PROJECTION)).await;
     assert_eq!(
         restored.status,
@@ -162,7 +158,7 @@ async fn limits_and_cors() {
     let root = tempfile::tempdir().expect("tempdir");
     let wal_directory = root.path().join("wal");
     let config_path = root.path().join("observerd.toml");
-    let (listen, mut daemon) = start_with_retries(&config_path, &wal_directory).await;
+    let (listen, mut daemon) = start_daemon(&config_path, &wal_directory).await;
 
     let preflight = reqwest::Client::new()
         .request(
@@ -234,9 +230,9 @@ async fn limits_and_cors() {
     let config_path = root.path().join("observerd.toml");
     let listen = reserve_ports();
     write_response_cap(&config_path, &wal_directory, listen, 64);
-    let mut daemon = start(&config_path, listen).await;
+    let mut daemon = start_ready(&config_path, listen).await;
     post_logs(listen.http, &marked("too-big", 1)).await;
-    wait_checkpoint(&wal_directory, support::TENANT, 1).await;
+    wait_checkpoint(&wal_directory, TENANT, 1).await;
     let oversized = post_query(
         listen.query,
         Some(BEARER),
@@ -254,7 +250,7 @@ async fn ingest_and_query() {
     let root = tempfile::tempdir().expect("tempdir");
     let wal_directory = root.path().join("wal");
     let config_path = root.path().join("observerd.toml");
-    let (listen, mut daemon) = start_with_retries(&config_path, &wal_directory).await;
+    let (listen, mut daemon) = start_daemon(&config_path, &wal_directory).await;
     let expected = [
         "row-0", "row-1", "row-2", "row-3", "row-4", "row-5", "row-6", "row-7",
     ];
@@ -274,7 +270,7 @@ async fn ingest_and_query() {
             );
             last = response.body;
             let document = serde_json::from_str::<Value>(&last).expect("query json");
-            let bodies = bodies_of(&document);
+            let bodies = column_strings(&document, "body");
             assert!(
                 bodies.windows(2).all(|pair| pair[0] <= pair[1]),
                 "rows were not ordered: {bodies:?}"
@@ -321,125 +317,4 @@ fn marked(body: &str, time_unix_nano: u64) -> ExportLogsServiceRequest {
             ..Default::default()
         }],
     }
-}
-
-fn sql_body(sql: &str) -> String {
-    json!({"sql": sql}).to_string()
-}
-
-fn bodies_of(document: &Value) -> Vec<String> {
-    document["rows"]
-        .as_array()
-        .expect("rows")
-        .iter()
-        .map(|row| row["body"].as_str().expect("body string").to_owned())
-        .collect()
-}
-
-fn assert_metrics(metrics: &Value, rows: u64) {
-    let object = metrics.as_object().expect("metrics");
-    for field in [
-        "admission_wait_ns",
-        "planning_ns",
-        "execution_ns",
-        "files_scanned",
-        "files_pruned",
-        "row_groups_pruned",
-        "rows_returned",
-        "memory_peak_bytes",
-        "spill_bytes",
-    ] {
-        let text = object
-            .get(field)
-            .and_then(Value::as_str)
-            .unwrap_or_else(|| panic!("{field} is not a decimal string in {metrics}"));
-        assert!(
-            !text.is_empty() && text.chars().all(|character| character.is_ascii_digit()),
-            "{field}={text}"
-        );
-    }
-    assert_eq!(
-        object.get("rows_returned").and_then(Value::as_str),
-        Some(rows.to_string()).as_deref()
-    );
-    assert_eq!(object.get("timed_out"), Some(&Value::Bool(false)));
-    assert_eq!(object.get("cancelled"), Some(&Value::Bool(false)));
-    assert_eq!(object.len(), 11);
-}
-
-async fn wait_for_bodies(address: std::net::SocketAddr, bearer: &str, expected: &[&str]) {
-    let deadline = Instant::now() + TEST_TIMEOUT;
-    let mut last = String::new();
-    while Instant::now() < deadline {
-        let response = post_query(
-            address,
-            Some(bearer),
-            &sql_body("SELECT body FROM logs ORDER BY body"),
-        )
-        .await;
-        last = response.body;
-        if response.status == reqwest::StatusCode::OK {
-            let document = serde_json::from_str::<Value>(&last).expect("query json");
-            let bodies = bodies_of(&document);
-            if bodies
-                .iter()
-                .map(String::as_str)
-                .eq(expected.iter().copied())
-            {
-                return;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("rows did not become {expected:?}: {last}");
-}
-
-async fn wait_checkpoint(wal_directory: &Path, tenant: &str, sequence: u64) {
-    let directory = tenant_wal_directory(wal_directory, tenant);
-    let start = Instant::now();
-    while start.elapsed() < TEST_TIMEOUT {
-        if WalCheckpoint::load(&directory)
-            .ok()
-            .is_some_and(|checkpoint| checkpoint.cursor().next_sequence() == sequence)
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("checkpoint for {tenant} did not reach {sequence}");
-}
-
-async fn start_with_retries(config_path: &Path, wal_directory: &Path) -> (ListenAddrs, Observerd) {
-    let mut last_error = String::from("no attempts");
-    for _ in 0..START_ATTEMPTS {
-        let listen = reserve_ports();
-        write_config(config_path, wal_directory, listen);
-        let mut daemon = Observerd::spawn(config_path);
-        match timeout(TEST_TIMEOUT, daemon.wait_ready(listen.admin)).await {
-            Ok(Ok(())) => return (listen, daemon),
-            Ok(Err(error)) => last_error = error,
-            Err(_) => last_error = "timed out waiting for first /ready".to_owned(),
-        }
-    }
-    panic!("failed to start observerd after {START_ATTEMPTS} attempts: {last_error}");
-}
-
-async fn restart(config_path: &Path, listen: ListenAddrs) -> Observerd {
-    let mut last_error = String::from("no attempts");
-    for _ in 0..START_ATTEMPTS {
-        let mut daemon = Observerd::spawn(config_path);
-        match timeout(TEST_TIMEOUT, daemon.wait_ready(listen.admin)).await {
-            Ok(Ok(())) => return daemon,
-            Ok(Err(error)) => last_error = error,
-            Err(_) => last_error = "timed out waiting for restart /ready".to_owned(),
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("failed to restart observerd after {START_ATTEMPTS} attempts: {last_error}");
-}
-
-async fn start(config: &Path, listen: ListenAddrs) -> Observerd {
-    let mut daemon = Observerd::spawn(config);
-    daemon.wait_ready(listen.admin).await.expect("ready");
-    daemon
 }
