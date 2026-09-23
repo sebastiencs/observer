@@ -12,10 +12,11 @@
 //! Results have no order unless the SQL contains `ORDER BY`. The tenant is the store passed to
 //! `execute`, never a value inside the SQL. Only one `SELECT` statement is accepted.
 //!
-//! One engine shares a bounded memory pool, a query runtime, and a limit on how many queries run at
-//! once. Each query uses its own session and the timeout and returned-row cap in [`QueryOptions`].
-//! That timeout bounds planning and reading. A query that cannot obtain a permit before the deadline
-//! is busy. Dropping or cancelling the result stream stops the query and releases its permit.
+//! One engine shares a bounded memory pool, a spill directory, a Parquet metadata cache, a query
+//! runtime, and a limit on how many queries run at once. Each query uses its own session and the
+//! timeout and returned-row cap in [`QueryOptions`]. That timeout bounds planning and reading. A
+//! query that cannot obtain a permit before the deadline is busy. Dropping or cancelling the result
+//! stream stops the query and releases its permit.
 //!
 //! # Contract
 //!
@@ -40,7 +41,7 @@
 //! This crate does not expose an HTTP or gRPC query API.
 
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -54,11 +55,12 @@ use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::ScalarValue;
 use datafusion::datasource::MemTable;
 use datafusion::datasource::listing::PartitionedFile;
+use datafusion::datasource::physical_plan::parquet::CachedParquetFileReaderFactory;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::{SessionConfig, SessionContext};
-use datafusion::execution::memory_pool::GreedyMemoryPool;
+use datafusion::execution::memory_pool::FairSpillPool;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType};
@@ -81,16 +83,19 @@ const NANOS_PER_HOUR: u64 = 3_600_000_000_000;
 
 /// Shared DataFusion resources for tenant-scoped SQL execution.
 pub struct QueryEngine {
-    runtime: Arc<RuntimeEnv>,
+    runtime: Option<Arc<RuntimeEnv>>,
+    spill: Option<Arc<SpillDirectory>>,
     threads: Arc<QueryThreads>,
     admission: Arc<Semaphore>,
-    target_partitions: usize,
+    config: QueryEngineConfig,
 }
 
 /// Shared limits for every query on one engine.
 ///
-/// [`Default`] derives the concurrency and partition cap once from the process parallelism.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// [`Default`] derives the concurrency and partition cap once from the process parallelism. The
+/// spill directory is a private path; the engine creates it when it is built and removes it when
+/// the engine and its queries are finished.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryEngineConfig {
     /// Bytes available to every query that shares this engine.
     pub memory_pool_bytes: usize,
@@ -98,6 +103,16 @@ pub struct QueryEngineConfig {
     pub max_concurrent_queries: usize,
     /// DataFusion partition target for each query.
     pub target_partitions_per_query: usize,
+    /// Rows DataFusion places in one record batch.
+    pub batch_size: usize,
+    /// Bytes reserved for the shared Parquet footer and page-index cache.
+    pub metadata_cache_bytes: usize,
+    /// Directory that receives spill files for this engine.
+    pub spill_directory: PathBuf,
+    /// Maximum bytes of spill files this engine may keep at once.
+    pub spill_budget_bytes: u64,
+    /// Bytes an external sort reserves before it can spill.
+    pub sort_spill_reservation_bytes: usize,
 }
 
 impl Default for QueryEngineConfig {
@@ -107,8 +122,46 @@ impl Default for QueryEngineConfig {
             memory_pool_bytes: QueryEngine::MEMORY_POOL_BYTES,
             max_concurrent_queries: parallelism,
             target_partitions_per_query: parallelism,
+            batch_size: QueryEngine::BATCH_SIZE,
+            metadata_cache_bytes: QueryEngine::METADATA_CACHE_BYTES,
+            spill_directory: default_spill_directory(),
+            spill_budget_bytes: QueryEngine::SPILL_BUDGET_BYTES,
+            sort_spill_reservation_bytes: QueryEngine::SORT_SPILL_RESERVATION_BYTES,
         }
     }
+}
+
+/// Removes a private spill directory after the engine and its queries release it.
+struct SpillDirectory {
+    path: PathBuf,
+}
+
+impl Drop for SpillDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Drops the query runtime before the spill directory so spill files are closed first.
+struct QueryKeepalive {
+    runtime: Option<Arc<RuntimeEnv>>,
+    spill: Option<Arc<SpillDirectory>>,
+}
+
+impl Drop for QueryKeepalive {
+    fn drop(&mut self) {
+        self.runtime.take();
+        self.spill.take();
+    }
+}
+
+fn default_spill_directory() -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "observer-query-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
 }
 
 /// Timeout and returned-row cap for one query.
@@ -198,32 +251,59 @@ impl std::error::Error for QueryError {
 impl QueryEngine {
     /// Bytes available to every query that shares this engine.
     pub const MEMORY_POOL_BYTES: usize = 256 * 1024 * 1024;
+    /// Rows in one DataFusion record batch.
+    pub const BATCH_SIZE: usize = 8192;
+    /// Shared Parquet metadata cache, kept apart from the execution memory pool.
+    pub const METADATA_CACHE_BYTES: usize = 32 * 1024 * 1024;
+    /// Spill files this engine may keep at once.
+    pub const SPILL_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+    /// Memory an external sort keeps available so it can spill the rest.
+    pub const SORT_SPILL_RESERVATION_BYTES: usize = 10 * 1024 * 1024;
+    /// Bytes read from the end of a Parquet file when looking for the footer.
+    pub const PARQUET_FOOTER_HINT_BYTES: usize = 512 * 1024;
+    /// Smallest file scan DataFusion may split across partitions.
+    pub const FILE_SCAN_MIN_BYTES: usize = 1024 * 1024;
 
     /// Build a runtime from `config`.
     ///
     /// Planning and execution run on threads named `observer-query`. At most
     /// [`QueryEngineConfig::max_concurrent_queries`] queries hold an admission permit at once.
     /// A result stream keeps the query threads and its permit alive until the query finishes or
-    /// the stream is dropped.
+    /// the stream is dropped. Spill files live under [`QueryEngineConfig::spill_directory`] and
+    /// are removed when the engine and its queries finish.
     ///
     /// # Errors
     ///
-    /// Returns [`QueryError::Resources`] when the runtime cannot be constructed, or when a
-    /// concurrency setting is zero.
+    /// Returns [`QueryError::Resources`] when the runtime or spill directory cannot be constructed,
+    /// or when a concurrency setting or the batch size is zero.
     pub fn new(config: QueryEngineConfig) -> Result<Self, QueryError> {
-        Self::with_threads(config.checked()?, QueryThreads::start()?)
+        Self::with_threads(config, QueryThreads::start()?)
     }
 
     fn with_threads(config: QueryEngineConfig, threads: QueryThreads) -> Result<Self, QueryError> {
+        let config = config.checked()?;
+        std::fs::create_dir_all(&config.spill_directory).map_err(|error| {
+            QueryError::Resources(format!(
+                "create spill directory {}: {error}",
+                config.spill_directory.display()
+            ))
+        })?;
+        let spill = Arc::new(SpillDirectory {
+            path: config.spill_directory.clone(),
+        });
         let runtime = RuntimeEnvBuilder::new()
-            .with_memory_pool(Arc::new(GreedyMemoryPool::new(config.memory_pool_bytes)))
+            .with_memory_pool(Arc::new(FairSpillPool::new(config.memory_pool_bytes)))
+            .with_temp_file_path(config.spill_directory.clone())
+            .with_max_temp_directory_size(config.spill_budget_bytes)
+            .with_metadata_cache_limit(config.metadata_cache_bytes)
             .build()
             .map_err(|error| QueryError::Resources(error.to_string()))?;
         Ok(Self {
-            runtime: Arc::new(runtime),
+            runtime: Some(Arc::new(runtime)),
+            spill: Some(spill),
             threads: Arc::new(threads),
             admission: Arc::new(Semaphore::new(config.max_concurrent_queries)),
-            target_partitions: config.target_partitions_per_query,
+            config,
         })
     }
 
@@ -235,7 +315,7 @@ impl QueryEngine {
     /// concurrency setting is zero.
     #[cfg(test)]
     fn paused(config: QueryEngineConfig) -> Result<Self, QueryError> {
-        Self::with_threads(config.checked()?, QueryThreads::start_paused()?)
+        Self::with_threads(config, QueryThreads::start_paused()?)
     }
 
     /// Advance the query runtime's clock.
@@ -252,7 +332,11 @@ impl QueryEngine {
     /// Shared execution resources for every query-local session.
     #[must_use]
     pub fn runtime(&self) -> &RuntimeEnv {
-        &self.runtime
+        self.runtime.as_ref().expect("query runtime")
+    }
+
+    fn spill_directory(&self) -> Arc<SpillDirectory> {
+        Arc::clone(self.spill.as_ref().expect("spill directory"))
     }
 
     /// Run one `SELECT` against the rows visible in `store` at call time.
@@ -300,14 +384,19 @@ impl QueryEngine {
         }
         let (ready_tx, ready_rx) = oneshot::channel();
         let (pull_tx, pull_rx) = mpsc::channel(1);
-        let runtime = Arc::clone(&self.runtime);
+        let runtime = Arc::clone(self.runtime.as_ref().expect("query runtime"));
+        let keepalive = QueryKeepalive {
+            runtime: Some(Arc::clone(&runtime)),
+            spill: Some(self.spill_directory()),
+        };
         let admission = Arc::clone(&self.admission);
-        let target_partitions = self.target_partitions;
+        let session = session_config(&self.config);
         let sql = sql.to_owned();
         let max_rows = options.max_rows;
         let timeout = options.timeout;
         let mut task = TaskGuard(Some(self.threads.spawn(async move {
-            match prepare(runtime, admission, target_partitions, input, sql, timeout).await {
+            let _keepalive = keepalive;
+            match prepare(runtime, admission, session, input, sql, timeout).await {
                 Err(error) => {
                     let _ = ready_tx.send(Err(error));
                 }
@@ -332,6 +421,13 @@ impl QueryEngine {
             Ok(Err(error)) => Err(error),
             Err(_) => Err(query_task_stopped()),
         }
+    }
+}
+
+impl Drop for QueryEngine {
+    fn drop(&mut self) {
+        self.runtime.take();
+        self.spill.take();
     }
 }
 
@@ -450,7 +546,7 @@ fn query_worker_threads() -> usize {
 async fn prepare(
     runtime: Arc<RuntimeEnv>,
     admission: Arc<Semaphore>,
-    target_partitions: usize,
+    session: SessionConfig,
     input: QueryInput,
     sql: String,
     timeout: Duration,
@@ -474,10 +570,7 @@ async fn prepare(
     };
     let prepared = tokio::time::timeout_at(deadline, async move {
         let provider = table_provider(input)?;
-        let context = SessionContext::new_with_config_rt(
-            SessionConfig::new().with_target_partitions(target_partitions),
-            runtime,
-        );
+        let context = SessionContext::new_with_config_rt(session, runtime);
         context
             .register_table(LOGS_TABLE, provider)
             .map_err(QueryError::Planning)?;
@@ -503,8 +596,36 @@ impl QueryEngineConfig {
                 "target_partitions_per_query must be at least 1".to_owned(),
             ));
         }
+        if self.batch_size == 0 {
+            return Err(QueryError::Resources(
+                "batch_size must be at least 1".to_owned(),
+            ));
+        }
+        if self.spill_directory.as_os_str().is_empty() {
+            return Err(QueryError::Resources(
+                "spill_directory must be set".to_owned(),
+            ));
+        }
         Ok(self)
     }
+}
+
+fn session_config(config: &QueryEngineConfig) -> SessionConfig {
+    let mut session = SessionConfig::new()
+        .with_batch_size(config.batch_size)
+        .with_target_partitions(config.target_partitions_per_query)
+        .with_collect_statistics(true)
+        .with_repartition_file_scans(true)
+        .with_repartition_file_min_size(QueryEngine::FILE_SCAN_MIN_BYTES)
+        .with_parquet_pruning(true)
+        .with_parquet_page_index_pruning(true)
+        .with_parquet_bloom_filter_pruning(false)
+        .with_sort_spill_reservation_bytes(config.sort_spill_reservation_bytes);
+    let parquet = &mut session.options_mut().execution.parquet;
+    parquet.pushdown_filters = true;
+    parquet.reorder_filters = true;
+    parquet.metadata_size_hint = Some(QueryEngine::PARQUET_FOOTER_HINT_BYTES);
+    session
 }
 
 fn table_provider(input: QueryInput) -> Result<Arc<dyn TableProvider>, QueryError> {
@@ -680,26 +801,33 @@ impl Stream for QueryBatchStream {
 }
 
 fn execution_error(error: DataFusionError) -> QueryError {
-    if memory_exhausted(&error) {
+    if resource_limit(&error) {
         QueryError::Resources(error.to_string())
     } else {
         QueryError::Execution(error)
     }
 }
 
-fn memory_exhausted(error: &DataFusionError) -> bool {
+fn resource_limit(error: &DataFusionError) -> bool {
     match error {
         DataFusionError::ResourcesExhausted(_) => true,
         DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => {
-            memory_exhausted(inner)
+            resource_limit(inner)
         }
-        DataFusionError::Shared(inner) => memory_exhausted(inner),
-        DataFusionError::Collection(errors) => errors.iter().any(memory_exhausted),
-        DataFusionError::External(error) => error
-            .downcast_ref::<DataFusionError>()
-            .is_some_and(memory_exhausted),
-        _ => false,
+        DataFusionError::Shared(inner) => resource_limit(inner),
+        DataFusionError::Collection(errors) => errors.iter().any(resource_limit),
+        DataFusionError::External(inner) => {
+            inner
+                .downcast_ref::<DataFusionError>()
+                .is_some_and(resource_limit)
+                || spill_budget_exhausted(&inner.to_string())
+        }
+        other => spill_budget_exhausted(&other.to_string()),
     }
+}
+
+fn spill_budget_exhausted(text: &str) -> bool {
+    text.contains("exceeded the allowable limit")
 }
 
 /// One event hour's visible batches and commit-referenced Parquet files.
@@ -1018,7 +1146,7 @@ async fn hour_plan(
 ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
     let mut inputs = Vec::new();
     if !hour.files.is_empty() {
-        inputs.push(parquet_plan(schema, &hour.files, projection).await?);
+        inputs.push(parquet_plan(state, schema, &hour.files, projection).await?);
     }
     if !hour.batches.is_empty() {
         let table = MemTable::try_new(Arc::clone(schema), vec![hour.batches.clone()])?;
@@ -1028,6 +1156,7 @@ async fn hour_plan(
 }
 
 async fn parquet_plan(
+    state: &dyn Session,
     schema: &SchemaRef,
     files: &[std::path::PathBuf],
     projection: Option<&Vec<usize>>,
@@ -1036,9 +1165,22 @@ async fn parquet_plan(
     for file in files {
         groups.push(FileGroup::new(vec![partitioned_file(file).await?]));
     }
-    let source = Arc::new(ParquetSource::new(Arc::clone(schema)));
-    let mut builder = FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source)
-        .with_file_groups(groups);
+    let url = ObjectStoreUrl::local_filesystem();
+    let store = state.runtime_env().object_store(&url)?;
+    let cache = state.runtime_env().cache_manager.get_file_metadata_cache();
+    let parquet = &state.config().options().execution.parquet;
+    let mut source = ParquetSource::new(Arc::clone(schema))
+        .with_parquet_file_reader_factory(Arc::new(CachedParquetFileReaderFactory::new(
+            store, cache,
+        )))
+        .with_pushdown_filters(parquet.pushdown_filters)
+        .with_reorder_filters(parquet.reorder_filters)
+        .with_enable_page_index(parquet.enable_page_index)
+        .with_bloom_filter_on_read(parquet.bloom_filter_on_read);
+    if let Some(hint) = parquet.metadata_size_hint {
+        source = source.with_metadata_size_hint(hint);
+    }
+    let mut builder = FileScanConfigBuilder::new(url, Arc::new(source)).with_file_groups(groups);
     if let Some(indices) = projection {
         builder = builder.with_projection_indices(Some(indices.clone()))?;
     }
@@ -1105,8 +1247,8 @@ mod tests {
     use std::future::Future;
     use std::path::Path;
     use std::pin::Pin;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use std::time::Duration;
 
@@ -1167,6 +1309,15 @@ mod tests {
     }
 
     fn frame(sequence: u64, time: u64, attributes: Vec<KeyValue>) -> observer_storage::DecodedLogs {
+        frame_body(sequence, time, &format!("row-{sequence}"), attributes)
+    }
+
+    fn frame_body(
+        sequence: u64,
+        time: u64,
+        body: &str,
+        attributes: Vec<KeyValue>,
+    ) -> observer_storage::DecodedLogs {
         let request = ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
                 scope_logs: vec![ScopeLogs {
@@ -1174,7 +1325,7 @@ mod tests {
                         time_unix_nano: time,
                         attributes,
                         body: Some(AnyValue {
-                            value: Some(any_value::Value::StringValue(format!("row-{sequence}"))),
+                            value: Some(any_value::Value::StringValue(body.to_owned())),
                         }),
                         ..Default::default()
                     }],
@@ -1674,7 +1825,12 @@ mod tests {
     fn builds_a_shared_runtime() {
         let engine = engine();
         assert_eq!(engine.runtime().memory_pool.reserved(), 0);
-        assert_eq!(engine.runtime().memory_pool.name(), "greedy");
+        assert_eq!(engine.runtime().memory_pool.name(), "fair");
+        assert_eq!(
+            engine.runtime().cache_manager.get_metadata_cache_limit(),
+            QueryEngine::METADATA_CACHE_BYTES
+        );
+        assert!(engine.runtime().disk_manager.tmp_files_enabled());
     }
 
     #[tokio::test]
@@ -2112,6 +2268,7 @@ mod tests {
         store.append(&frame(1, 2, Vec::new())).expect("append");
         let engine = QueryEngine::new(QueryEngineConfig {
             memory_pool_bytes: 1,
+            spill_budget_bytes: 0,
             ..QueryEngineConfig::default()
         })
         .expect("engine");
@@ -2127,6 +2284,268 @@ mod tests {
             Err(error) => Err(error),
         };
         assert!(matches!(error, Err(QueryError::Resources(_))), "{error:?}");
+    }
+
+    #[test]
+    fn batch_size_must_be_at_least_one() {
+        let engine = QueryEngine::new(QueryEngineConfig {
+            batch_size: 0,
+            ..QueryEngineConfig::default()
+        });
+        assert!(matches!(engine, Err(QueryError::Resources(_))));
+    }
+
+    #[tokio::test]
+    async fn each_query_uses_the_configured_session() {
+        let seen = Arc::new(Mutex::new(None));
+        let engine = QueryEngine::new(QueryEngineConfig {
+            batch_size: 128,
+            target_partitions_per_query: 3,
+            ..QueryEngineConfig::default()
+        })
+        .expect("engine");
+        engine
+            .execute_provider(
+                Arc::new(SessionProbe {
+                    schema: probe_schema(),
+                    seen: Arc::clone(&seen),
+                    pools: Arc::new(Mutex::new(Vec::new())),
+                }),
+                "SELECT wal_sequence FROM logs",
+                QueryOptions::default(),
+            )
+            .await
+            .expect("execute");
+        let seen = seen.lock().expect("session").clone().expect("recorded");
+        assert_eq!(seen.batch_size, 128);
+        assert_eq!(seen.target_partitions, 3);
+        assert!(seen.pushdown_filters);
+        assert!(seen.reorder_filters);
+        assert!(seen.pruning);
+        assert!(seen.enable_page_index);
+        assert!(!seen.bloom_filter_on_read);
+        assert_eq!(
+            seen.metadata_size_hint,
+            Some(QueryEngine::PARQUET_FOOTER_HINT_BYTES)
+        );
+        assert!(seen.collect_statistics);
+        assert!(seen.repartition_file_scans);
+        assert_eq!(
+            seen.repartition_file_min_size,
+            QueryEngine::FILE_SCAN_MIN_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_queries_share_one_memory_pool() {
+        let pools = Arc::new(Mutex::new(Vec::new()));
+        let engine = engine_with(2);
+        let provider = Arc::new(SessionProbe {
+            schema: probe_schema(),
+            seen: Arc::new(Mutex::new(None)),
+            pools: Arc::clone(&pools),
+        });
+        let first = engine.execute_provider(
+            Arc::clone(&provider) as Arc<dyn TableProvider>,
+            "SELECT wal_sequence FROM logs",
+            QueryOptions::default(),
+        );
+        let second = engine.execute_provider(
+            provider,
+            "SELECT wal_sequence FROM logs",
+            QueryOptions::default(),
+        );
+        let (first, second) = tokio::join!(first, second);
+        first.expect("first");
+        second.expect("second");
+        let pools = pools.lock().expect("pools");
+        assert_eq!(pools.len(), 2);
+        let shared = Arc::as_ptr(&engine.runtime().memory_pool) as *const () as usize;
+        assert!(pools.iter().all(|pool| *pool == shared));
+        assert_eq!(engine.runtime().memory_pool.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_small_pool_spills_and_clears_the_spill_files() {
+        let store = store();
+        let body = "x".repeat(64 * 1024);
+        for sequence in 0..40 {
+            store
+                .append(&frame_body(sequence, 1, &body, Vec::new()))
+                .expect("append");
+        }
+        let blocked = tempfile::tempdir().expect("blocked spill");
+        let blocked_engine = QueryEngine::new(QueryEngineConfig {
+            memory_pool_bytes: 1024 * 1024,
+            sort_spill_reservation_bytes: 64 * 1024,
+            spill_directory: blocked.path().to_path_buf(),
+            spill_budget_bytes: 1,
+            ..QueryEngineConfig::default()
+        })
+        .expect("engine");
+        let blocked_query = blocked_engine
+            .execute(
+                Arc::clone(&store),
+                "SELECT body FROM logs ORDER BY body",
+                QueryOptions::default(),
+            )
+            .await;
+        let blocked_error = match blocked_query {
+            Ok(mut stream) => stream.next().await.expect("exhausted"),
+            Err(error) => Err(error),
+        };
+        assert!(
+            matches!(blocked_error, Err(QueryError::Resources(_))),
+            "{blocked_error:?}"
+        );
+
+        let spill = tempfile::tempdir().expect("spill");
+        let engine = QueryEngine::new(QueryEngineConfig {
+            memory_pool_bytes: 3 * 1024 * 1024,
+            sort_spill_reservation_bytes: 64 * 1024,
+            spill_directory: spill.path().to_path_buf(),
+            spill_budget_bytes: 64 * 1024 * 1024,
+            ..QueryEngineConfig::default()
+        })
+        .expect("engine");
+        let mut stream = engine
+            .execute(
+                store,
+                "SELECT body FROM logs ORDER BY body",
+                QueryOptions::default(),
+            )
+            .await
+            .expect("execute");
+        let mut rows = 0usize;
+        while let Some(batch) = stream.next().await {
+            rows += batch.expect("batch").num_rows();
+        }
+        assert_eq!(rows, 40);
+        drop(stream);
+        assert_eq!(engine.runtime().disk_manager.used_disk_space(), 0);
+        assert_eq!(spill_file_count(spill.path()), 0);
+        drop(engine);
+        assert_eq!(spill_file_count(spill.path()), 0);
+    }
+
+    #[tokio::test]
+    async fn parquet_metadata_is_reused_across_queries() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = open_at(directory.path());
+        store.append(&frame(0, 1, Vec::new())).expect("append");
+        store.rotate().expect("rotate");
+        store.publish(&PublishOptions::default()).expect("publish");
+        let engine = engine();
+        let cache = engine.runtime().cache_manager.get_file_metadata_cache();
+        assert_eq!(cache.len(), 0);
+        for _ in 0..2 {
+            let mut stream = engine
+                .execute(
+                    Arc::clone(&store),
+                    "SELECT wal_sequence FROM logs",
+                    QueryOptions::default(),
+                )
+                .await
+                .expect("execute");
+            while let Some(batch) = stream.next().await {
+                batch.expect("batch");
+            }
+        }
+        assert!(!cache.is_empty(), "metadata cache stayed empty");
+        let reused = cache.list_entries().values().any(|entry| entry.hits > 0);
+        assert!(reused, "second query did not hit the metadata cache");
+    }
+
+    fn spill_file_count(path: &Path) -> usize {
+        let mut count = 0usize;
+        let mut pending = vec![path.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    fn probe_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(
+            "wal_sequence",
+            DataType::UInt64,
+            false,
+        )]))
+    }
+
+    #[derive(Clone, Debug)]
+    struct ProbeSession {
+        batch_size: usize,
+        target_partitions: usize,
+        pushdown_filters: bool,
+        reorder_filters: bool,
+        pruning: bool,
+        enable_page_index: bool,
+        bloom_filter_on_read: bool,
+        metadata_size_hint: Option<usize>,
+        collect_statistics: bool,
+        repartition_file_scans: bool,
+        repartition_file_min_size: usize,
+    }
+
+    #[derive(Debug)]
+    struct SessionProbe {
+        schema: SchemaRef,
+        seen: Arc<Mutex<Option<ProbeSession>>>,
+        pools: Arc<Mutex<Vec<usize>>>,
+    }
+
+    #[async_trait]
+    impl TableProvider for SessionProbe {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+            let options = state.config().options();
+            let execution = &options.execution;
+            let parquet = &execution.parquet;
+            let optimizer = &options.optimizer;
+            *self.seen.lock().expect("session") = Some(ProbeSession {
+                batch_size: execution.batch_size.get(),
+                target_partitions: execution.target_partitions,
+                pushdown_filters: parquet.pushdown_filters,
+                reorder_filters: parquet.reorder_filters,
+                pruning: parquet.pruning,
+                enable_page_index: parquet.enable_page_index,
+                bloom_filter_on_read: parquet.bloom_filter_on_read,
+                metadata_size_hint: parquet.metadata_size_hint,
+                collect_statistics: execution.collect_statistics,
+                repartition_file_scans: optimizer.repartition_file_scans,
+                repartition_file_min_size: optimizer.repartition_file_min_size,
+            });
+            self.pools
+                .lock()
+                .expect("pools")
+                .push(Arc::as_ptr(&state.runtime_env().memory_pool) as *const () as usize);
+            let table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![]])?;
+            table.scan(state, projection, &[], None).await
+        }
     }
 
     fn brief_timeout() -> QueryOptions {
