@@ -1,7 +1,7 @@
 //! One blocking WAL consumer per configured tenant.
 //!
 //! Each tenant store is created once. [`ConsumerSet`] keeps that [`Store`] and the consumer thread
-//! receives a clone. A later query uses [`ConsumerSet::store`] instead of opening the tenant again.
+//! receives a clone. The query listener takes [`ConsumerSet::stores`] so it shares those stores.
 //!
 //! Startup reconciles the published sequence with the WAL checkpoint. The worker then decodes
 //! complete logs frames into the memtable, publishes a frozen generation, and only afterwards
@@ -224,12 +224,19 @@ impl ConsumerSet {
     }
 
     /// The live store for `tenant`, shared with that tenant's consumer.
-    ///
-    /// The daemon has no query listener yet, so only tests call this.
     #[must_use]
-    #[allow(dead_code)]
+    #[allow(dead_code)] // tests look up one tenant; the listener uses `stores`
     pub fn store(&self, tenant: &str) -> Option<Arc<Store>> {
         self.stores.get(tenant).map(Arc::clone)
+    }
+
+    /// Cloned handles for the stores the consumers are updating.
+    #[must_use]
+    pub fn stores(&self) -> HashMap<String, Arc<Store>> {
+        self.stores
+            .iter()
+            .map(|(tenant, store)| (tenant.clone(), Arc::clone(store)))
+            .collect()
     }
 
     /// Shared flag set when any consumer returns an error.
@@ -439,12 +446,16 @@ fn advance_checkpoint(
 mod tests {
     use super::{ConsumerError, ConsumerSet};
     use crate::config::Config;
+    use crate::query::{QueryService, router};
     use arrow_array::Array;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
     use bytes::Bytes;
     use observer_protocol::otlp::{
         AnyValue, ExportLogsServiceRequest, LogRecord, ResourceLogs, ScopeLogs, any_value,
     };
     use observer_protocol::{AcceptedBatch, Signal};
+    use observer_query::QueryEngine;
     use observer_storage::{
         CommitFault, CommitWriteOptions, DynamicLimits, EventHour, ParquetFault,
         ParquetWriteOptions, PublishOptions, Scan, Store, SystemClock, decode_logs_frame,
@@ -461,6 +472,7 @@ mod tests {
         time::{Duration, Instant},
     };
     use tokio_stream::StreamExt;
+    use tower::ServiceExt;
 
     fn config(root: &Path, max_rows: u64) -> Config {
         config_with(root, max_rows, 2)
@@ -782,6 +794,98 @@ min_free_bytes = 0
             vec!["active".to_owned(), "later".to_owned()]
         );
         assert_eq!(store.durable_sequence().expect("durable"), Some(2));
+    }
+
+    #[test]
+    fn the_query_route_shares_one_engine_and_each_tenants_live_store() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = config(root.path(), 100);
+        let directory = tenant_dir(root.path(), "tenant-a");
+        let consumers = ConsumerSet::start(&config, ["tenant-a", "tenant-b"]).expect("start");
+        let stores = consumers.stores();
+        let store_a = Arc::clone(stores.get("tenant-a").expect("tenant-a"));
+        let store_b = Arc::clone(stores.get("tenant-b").expect("tenant-b"));
+        assert!(Arc::ptr_eq(
+            &store_a,
+            &consumers.store("tenant-a").expect("same store")
+        ));
+        assert!(Arc::ptr_eq(
+            &store_b,
+            &consumers.store("tenant-b").expect("same store")
+        ));
+
+        let mut engine_config = config.query.engine.clone();
+        engine_config.max_concurrent_queries = 1;
+        let engine = Arc::new(QueryEngine::new(engine_config).expect("engine"));
+        let service = QueryService::new(
+            Arc::clone(&engine),
+            stores,
+            config.tokens.clone(),
+            &config.query,
+        );
+        let runtime = query_runtime();
+
+        write_payload(&directory, "tenant-a", logs_at("active", 1));
+        wait_for_bodies(&store_a, &[Some("active".to_owned())]);
+        assert_eq!(store_a.durable_sequence().expect("durable"), None);
+        let active = runtime.block_on(query_json(service.clone(), "secret-a", None));
+        assert_eq!(active.0, StatusCode::OK);
+        assert!(active.1.contains("\"active\""));
+        let other = runtime.block_on(query_json(service.clone(), "secret-b", None));
+        assert_eq!(other.0, StatusCode::OK);
+        assert!(other.1.contains("\"rows\":[]"));
+
+        let pinned = runtime
+            .block_on(engine.execute(
+                Arc::clone(&store_a),
+                "SELECT body FROM logs ORDER BY body",
+                observer_query::QueryOptions::default(),
+            ))
+            .expect("pin");
+        let busy = runtime.block_on(query_json(service.clone(), "secret-a", Some(50)));
+        assert_eq!(busy.0, StatusCode::TOO_MANY_REQUESTS);
+        assert!(busy.1.contains("\"code\":\"busy\""));
+
+        write_payload(&directory, "tenant-a", logs_at("later", 2));
+        wait_for_bodies(
+            &store_a,
+            &[Some("active".to_owned()), Some("later".to_owned())],
+        );
+        consumers.shutdown().expect("flush");
+        assert_eq!(
+            runtime.block_on(collect_bodies(pinned)),
+            vec!["active".to_owned()]
+        );
+        let published = runtime.block_on(query_json(service, "secret-a", None));
+        assert_eq!(published.0, StatusCode::OK);
+        assert!(published.1.contains("\"active\""));
+        assert!(published.1.contains("\"later\""));
+        assert_eq!(store_a.durable_sequence().expect("durable"), Some(2));
+    }
+
+    async fn query_json(
+        service: QueryService,
+        token: &str,
+        timeout_ms: Option<u64>,
+    ) -> (StatusCode, String) {
+        let sql = "SELECT body FROM logs ORDER BY body";
+        let body = match timeout_ms {
+            Some(timeout_ms) => format!(r#"{{"sql":"{sql}","timeout_ms":{timeout_ms}}}"#),
+            None => format!(r#"{{"sql":"{sql}"}}"#),
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/query")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .expect("request");
+        let response = router(service).oneshot(request).await.expect("response");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        (status, String::from_utf8(bytes.to_vec()).expect("utf8"))
     }
 
     #[test]

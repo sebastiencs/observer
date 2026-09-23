@@ -391,20 +391,7 @@ fn query_error(error: QueryError) -> Response<Body> {
 }
 
 fn encode_failure(error: EncodeError) -> Response<Body> {
-    match error {
-        EncodeError::UnsupportedResultType { data_type } => error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            UNSUPPORTED_RESULT_TYPE,
-            Some(data_type),
-            None,
-        ),
-        EncodeError::ResponseTooLarge { .. } => error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            RESPONSE_TOO_LARGE,
-            None,
-            None,
-        ),
-    }
+    json_response(StatusCode::UNPROCESSABLE_ENTITY, encode_error(&error), None)
 }
 
 fn error_response(

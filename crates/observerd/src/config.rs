@@ -27,15 +27,11 @@ pub struct Config {
     pub tokens: TokenDirectory,
     pub readiness: ReadinessConfig,
     pub storage: StorageConfig,
-    /// Query listener settings. The listener is not bound yet.
-    #[allow(dead_code)]
+    /// Query listener caps and runtime.
     pub query: QueryConfig,
 }
 
 /// HTTP caps and the shared query runtime.
-///
-/// The query listener is not bound yet, so only configuration tests read these fields.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryConfig {
     /// Deadline applied when a request does not set a lower one.
@@ -81,8 +77,7 @@ pub struct ListenConfig {
     pub grpc: SocketAddr,
     pub http: SocketAddr,
     pub admin: SocketAddr,
-    /// Separate query listener. It is not bound yet.
-    #[allow(dead_code)]
+    /// Separate query listener.
     pub query: SocketAddr,
 }
 

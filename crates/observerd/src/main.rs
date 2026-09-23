@@ -1,7 +1,5 @@
 mod config;
 mod consumer;
-/// Query JSON encoding. The HTTP listener is not wired yet.
-#[allow(dead_code)]
 mod query;
 mod readiness;
 
@@ -18,6 +16,7 @@ use std::{
 use axum::{Router, extract::State, http::StatusCode, routing::get};
 use config::Config;
 use observer_ingest::{LogsHttpService, LogsIngestService};
+use observer_query::QueryEngine;
 use observer_wal::{TenantWalRouter, WalWriterConfig};
 use readiness::{FilesystemFreeSpace, Readiness};
 use tokio::{net::TcpListener, sync::watch};
@@ -72,6 +71,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Err(error.into());
         }
     };
+    let query_listener = match TcpListener::bind(config.listen.query).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            let _ = consumers.shutdown();
+            let _ = wal.shutdown().await;
+            return Err(error.into());
+        }
+    };
+    let engine = match QueryEngine::new(config.query.engine.clone()) {
+        Ok(engine) => Arc::new(engine),
+        Err(error) => {
+            let _ = consumers.shutdown();
+            let _ = wal.shutdown().await;
+            return Err(error.into());
+        }
+    };
     let serving = Arc::new(AtomicBool::new(false));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -84,7 +99,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let http = spawn_http(
         http_listener,
         Arc::clone(&wal),
-        config.tokens,
+        config.tokens.clone(),
+        shutdown_rx.clone(),
+    );
+    let query = spawn_query(
+        query_listener,
+        query::QueryService::new(
+            Arc::clone(&engine),
+            consumers.stores(),
+            config.tokens,
+            &config.query,
+        ),
         shutdown_rx.clone(),
     );
     let admin = spawn_admin(
@@ -105,11 +130,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     serving.store(false, Ordering::SeqCst);
     let _ = shutdown_tx.send(true);
 
+    // Stop accepting queries and finish in-flight requests before the WAL consumers drain.
+    // Dropping the engine afterwards releases its spill directory.
+    let query_result = query.await;
+    drop(engine);
     let grpc_result = grpc.await;
     let http_result = http.await;
     let admin_result = admin.await;
     let wal_result = wal.shutdown().await;
     let consumer_result = consumers.shutdown();
+    query_result??;
     grpc_result??;
     http_result??;
     admin_result??;
@@ -142,6 +172,21 @@ fn spawn_http(
     mut shutdown: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<Result<(), std::io::Error>> {
     let router = LogsHttpService::new(wal, tokens, MAX_MESSAGE_SIZE).into_router();
+    tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown.wait_for(|stop| *stop).await;
+            })
+            .await
+    })
+}
+
+fn spawn_query(
+    listener: TcpListener,
+    service: query::QueryService,
+    mut shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<Result<(), std::io::Error>> {
+    let router = query::router(service);
     tokio::spawn(async move {
         axum::serve(listener, router)
             .with_graceful_shutdown(async move {
