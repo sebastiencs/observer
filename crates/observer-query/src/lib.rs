@@ -12,8 +12,9 @@
 //! Results have no order unless the SQL contains `ORDER BY`. The tenant is the store passed to
 //! `execute`, never a value inside the SQL. Only one `SELECT` statement is accepted.
 //!
-//! One engine shares a bounded memory pool. Each query uses its own session and the timeout and
-//! returned-row cap in [`QueryOptions`]. Dropping or cancelling the result stream stops the query.
+//! One engine shares a bounded memory pool and a query runtime. Each query uses its own session and
+//! the timeout and returned-row cap in [`QueryOptions`]. That timeout bounds planning and reading.
+//! Dropping or cancelling the result stream stops the query.
 //!
 //! # Contract
 //!
@@ -37,10 +38,12 @@
 //!
 //! This crate does not expose an HTTP or gRPC query API.
 
+use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::thread;
 use std::time::Duration;
 
 use arrow_array::RecordBatch;
@@ -65,10 +68,12 @@ use datafusion::physical_plan::{
 };
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::Statement;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use observer_storage::{
     COLUMN_EVENT_TIME_UNIX_NANO, EventHour, Scan, Store, StoreError, StoreSnapshot, align_batch,
 };
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 const LOGS_TABLE: &str = "logs";
 const NANOS_PER_HOUR: u64 = 3_600_000_000_000;
@@ -76,6 +81,7 @@ const NANOS_PER_HOUR: u64 = 3_600_000_000_000;
 /// Shared DataFusion resources for tenant-scoped SQL execution.
 pub struct QueryEngine {
     runtime: Arc<RuntimeEnv>,
+    threads: Arc<QueryThreads>,
 }
 
 /// Timeout and returned-row cap for one query.
@@ -164,17 +170,46 @@ impl QueryEngine {
 
     /// Build a runtime whose queries share one greedy memory pool of `memory_pool_bytes`.
     ///
+    /// Planning and execution run on threads named `observer-query`. A result stream keeps those
+    /// threads alive until it is dropped.
+    ///
     /// # Errors
     ///
     /// Returns [`QueryError::Resources`] when the runtime cannot be constructed.
     pub fn new(memory_pool_bytes: usize) -> Result<Self, QueryError> {
+        Self::with_threads(memory_pool_bytes, QueryThreads::start()?)
+    }
+
+    fn with_threads(memory_pool_bytes: usize, threads: QueryThreads) -> Result<Self, QueryError> {
         let runtime = RuntimeEnvBuilder::new()
             .with_memory_pool(Arc::new(GreedyMemoryPool::new(memory_pool_bytes)))
             .build()
             .map_err(|error| QueryError::Resources(error.to_string()))?;
         Ok(Self {
             runtime: Arc::new(runtime),
+            threads: Arc::new(threads),
         })
+    }
+
+    /// Build an engine whose query clock starts paused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueryError::Resources`] when the runtime cannot be constructed.
+    #[cfg(test)]
+    fn paused(memory_pool_bytes: usize) -> Result<Self, QueryError> {
+        Self::with_threads(memory_pool_bytes, QueryThreads::start_paused()?)
+    }
+
+    /// Advance the query runtime's clock.
+    #[cfg(test)]
+    async fn advance_time(&self, duration: Duration) {
+        let (finished, finished_rx) = oneshot::channel();
+        self.threads.spawn(async move {
+            tokio::time::advance(duration).await;
+            let _ = finished.send(());
+        });
+        finished_rx.await.expect("query clock");
     }
 
     /// Shared execution resources for every query-local session.
@@ -185,66 +220,336 @@ impl QueryEngine {
 
     /// Run one `SELECT` against the rows visible in `store` at call time.
     ///
-    /// The returned stream has no order unless `sql` contains `ORDER BY`. `options.timeout` covers
-    /// planning and reading the stream. `options.max_rows` is the most rows the stream yields
-    /// before it returns [`QueryError::RowLimit`].
+    /// The returned stream has no order unless `sql` contains `ORDER BY`. `options.timeout` is one
+    /// deadline for validation, planning, stream creation, and reading. `options.max_rows` is the
+    /// most rows the stream yields before it returns [`QueryError::RowLimit`].
     ///
     /// # Errors
     ///
     /// Returns [`QueryError::Statement`] for an empty string, multiple statements, or any statement
     /// other than `SELECT`. Storage, planning, execution, timeout, and resource failures use the
-    /// matching variant.
+    /// matching variant. Failures that happen before the stream is ready are returned here.
     pub async fn execute(
         &self,
         store: Arc<Store>,
         sql: &str,
         options: QueryOptions,
     ) -> Result<QueryBatchStream, QueryError> {
+        self.execute_input(QueryInput::Store(store), sql, options)
+            .await
+    }
+
+    /// Run `sql` against a test table instead of a tenant snapshot.
+    #[cfg(test)]
+    async fn execute_provider(
+        &self,
+        provider: Arc<dyn TableProvider>,
+        sql: &str,
+        options: QueryOptions,
+    ) -> Result<QueryBatchStream, QueryError> {
+        self.execute_input(QueryInput::Provider(provider), sql, options)
+            .await
+    }
+
+    async fn execute_input(
+        &self,
+        input: QueryInput,
+        sql: &str,
+        options: QueryOptions,
+    ) -> Result<QueryBatchStream, QueryError> {
         if options.timeout.is_zero() {
             return Err(QueryError::Timeout);
         }
-        let deadline = tokio::time::Instant::now() + options.timeout;
-        ensure_query(sql)?;
-        if tokio::time::Instant::now() >= deadline {
-            return Err(QueryError::Timeout);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (pull_tx, pull_rx) = mpsc::channel(1);
+        let runtime = Arc::clone(&self.runtime);
+        let sql = sql.to_owned();
+        let max_rows = options.max_rows;
+        let timeout = options.timeout;
+        let mut task = TaskGuard(Some(self.threads.spawn(async move {
+            match prepare(runtime, input, sql, timeout).await {
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error));
+                }
+                Ok((stream, deadline)) => {
+                    if ready_tx.send(Ok(())).is_err() {
+                        return;
+                    }
+                    forward(stream, pull_rx, deadline, max_rows).await;
+                }
+            }
+        })));
+        match ready_rx.await {
+            Ok(Ok(())) => Ok(QueryBatchStream {
+                pull_tx: Some(pull_tx),
+                pending: None,
+                task: task.0.take(),
+                terminal: None,
+                finished: false,
+                threads: Arc::clone(&self.threads),
+            }),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(query_task_stopped()),
         }
-        let snapshot = store.snapshot().map_err(QueryError::Storage)?;
-        let provider = ObserverTableProvider::new(Arc::clone(&store), snapshot)?;
-        let context =
-            SessionContext::new_with_config_rt(SessionConfig::new(), Arc::clone(&self.runtime));
-        context
-            .register_table(LOGS_TABLE, Arc::new(provider))
-            .map_err(QueryError::Planning)?;
-        let frame = context.sql(sql).await.map_err(QueryError::Planning)?;
-        if tokio::time::Instant::now() >= deadline {
-            return Err(QueryError::Timeout);
-        }
-        let inner = frame.execute_stream().await.map_err(execution_error)?;
-        Ok(QueryBatchStream {
-            inner: Some(inner),
-            deadline: Box::pin(tokio::time::sleep_until(deadline)),
-            max_rows: options.max_rows,
-            emitted: 0,
-            pending: None,
+    }
+}
+
+/// Tokio runtime that plans and executes queries away from the caller.
+struct QueryThreads {
+    handle: tokio::runtime::Handle,
+    shutdown: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl QueryThreads {
+    fn start() -> Result<Self, QueryError> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(query_worker_threads())
+            .thread_name("observer-query")
+            .enable_all()
+            .build()
+            .map_err(|error| QueryError::Resources(error.to_string()))?;
+        let handle = runtime.handle().clone();
+        Ok(Self {
+            handle,
+            shutdown: Mutex::new(Some(Box::new(move || runtime.shutdown_background()))),
         })
     }
+
+    /// A paused clock is only available on a current-thread runtime, so a dedicated thread drives it.
+    #[cfg(test)]
+    fn start_paused() -> Result<Self, QueryError> {
+        let (handle_tx, handle_rx) = std::sync::mpsc::sync_channel(1);
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let driver = thread::Builder::new()
+            .name("observer-query".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .start_paused(true)
+                    .build()
+                    .expect("paused query runtime");
+                handle_tx
+                    .send(runtime.handle().clone())
+                    .expect("query handle");
+                runtime.block_on(async move {
+                    // A running blocking task keeps the paused clock from jumping to the next timer.
+                    let inhibit = tokio::task::spawn_blocking(move || {
+                        let _ = release_rx.recv();
+                    });
+                    let _ = stop_rx.await;
+                    drop(release_tx);
+                    let _ = inhibit.await;
+                });
+            })
+            .map_err(|error| QueryError::Resources(error.to_string()))?;
+        let handle = handle_rx
+            .recv()
+            .map_err(|error| QueryError::Resources(error.to_string()))?;
+        Ok(Self {
+            handle,
+            shutdown: Mutex::new(Some(Box::new(move || {
+                let _ = stop_tx.send(());
+                let _ = driver.join();
+            }))),
+        })
+    }
+
+    fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.handle.spawn(future)
+    }
+}
+
+impl Drop for QueryThreads {
+    fn drop(&mut self) {
+        let shutdown = self
+            .shutdown
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(shutdown) = shutdown {
+            shutdown();
+        }
+    }
+}
+
+/// Aborts a query task unless the result stream has taken ownership of it.
+struct TaskGuard(Option<JoinHandle<()>>);
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+enum QueryInput {
+    Store(Arc<Store>),
+    #[cfg(test)]
+    Provider(Arc<dyn TableProvider>),
+}
+
+type BatchReply = Option<Result<RecordBatch, QueryError>>;
+
+struct Pull {
+    reply: oneshot::Sender<BatchReply>,
+}
+
+fn query_worker_threads() -> usize {
+    thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+}
+
+async fn prepare(
+    runtime: Arc<RuntimeEnv>,
+    input: QueryInput,
+    sql: String,
+    timeout: Duration,
+) -> Result<(SendableRecordBatchStream, tokio::time::Instant), QueryError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let prepared = tokio::time::timeout_at(deadline, async move {
+        ensure_query(&sql)?;
+        let provider = table_provider(input)?;
+        let context = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
+        context
+            .register_table(LOGS_TABLE, provider)
+            .map_err(QueryError::Planning)?;
+        let frame = context.sql(&sql).await.map_err(QueryError::Planning)?;
+        frame.execute_stream().await.map_err(execution_error)
+    })
+    .await;
+    match prepared {
+        Ok(stream) => stream.map(|stream| (stream, deadline)),
+        Err(_elapsed) => Err(QueryError::Timeout),
+    }
+}
+
+fn table_provider(input: QueryInput) -> Result<Arc<dyn TableProvider>, QueryError> {
+    match input {
+        QueryInput::Store(store) => {
+            let snapshot = store.snapshot().map_err(QueryError::Storage)?;
+            Ok(Arc::new(ObserverTableProvider::new(store, snapshot)?))
+        }
+        #[cfg(test)]
+        QueryInput::Provider(provider) => Ok(provider),
+    }
+}
+
+async fn forward(
+    mut stream: SendableRecordBatchStream,
+    mut pulls: mpsc::Receiver<Pull>,
+    deadline: tokio::time::Instant,
+    max_rows: usize,
+) {
+    let mut emitted = 0usize;
+    loop {
+        let pull = tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => {
+                deliver_timeout(&mut pulls).await;
+                return;
+            }
+            pull = pulls.recv() => {
+                let Some(pull) = pull else {
+                    return;
+                };
+                pull
+            }
+        };
+        if tokio::time::Instant::now() >= deadline {
+            let _ = pull.reply.send(Some(Err(QueryError::Timeout)));
+            return;
+        }
+        let next = stream.next();
+        tokio::pin!(next);
+        let item = tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => Err(QueryError::Timeout),
+            batch = &mut next => match batch {
+                None => {
+                    let _ = pull.reply.send(None);
+                    return;
+                }
+                Some(Ok(batch)) => Ok(batch),
+                Some(Err(error)) => Err(execution_error(error)),
+            },
+        };
+        match item {
+            Ok(batch) => {
+                let rows = batch.num_rows();
+                if rows > 0 && emitted.saturating_add(rows) > max_rows {
+                    let _ = pull
+                        .reply
+                        .send(Some(Err(QueryError::RowLimit { max_rows })));
+                    return;
+                }
+                emitted += rows;
+                if pull.reply.send(Some(Ok(batch))).is_err() {
+                    return;
+                }
+            }
+            Err(error) => {
+                let _ = pull.reply.send(Some(Err(error)));
+                return;
+            }
+        }
+    }
+}
+
+async fn deliver_timeout(pulls: &mut mpsc::Receiver<Pull>) {
+    if let Some(pull) = pulls.recv().await {
+        let _ = pull.reply.send(Some(Err(QueryError::Timeout)));
+    }
+}
+
+fn query_task_stopped() -> QueryError {
+    QueryError::Execution(DataFusionError::Execution("query task stopped".into()))
 }
 
 /// Arrow batches for one query, with the engine's timeout and row cap applied.
 pub struct QueryBatchStream {
-    inner: Option<SendableRecordBatchStream>,
-    deadline: Pin<Box<tokio::time::Sleep>>,
-    max_rows: usize,
-    emitted: usize,
-    pending: Option<QueryError>,
+    pull_tx: Option<mpsc::Sender<Pull>>,
+    pending: Option<oneshot::Receiver<BatchReply>>,
+    task: Option<JoinHandle<()>>,
+    terminal: Option<QueryError>,
+    finished: bool,
+    /// Keeps the query threads alive until this stream is dropped.
+    #[allow(dead_code)]
+    threads: Arc<QueryThreads>,
 }
 
 impl QueryBatchStream {
     /// Stop the query. The next poll returns [`QueryError::Cancelled`] and no further batches.
     pub fn cancel(&mut self) {
-        if self.inner.take().is_some() {
-            self.pending = Some(QueryError::Cancelled);
+        if self.finished || self.terminal.is_some() {
+            return;
         }
+        self.terminal = Some(QueryError::Cancelled);
+        self.stop_task();
+    }
+
+    fn stop_task(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        self.pull_tx = None;
+    }
+
+    fn finish(&mut self) {
+        self.finished = true;
+        self.stop_task();
+    }
+}
+
+impl Drop for QueryBatchStream {
+    fn drop(&mut self) {
+        self.stop_task();
     }
 }
 
@@ -253,41 +558,42 @@ impl Stream for QueryBatchStream {
 
     fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let stream = self.get_mut();
-        if let Some(error) = stream.pending.take() {
-            return Poll::Ready(Some(Err(error)));
-        }
-        if stream.inner.is_none() {
+        if stream.finished {
             return Poll::Ready(None);
         }
-        if stream.deadline.as_mut().poll(context).is_ready() {
-            stream.inner = None;
-            return Poll::Ready(Some(Err(QueryError::Timeout)));
+        if let Some(error) = stream.terminal.take() {
+            stream.finish();
+            return Poll::Ready(Some(Err(error)));
+        }
+        if stream.pending.is_none() {
+            let (reply, receiver) = oneshot::channel();
+            let sent = stream
+                .pull_tx
+                .as_ref()
+                .is_some_and(|pull_tx| pull_tx.try_send(Pull { reply }).is_ok());
+            if !sent {
+                stream.finish();
+                return Poll::Ready(Some(Err(query_task_stopped())));
+            }
+            stream.pending = Some(receiver);
         }
         let polled = stream
-            .inner
+            .pending
             .as_mut()
-            .map(|inner| Pin::new(inner).poll_next(context));
+            .map(|pending| Pin::new(pending).poll(context));
         match polled {
             Some(Poll::Pending) => Poll::Pending,
-            None | Some(Poll::Ready(None)) => {
-                stream.inner = None;
-                Poll::Ready(None)
-            }
-            Some(Poll::Ready(Some(Err(error)))) => {
-                stream.inner = None;
-                Poll::Ready(Some(Err(execution_error(error))))
-            }
-            Some(Poll::Ready(Some(Ok(batch)))) => {
-                let rows = batch.num_rows();
-                if rows > 0 && stream.emitted.saturating_add(rows) > stream.max_rows {
-                    stream.inner = None;
-                    Poll::Ready(Some(Err(QueryError::RowLimit {
-                        max_rows: stream.max_rows,
-                    })))
-                } else {
-                    stream.emitted += rows;
-                    Poll::Ready(Some(Ok(batch)))
+            Some(Poll::Ready(Ok(item))) => {
+                stream.pending = None;
+                if item.as_ref().is_none_or(Result::is_err) {
+                    stream.finish();
                 }
+                Poll::Ready(item)
+            }
+            Some(Poll::Ready(Err(_))) | None => {
+                stream.pending = None;
+                stream.finish();
+                Poll::Ready(Some(Err(query_task_stopped())))
             }
         }
     }
@@ -716,16 +1022,34 @@ fn ensure_query(sql: &str) -> Result<(), QueryError> {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::path::Path;
+    use std::pin::Pin;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
     use std::time::Duration;
 
-    use arrow_array::{Array, Int64Array, StringArray, UInt64Array};
+    use arrow_array::{Array, Int64Array, RecordBatch, StringArray, UInt64Array};
+    use arrow_schema::{DataType, Field, Schema, SchemaRef};
+    use async_trait::async_trait;
     use bytes::Bytes;
+    use datafusion::catalog::{Session, TableProvider};
+    use datafusion::common::tree_node::TreeNodeRecursion;
+    use datafusion::datasource::MemTable;
     use datafusion::datasource::physical_plan::FileScanConfig;
     use datafusion::datasource::source::DataSourceExec;
+    use datafusion::error::DataFusionError;
+    use datafusion::execution::TaskContext;
     use datafusion::execution::context::SessionContext;
-    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::logical_expr::{Expr, TableType};
+    use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+    use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion::physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+    };
+    use futures::Stream;
     use observer_protocol::otlp::{
         AnyValue, ExportLogsServiceRequest, KeyValue, LogRecord, ResourceLogs, ScopeLogs, any_value,
     };
@@ -824,6 +1148,10 @@ mod tests {
 
     fn engine() -> QueryEngine {
         QueryEngine::new(QueryEngine::MEMORY_POOL_BYTES).expect("engine")
+    }
+
+    fn paused_engine() -> QueryEngine {
+        QueryEngine::paused(QueryEngine::MEMORY_POOL_BYTES).expect("paused engine")
     }
 
     async fn batches(store: Arc<Store>, sql: &str) -> Vec<arrow_array::RecordBatch> {
@@ -1306,11 +1634,12 @@ mod tests {
         assert!(stream.next().await.is_none());
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_query_times_out_while_its_stream_is_open() {
         let store = store();
         store.append(&frame(0, 1, Vec::new())).expect("append");
-        let mut stream = engine()
+        let engine = paused_engine();
+        let mut stream = engine
             .execute(
                 store,
                 "SELECT wal_sequence FROM logs",
@@ -1321,10 +1650,116 @@ mod tests {
             )
             .await
             .expect("execute");
-        tokio::time::advance(Duration::from_secs(5)).await;
+        engine.advance_time(Duration::from_secs(5)).await;
         let expired = stream.next().await.expect("timeout");
         assert!(matches!(expired, Err(QueryError::Timeout)));
         assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_query_times_out_while_planning() {
+        let blocked = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let engine = paused_engine();
+        let execute = engine.execute_provider(
+            blocking_provider(BlockStage::Scan, &blocked, &stopped),
+            "SELECT wal_sequence FROM logs",
+            short_timeout(),
+        );
+        tokio::pin!(execute);
+        wait_until_blocked(&blocked, &mut execute).await;
+        engine.advance_time(Duration::from_secs(5)).await;
+        let error = match execute.await {
+            Ok(_stream) => panic!("query started"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, QueryError::Timeout), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_query_times_out_before_the_first_batch() {
+        let blocked = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let engine = paused_engine();
+        let mut stream = engine
+            .execute_provider(
+                blocking_provider(BlockStage::BeforeBatch, &blocked, &stopped),
+                "SELECT wal_sequence FROM logs",
+                short_timeout(),
+            )
+            .await
+            .expect("execute");
+        let next = stream.next();
+        tokio::pin!(next);
+        wait_until_blocked(&blocked, &mut next).await;
+        engine.advance_time(Duration::from_secs(5)).await;
+        let expired = next.await.expect("timeout");
+        assert!(matches!(expired, Err(QueryError::Timeout)));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_query_times_out_between_batches() {
+        let blocked = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let engine = paused_engine();
+        let mut stream = engine
+            .execute_provider(
+                blocking_provider(BlockStage::AfterBatch, &blocked, &stopped),
+                "SELECT wal_sequence FROM logs",
+                short_timeout(),
+            )
+            .await
+            .expect("execute");
+        let first = stream.next().await.expect("batch").expect("row");
+        assert_eq!(first.num_rows(), 1);
+        assert!(!blocked.load(Ordering::SeqCst));
+        let next = stream.next();
+        tokio::pin!(next);
+        wait_until_blocked(&blocked, &mut next).await;
+        engine.advance_time(Duration::from_secs(5)).await;
+        let expired = next.await.expect("timeout");
+        assert!(matches!(expired, Err(QueryError::Timeout)));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_a_running_query_stops_its_task() {
+        let blocked = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let engine = engine();
+        let mut stream = engine
+            .execute_provider(
+                blocking_provider(BlockStage::BeforeBatch, &blocked, &stopped),
+                "SELECT wal_sequence FROM logs",
+                QueryOptions::default(),
+            )
+            .await
+            .expect("execute");
+        {
+            let next = stream.next();
+            tokio::pin!(next);
+            wait_until_blocked(&blocked, &mut next).await;
+        }
+        drop(stream);
+        wait_until(&stopped).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_execute_stops_planning() {
+        let blocked = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let engine = engine();
+        {
+            let execute = engine.execute_provider(
+                blocking_provider(BlockStage::Scan, &blocked, &stopped),
+                "SELECT wal_sequence FROM logs",
+                QueryOptions::default(),
+            );
+            tokio::pin!(execute);
+            wait_until_blocked(&blocked, &mut execute).await;
+        }
+        wait_until(&stopped).await;
     }
 
     #[tokio::test]
@@ -1365,5 +1800,254 @@ mod tests {
             Err(error) => Err(error),
         };
         assert!(matches!(error, Err(QueryError::Resources(_))), "{error:?}");
+    }
+
+    fn short_timeout() -> QueryOptions {
+        QueryOptions {
+            timeout: Duration::from_secs(5),
+            max_rows: QueryOptions::MAX_ROWS,
+        }
+    }
+
+    async fn wait_until(flag: &AtomicBool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !flag.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "query task was not dropped"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    async fn wait_until_blocked<F: std::future::Future>(
+        blocked: &AtomicBool,
+        pending: &mut Pin<&mut F>,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            tokio::select! {
+                biased;
+                _ = pending.as_mut() => panic!("query finished before it blocked"),
+                () = tokio::task::yield_now() => {
+                    if blocked.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "query did not block"
+                    );
+                }
+            }
+        }
+    }
+
+    fn blocking_provider(
+        stage: BlockStage,
+        blocked: &Arc<AtomicBool>,
+        stopped: &Arc<AtomicBool>,
+    ) -> Arc<dyn TableProvider> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "wal_sequence",
+            DataType::UInt64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(UInt64Array::from(vec![1_u64]))],
+        )
+        .expect("batch");
+        Arc::new(BlockingProvider {
+            schema,
+            batch,
+            stage,
+            blocked: Arc::clone(blocked),
+            stopped: Arc::clone(stopped),
+        })
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum BlockStage {
+        Scan,
+        BeforeBatch,
+        AfterBatch,
+    }
+
+    struct StopGuard(Arc<AtomicBool>);
+
+    impl Drop for StopGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingProvider {
+        schema: SchemaRef,
+        batch: RecordBatch,
+        stage: BlockStage,
+        blocked: Arc<AtomicBool>,
+        stopped: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl TableProvider for BlockingProvider {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+            if matches!(self.stage, BlockStage::Scan) {
+                self.blocked.store(true, Ordering::SeqCst);
+                let stop = StopGuard(Arc::clone(&self.stopped));
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                drop(stop);
+                let table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![]])?;
+                return table.scan(state, projection, &[], None).await;
+            }
+            Ok(Arc::new(DelayExec {
+                batch: self.batch.clone(),
+                stage: self.stage,
+                blocked: Arc::clone(&self.blocked),
+                stopped: Arc::clone(&self.stopped),
+                properties: Arc::new(PlanProperties::new(
+                    EquivalenceProperties::new(Arc::clone(&self.schema)),
+                    Partitioning::UnknownPartitioning(1),
+                    EmissionType::Incremental,
+                    Boundedness::Bounded,
+                )),
+                schema: Arc::clone(&self.schema),
+            }))
+        }
+    }
+
+    struct DelayExec {
+        schema: SchemaRef,
+        batch: RecordBatch,
+        stage: BlockStage,
+        blocked: Arc<AtomicBool>,
+        stopped: Arc<AtomicBool>,
+        properties: Arc<PlanProperties>,
+    }
+
+    impl std::fmt::Debug for DelayExec {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("DelayExec")
+                .field("stage", &self.stage)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl DisplayAs for DelayExec {
+        fn fmt_as(
+            &self,
+            _format_type: DisplayFormatType,
+            formatter: &mut std::fmt::Formatter,
+        ) -> std::fmt::Result {
+            formatter.write_str("DelayExec")
+        }
+    }
+
+    impl ExecutionPlan for DelayExec {
+        fn name(&self) -> &str {
+            "DelayExec"
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.properties
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            Vec::new()
+        }
+
+        fn apply_expressions(
+            &self,
+            _expressions: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+            )
+                -> datafusion::error::Result<TreeNodeRecursion>,
+        ) -> datafusion::error::Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+
+        #[allow(deprecated)]
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> datafusion::error::Result<SendableRecordBatchStream> {
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&self.schema),
+                DelayStream {
+                    batch: Some(self.batch.clone()),
+                    sleep: None,
+                    delay_before: matches!(self.stage, BlockStage::BeforeBatch),
+                    emitted: false,
+                    blocked: Arc::clone(&self.blocked),
+                    _stop: StopGuard(Arc::clone(&self.stopped)),
+                },
+            )))
+        }
+    }
+
+    struct DelayStream {
+        batch: Option<RecordBatch>,
+        sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+        delay_before: bool,
+        emitted: bool,
+        blocked: Arc<AtomicBool>,
+        _stop: StopGuard,
+    }
+
+    impl Stream for DelayStream {
+        type Item = Result<RecordBatch, DataFusionError>;
+
+        fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let stream = self.get_mut();
+            if stream.delay_before && !stream.emitted {
+                if stream.sleep_ready(context).is_pending() {
+                    return Poll::Pending;
+                }
+                stream.emitted = true;
+                return Poll::Ready(Some(Ok(stream.batch.take().expect("batch"))));
+            }
+            if !stream.emitted {
+                stream.emitted = true;
+                return Poll::Ready(Some(Ok(stream.batch.take().expect("batch"))));
+            }
+            if stream.delay_before || stream.sleep_ready(context).is_ready() {
+                return Poll::Ready(None);
+            }
+            Poll::Pending
+        }
+    }
+
+    impl DelayStream {
+        fn sleep_ready(&mut self, context: &mut Context<'_>) -> Poll<()> {
+            if self.sleep.is_none() {
+                self.blocked.store(true, Ordering::SeqCst);
+                self.sleep = Some(Box::pin(tokio::time::sleep(Duration::from_secs(60))));
+            }
+            self.sleep.as_mut().expect("sleep").as_mut().poll(context)
+        }
     }
 }
