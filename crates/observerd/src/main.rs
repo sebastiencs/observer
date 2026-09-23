@@ -1,5 +1,8 @@
 mod config;
 mod consumer;
+/// Query JSON encoding. The HTTP listener is not wired yet.
+#[allow(dead_code)]
+mod query;
 mod readiness;
 
 use std::{
