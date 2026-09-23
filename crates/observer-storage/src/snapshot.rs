@@ -20,6 +20,7 @@ use crate::commit::{Commit, CommitError, CommitWriteOptions, commit_for, write_c
 use crate::layout::tenant_directory;
 use crate::parquet::{ParquetError, ParquetWriteOptions, read_parquet_batches, write_generation};
 use crate::recovery::{RecoveryError, recover};
+use crate::statistics::FileStatistics;
 use crate::{
     Appended, Clock, DecodedLogs, EventHour, Generation, Memtable, MemtableConfig, MemtableError,
     align_batch, core_logs_schema,
@@ -54,17 +55,26 @@ pub struct Scan {
     pub to_hour: Option<EventHour>,
 }
 
+/// One Parquet file named by a published commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublishedFile {
+    /// Absolute path.
+    pub path: PathBuf,
+    /// Bounds copied from the commit. Absent when the file must be scanned.
+    pub statistics: Option<FileStatistics>,
+}
+
 /// Memory batches and commit-referenced Parquet files for one event hour.
 ///
-/// Files are absolute paths named by published commits, oldest commit first. Batches are frozen
-/// generations and then the active generation, oldest first. Empty batches are omitted. A directory
-/// listing is never a source.
+/// Files are named by published commits, oldest commit first. Batches are frozen generations and
+/// then the active generation, oldest first. Empty batches are omitted. A directory listing is
+/// never a source.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HourSources {
     /// UTC hour these sources cover.
     pub hour: EventHour,
-    /// Absolute paths of published Parquet files.
-    pub files: Vec<PathBuf>,
+    /// Published Parquet files.
+    pub files: Vec<PublishedFile>,
     /// Active and frozen batches that contain at least one row.
     pub batches: Vec<Arc<RecordBatch>>,
 }
@@ -375,10 +385,12 @@ impl Store {
                 Visible::File {
                     hour,
                     relative_path,
+                    statistics,
                 } => {
-                    hour_sources(&mut hours, hour)
-                        .files
-                        .push(tenant_directory(&self.root, &self.tenant).join(relative_path));
+                    hour_sources(&mut hours, hour).files.push(PublishedFile {
+                        path: tenant_directory(&self.root, &self.tenant).join(relative_path),
+                        statistics: statistics.cloned(),
+                    });
                 }
                 Visible::Memory { hour, batches } => {
                     let kept: Vec<_> = batches
@@ -430,6 +442,7 @@ enum Visible<'a> {
     File {
         hour: EventHour,
         relative_path: &'a str,
+        statistics: Option<&'a FileStatistics>,
     },
 }
 
@@ -441,6 +454,7 @@ fn visible_sources<'a>(snapshot: &'a StoreSnapshot, scan: &Scan) -> Vec<Visible<
                 sources.push(Visible::File {
                     hour: file.hour,
                     relative_path: &file.relative_path,
+                    statistics: file.statistics.as_ref(),
                 });
             }
         }
@@ -815,10 +829,17 @@ mod tests {
         assert!(mixed_sources[0].batches.is_empty());
         assert_eq!(mixed_sources[0].files.len(), 1);
         assert_eq!(
-            mixed_sources[0].files[0],
+            mixed_sources[0].files[0].path,
             crate::parquet_path(directory.path(), "tenant-a", EventHour::containing(0), 0, 2)
         );
-        assert!(mixed_sources[0].files[0].is_file());
+        assert!(mixed_sources[0].files[0].path.is_file());
+        let statistics = mixed_sources[0].files[0]
+            .statistics
+            .as_ref()
+            .expect("file statistics");
+        assert_eq!(statistics.rows, 2);
+        assert_eq!(statistics.wal_min, 0);
+        assert_eq!(statistics.wal_max, 1);
         assert!(mixed_sources[1].files.is_empty());
         assert_eq!(sequences(&mixed_sources[1].batches), [2]);
 
@@ -943,6 +964,7 @@ mod tests {
                 .publish(&PublishOptions {
                     parquet: ParquetWriteOptions {
                         fault: parquet_fault,
+                        ..ParquetWriteOptions::default()
                     },
                     commit: CommitWriteOptions {
                         fault: commit_fault,

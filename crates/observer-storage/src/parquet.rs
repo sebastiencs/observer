@@ -19,7 +19,9 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
+use crate::FileStatistics;
 use crate::layout::{hour_end_unix_nano, sync_ancestors};
+use crate::statistics::file_statistics;
 use crate::{EventHour, Generation, MemtableError, PROJECTION_VERSION, align_batch, parquet_path};
 
 /// Arrow schema metadata key for [`PROJECTION_VERSION`].
@@ -61,6 +63,8 @@ pub enum ParquetFault {
 pub struct ParquetWriteOptions {
     /// Stop at this durability boundary and leave the partial file in place.
     pub fault: Option<ParquetFault>,
+    /// Maximum rows in one row group. Absent uses the Parquet writer's own limit.
+    pub max_row_group_rows: Option<usize>,
 }
 
 /// One hour file written for a generation.
@@ -72,6 +76,8 @@ pub struct ParquetFile {
     pub path: PathBuf,
     /// Rows stored in the file.
     pub rows: u64,
+    /// Bounds used to skip the file. Absent when the rows have no usable event-time or WAL bounds.
+    pub statistics: Option<FileStatistics>,
 }
 
 /// Why a generation could not be written or read.
@@ -158,10 +164,12 @@ pub fn write_generation(
             .map(|batch| align_batch(batch, Arc::clone(&schema)).map_err(ParquetError::Align))
             .collect::<Result<Vec<_>, _>>()?;
         write_hour(root, &path, &schema, &batches, options)?;
+        let size_bytes = fs::metadata(&path)?.len();
         written.push(ParquetFile {
             hour: partition.hour,
             path,
             rows,
+            statistics: file_statistics(schema.as_ref(), &batches, size_bytes),
         });
     }
     Ok(written)
@@ -260,9 +268,11 @@ fn write_hour(
         .truncate(true)
         .open(&temporary)?;
     let synced = file.try_clone()?;
-    let properties = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .build();
+    let mut properties = WriterProperties::builder().set_compression(Compression::SNAPPY);
+    if let Some(max_rows) = options.max_row_group_rows {
+        properties = properties.set_max_row_group_row_count(Some(max_rows));
+    }
+    let properties = properties.build();
     let mut writer = ArrowWriter::try_new(file, Arc::clone(schema), Some(properties))
         .map_err(|error| ParquetError::Storage(error.to_string()))?;
     for batch in batches {
@@ -579,7 +589,10 @@ mod tests {
                 directory.path(),
                 "tenant-a",
                 &generation,
-                &ParquetWriteOptions { fault: Some(fault) },
+                &ParquetWriteOptions {
+                    fault: Some(fault),
+                    ..ParquetWriteOptions::default()
+                },
             )
             .expect_err("fault");
             assert_eq!(error.to_string(), ParquetError::Fault(fault).to_string());

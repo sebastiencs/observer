@@ -5,9 +5,10 @@
 //! active and frozen batches with the Parquet files named by published commits. A file that is not
 //! named by a commit is not read.
 //!
-//! The scan projects only the physical columns DataFusion asks for. Comparisons on
-//! `event_time_unix_nano` drop event hours that cannot match; DataFusion applies that nanosecond
-//! predicate again. Every other filter stays above the scan.
+//! The scan projects only the physical columns DataFusion asks for. Event-time comparisons drop
+//! hours that cannot match, and committed file statistics drop Parquet files that cannot match.
+//! DataFusion then prunes Parquet row groups and pages with the same predicates. Every pushed
+//! filter still runs again above the scan.
 //!
 //! Results have no order unless the SQL contains `ORDER BY`. The tenant is the store passed to
 //! `execute`, never a value inside the SQL. Only one `SELECT` statement is accepted.
@@ -52,7 +53,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::ScalarValue;
+use datafusion::common::{DFSchema, ScalarValue};
 use datafusion::datasource::MemTable;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::CachedParquetFileReaderFactory;
@@ -64,6 +65,7 @@ use datafusion::execution::memory_pool::FairSpillPool;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
@@ -73,7 +75,8 @@ use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::Statement;
 use futures::{Stream, StreamExt};
 use observer_storage::{
-    COLUMN_EVENT_TIME_UNIX_NANO, EventHour, Scan, Store, StoreError, StoreSnapshot, align_batch,
+    COLUMN_EVENT_TIME_UNIX_NANO, ColumnStatistics, EventHour, FileStatistics, PublishedFile, Scan,
+    StatValue, Store, StoreError, StoreSnapshot, align_batch,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -833,7 +836,7 @@ fn spill_budget_exhausted(text: &str) -> bool {
 /// One event hour's visible batches and commit-referenced Parquet files.
 struct HourPartition {
     hour: EventHour,
-    files: Vec<std::path::PathBuf>,
+    files: Vec<PublishedFile>,
     batches: Vec<RecordBatch>,
 }
 
@@ -913,7 +916,7 @@ impl TableProvider for ObserverTableProvider {
         Ok(filters
             .iter()
             .map(|filter| {
-                if time_predicate(filter).is_some() {
+                if prunable(filter) || time_predicate(filter).is_some() {
                     TableProviderFilterPushDown::Inexact
                 } else {
                     TableProviderFilterPushDown::Unsupported
@@ -941,7 +944,13 @@ impl TableProvider for ObserverTableProvider {
         }
         let mut hour_plans = Vec::with_capacity(selected.len());
         for hour in selected {
-            hour_plans.push(hour_plan(state, &self.schema, hour, projection).await?);
+            if let Some(plan) = hour_plan(state, &self.schema, hour, projection, filters).await? {
+                hour_plans.push(plan);
+            }
+        }
+        if hour_plans.is_empty() {
+            let table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![]])?;
+            return table.scan(state, projection, &[], None).await;
         }
         UnionExec::try_new(hour_plans)
     }
@@ -990,6 +999,230 @@ impl HourWindow {
         {
             self.impossible = true;
         }
+    }
+}
+
+fn prunable(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryExpr(binary) if binary.op == Operator::And => {
+            prunable(&binary.left) && prunable(&binary.right)
+        }
+        Expr::Between(between) if !between.negated => {
+            column_name(&between.expr).is_some()
+                && literal_stat(&between.low).is_some()
+                && literal_stat(&between.high).is_some()
+        }
+        Expr::IsNull(inner) => column_name(inner).is_some(),
+        Expr::BinaryExpr(binary) if is_order_comparison(binary.op) || binary.op == Operator::Eq => {
+            compared_column(binary).is_some()
+        }
+        _ => false,
+    }
+}
+
+fn parquet_predicate(
+    state: &dyn Session,
+    schema: &SchemaRef,
+    filters: &[Expr],
+) -> datafusion::error::Result<Option<Arc<dyn PhysicalExpr>>> {
+    let mut combined: Option<Expr> = None;
+    for filter in filters {
+        if !prunable(filter) {
+            continue;
+        }
+        combined = Some(match combined {
+            None => filter.clone(),
+            Some(existing) => existing.and(filter.clone()),
+        });
+    }
+    let Some(expr) = combined else {
+        return Ok(None);
+    };
+    let Ok(df_schema) = DFSchema::try_from(schema.as_ref().clone()) else {
+        return Ok(None);
+    };
+    Ok(state.create_physical_expr(expr, &df_schema).ok())
+}
+
+fn file_may_match(statistics: Option<&FileStatistics>, filters: &[Expr]) -> bool {
+    let Some(statistics) = statistics else {
+        return true;
+    };
+    filters
+        .iter()
+        .all(|filter| predicate_may_match(statistics, filter))
+}
+
+fn predicate_may_match(statistics: &FileStatistics, expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryExpr(binary) if binary.op == Operator::And => {
+            predicate_may_match(statistics, &binary.left)
+                && predicate_may_match(statistics, &binary.right)
+        }
+        Expr::Between(between) if !between.negated => {
+            let Some(name) = column_name(&between.expr) else {
+                return true;
+            };
+            let (Some(low), Some(high)) = (literal_stat(&between.low), literal_stat(&between.high))
+            else {
+                return true;
+            };
+            !between_excludes(statistics, column_by_name(statistics, &name), &low, &high)
+        }
+        Expr::IsNull(inner) => {
+            let Some(name) = column_name(inner) else {
+                return true;
+            };
+            match column_by_name(statistics, &name) {
+                ColumnLookup::Absent => true,
+                ColumnLookup::Present(column) => column.null_count > 0,
+            }
+        }
+        Expr::BinaryExpr(binary) if is_order_comparison(binary.op) || binary.op == Operator::Eq => {
+            let Some((name, operator, literal)) = compared_column(binary) else {
+                return true;
+            };
+            !comparison_excludes(
+                statistics,
+                column_by_name(statistics, &name),
+                operator,
+                &literal,
+            )
+        }
+        _ => true,
+    }
+}
+
+enum ColumnLookup<'a> {
+    Absent,
+    Present(&'a ColumnStatistics),
+}
+
+fn column_by_name<'a>(statistics: &'a FileStatistics, name: &str) -> ColumnLookup<'a> {
+    match statistics.columns.iter().find(|column| column.name == name) {
+        Some(column) => ColumnLookup::Present(column),
+        None => ColumnLookup::Absent,
+    }
+}
+
+fn between_excludes(
+    statistics: &FileStatistics,
+    column: ColumnLookup<'_>,
+    low: &StatValue,
+    high: &StatValue,
+) -> bool {
+    if low.less_than(high) == Some(false) && low != high {
+        return true;
+    }
+    let ColumnLookup::Present(column) = column else {
+        return true;
+    };
+    if column.null_count == statistics.rows {
+        return true;
+    }
+    let Some((min, max)) = column.bounds.as_ref() else {
+        return false;
+    };
+    let Some(low) = coerce_stat(low, min) else {
+        return false;
+    };
+    let Some(high) = coerce_stat(high, min) else {
+        return false;
+    };
+    max.less_than(&low) == Some(true) || high.less_than(min) == Some(true)
+}
+
+fn comparison_excludes(
+    statistics: &FileStatistics,
+    column: ColumnLookup<'_>,
+    operator: Operator,
+    literal: &StatValue,
+) -> bool {
+    let ColumnLookup::Present(column) = column else {
+        return true;
+    };
+    if column.null_count == statistics.rows {
+        return true;
+    }
+    let Some((min, max)) = column.bounds.as_ref() else {
+        return false;
+    };
+    let Some(literal) = coerce_stat(literal, min) else {
+        return false;
+    };
+    match operator {
+        Operator::Eq => {
+            literal.less_than(min) == Some(true) || max.less_than(&literal) == Some(true)
+        }
+        Operator::Gt => max.less_than(&literal) == Some(true) || max == &literal,
+        Operator::GtEq => max.less_than(&literal) == Some(true),
+        Operator::Lt => literal.less_than(min) == Some(true) || &literal == min,
+        Operator::LtEq => literal.less_than(min) == Some(true),
+        _ => false,
+    }
+}
+
+fn coerce_stat(literal: &StatValue, target: &StatValue) -> Option<StatValue> {
+    if literal.data_type() == target.data_type() {
+        return Some(literal.clone());
+    }
+    let number = match literal {
+        StatValue::Int32(value) => i128::from(*value),
+        StatValue::Int64(value) => i128::from(*value),
+        StatValue::UInt16(value) => i128::from(*value),
+        StatValue::UInt32(value) => i128::from(*value),
+        StatValue::UInt64(value) => i128::from(*value),
+        _ => return None,
+    };
+    match target {
+        StatValue::Int32(_) => i32::try_from(number).ok().map(StatValue::Int32),
+        StatValue::Int64(_) => i64::try_from(number).ok().map(StatValue::Int64),
+        StatValue::UInt16(_) => u16::try_from(number).ok().map(StatValue::UInt16),
+        StatValue::UInt32(_) => u32::try_from(number).ok().map(StatValue::UInt32),
+        StatValue::UInt64(_) => u64::try_from(number).ok().map(StatValue::UInt64),
+        _ => None,
+    }
+}
+
+fn compared_column(
+    binary: &datafusion::logical_expr::BinaryExpr,
+) -> Option<(String, Operator, StatValue)> {
+    let (name, operator, literal) = match (
+        column_name(&binary.left),
+        binary.op,
+        literal_stat(&binary.right),
+    ) {
+        (Some(name), operator, Some(literal)) => (name, operator, literal),
+        _ => {
+            let name = column_name(&binary.right)?;
+            let literal = literal_stat(&binary.left)?;
+            let operator = flip_comparison(binary.op)?;
+            (name, operator, literal)
+        }
+    };
+    Some((name, operator, literal))
+}
+
+fn column_name(expr: &Expr) -> Option<String> {
+    bare(expr).try_as_col().map(|column| column.name.clone())
+}
+
+fn literal_stat(expr: &Expr) -> Option<StatValue> {
+    let Expr::Literal(value, _) = bare(expr) else {
+        return None;
+    };
+    match value {
+        ScalarValue::Boolean(Some(value)) => Some(StatValue::Bool(*value)),
+        ScalarValue::Int32(Some(value)) => Some(StatValue::Int32(*value)),
+        ScalarValue::Int64(Some(value)) => Some(StatValue::Int64(*value)),
+        ScalarValue::UInt16(Some(value)) => Some(StatValue::UInt16(*value)),
+        ScalarValue::UInt32(Some(value)) => Some(StatValue::UInt32(*value)),
+        ScalarValue::UInt64(Some(value)) => Some(StatValue::UInt64(*value)),
+        ScalarValue::Float64(Some(value)) if value.is_finite() => Some(StatValue::Float64(*value)),
+        ScalarValue::Utf8(Some(value)) | ScalarValue::Utf8View(Some(value)) => {
+            Some(StatValue::Utf8(value.clone()))
+        }
+        _ => None,
     }
 }
 
@@ -1143,27 +1376,37 @@ async fn hour_plan(
     schema: &SchemaRef,
     hour: &HourPartition,
     projection: Option<&Vec<usize>>,
-) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+    filters: &[Expr],
+) -> datafusion::error::Result<Option<Arc<dyn ExecutionPlan>>> {
     let mut inputs = Vec::new();
-    if !hour.files.is_empty() {
-        inputs.push(parquet_plan(state, schema, &hour.files, projection).await?);
+    let files: Vec<_> = hour
+        .files
+        .iter()
+        .filter(|file| file_may_match(file.statistics.as_ref(), filters))
+        .collect();
+    if !files.is_empty() {
+        inputs.push(parquet_plan(state, schema, &files, projection, filters).await?);
     }
     if !hour.batches.is_empty() {
         let table = MemTable::try_new(Arc::clone(schema), vec![hour.batches.clone()])?;
         inputs.push(table.scan(state, projection, &[], None).await?);
     }
-    one_partition(UnionExec::try_new(inputs)?)
+    if inputs.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(one_partition(UnionExec::try_new(inputs)?)?))
 }
 
 async fn parquet_plan(
     state: &dyn Session,
     schema: &SchemaRef,
-    files: &[std::path::PathBuf],
+    files: &[&PublishedFile],
     projection: Option<&Vec<usize>>,
+    filters: &[Expr],
 ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
     let mut groups = Vec::with_capacity(files.len());
     for file in files {
-        groups.push(FileGroup::new(vec![partitioned_file(file).await?]));
+        groups.push(FileGroup::new(vec![partitioned_file(&file.path).await?]));
     }
     let url = ObjectStoreUrl::local_filesystem();
     let store = state.runtime_env().object_store(&url)?;
@@ -1179,6 +1422,9 @@ async fn parquet_plan(
         .with_bloom_filter_on_read(parquet.bloom_filter_on_read);
     if let Some(hint) = parquet.metadata_size_hint {
         source = source.with_metadata_size_hint(hint);
+    }
+    if let Some(predicate) = parquet_predicate(state, schema, filters)? {
+        source = source.with_predicate(predicate);
     }
     let mut builder = FileScanConfigBuilder::new(url, Arc::new(source)).with_file_groups(groups);
     if let Some(indices) = projection {
@@ -1257,7 +1503,7 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use datafusion::catalog::{Session, TableProvider};
-    use datafusion::common::tree_node::TreeNodeRecursion;
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion::datasource::MemTable;
     use datafusion::datasource::physical_plan::FileScanConfig;
     use datafusion::datasource::source::DataSourceExec;
@@ -1265,18 +1511,22 @@ mod tests {
     use datafusion::execution::TaskContext;
     use datafusion::execution::context::SessionContext;
     use datafusion::logical_expr::{Expr, TableType};
+    use datafusion::logical_expr::{col, lit};
     use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion::physical_plan::metrics::MetricValue;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+        DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+        SendableRecordBatchStream,
     };
     use futures::Stream;
     use observer_protocol::otlp::{
         AnyValue, ExportLogsServiceRequest, KeyValue, LogRecord, ResourceLogs, ScopeLogs, any_value,
     };
     use observer_storage::{
-        DynamicLimits, ManualClock, MemtableConfig, PublishOptions, Scan, Store, decode_logs_frame,
+        ColumnStatistics, DynamicLimits, FileStatistics, ManualClock, MemtableConfig,
+        ParquetWriteOptions, PublishOptions, Scan, StatValue, Store, decode_logs_frame,
     };
     use observer_wal::{Frame, FrameSignal};
     use prost::Message;
@@ -1562,7 +1812,7 @@ mod tests {
         assert_eq!(i64_column(&rows, "log_b_i64"), vec![None, None, Some(2)]);
 
         let published = store.sources(&store.snapshot().expect("snapshot"), &Scan::default());
-        let committed = &published[0].files[0];
+        let committed = &published[0].files[0].path;
         std::fs::copy(committed, committed.with_file_name("stray.parquet")).expect("stray");
         let once = batches(Arc::clone(&store), "SELECT wal_sequence FROM logs").await;
         let mut sequences = u64_column(&once, "wal_sequence");
@@ -1747,6 +1997,269 @@ mod tests {
         );
         let rows = batches(store, &narrowed).await;
         assert_eq!(u64_column(&rows, "wal_sequence"), [2]);
+    }
+
+    #[test]
+    fn missing_statistics_keep_every_file() {
+        let selective = col("log_a_i64").eq(lit(1_i64));
+        assert!(super::file_may_match(
+            None,
+            std::slice::from_ref(&selective)
+        ));
+        let excluded = FileStatistics {
+            size_bytes: 8,
+            rows: 1,
+            event_time_min: 1,
+            event_time_max: 1,
+            wal_min: 0,
+            wal_max: 0,
+            columns: vec![ColumnStatistics {
+                name: "log_a_i64".to_owned(),
+                null_count: 0,
+                bounds: Some((StatValue::Int64(2), StatValue::Int64(2))),
+            }],
+        };
+        assert!(!super::file_may_match(Some(&excluded), &[selective]));
+    }
+
+    #[tokio::test]
+    async fn file_statistics_drop_generations_that_cannot_match() {
+        let store = store();
+        publish_row(&store, frame(0, 1, vec![attribute("a", 1)]));
+        publish_row(&store, frame(1, 2, vec![attribute("a", 2)]));
+
+        let equal = "SELECT wal_sequence FROM logs WHERE log_a_i64 = 1 ORDER BY wal_sequence";
+        let files = scan_files(&physical_plan(Arc::clone(&store), equal).await);
+        assert!(
+            files.iter().any(|file| file.contains("0-1.parquet")),
+            "{files:?}"
+        );
+        assert!(
+            files.iter().all(|file| !file.contains("1-2.parquet")),
+            "{files:?}"
+        );
+        assert_eq!(
+            u64_column(&batches(Arc::clone(&store), equal).await, "wal_sequence"),
+            [0]
+        );
+
+        let between = "SELECT wal_sequence FROM logs WHERE log_a_i64 BETWEEN 2 AND 2";
+        let files = scan_files(&physical_plan(Arc::clone(&store), between).await);
+        assert!(
+            files.iter().all(|file| !file.contains("0-1.parquet")),
+            "{files:?}"
+        );
+        assert!(
+            files.iter().any(|file| file.contains("1-2.parquet")),
+            "{files:?}"
+        );
+
+        let either = "SELECT wal_sequence FROM logs WHERE log_a_i64 = 1 OR log_a_i64 = 2 ORDER BY wal_sequence";
+        let files = scan_files(&physical_plan(Arc::clone(&store), either).await);
+        assert!(
+            files.iter().any(|file| file.contains("0-1.parquet")),
+            "{files:?}"
+        );
+        assert!(
+            files.iter().any(|file| file.contains("1-2.parquet")),
+            "{files:?}"
+        );
+        assert_eq!(
+            u64_column(&batches(store, either).await, "wal_sequence"),
+            [0, 1]
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_dynamic_column_is_all_null_for_that_file() {
+        let store = store();
+        publish_row(&store, frame(0, 1, vec![attribute("a", 1)]));
+        publish_row(&store, frame(1, 2, vec![attribute("b", 2)]));
+
+        let equal = "SELECT wal_sequence FROM logs WHERE log_a_i64 = 1 ORDER BY wal_sequence";
+        let files = scan_files(&physical_plan(Arc::clone(&store), equal).await);
+        assert!(
+            files.iter().any(|file| file.contains("0-1.parquet")),
+            "{files:?}"
+        );
+        assert!(
+            files.iter().all(|file| !file.contains("1-2.parquet")),
+            "{files:?}"
+        );
+        assert_eq!(
+            u64_column(&batches(Arc::clone(&store), equal).await, "wal_sequence"),
+            [0]
+        );
+
+        let missing = "SELECT wal_sequence FROM logs WHERE log_a_i64 IS NULL ORDER BY wal_sequence";
+        let files = scan_files(&physical_plan(Arc::clone(&store), missing).await);
+        assert!(
+            files.iter().all(|file| !file.contains("0-1.parquet")),
+            "{files:?}"
+        );
+        assert!(
+            files.iter().any(|file| file.contains("1-2.parquet")),
+            "{files:?}"
+        );
+        assert_eq!(
+            u64_column(&batches(store, missing).await, "wal_sequence"),
+            [1]
+        );
+    }
+
+    #[tokio::test]
+    async fn null_and_range_bounds_keep_only_files_that_can_match() {
+        let store = store();
+        publish_row(&store, frame_severity(0, 1, 9));
+        publish_row(&store, frame_severity(1, 2, 0));
+
+        let equal = "SELECT wal_sequence FROM logs WHERE severity_number = 9";
+        let files = scan_files(&physical_plan(Arc::clone(&store), equal).await);
+        assert!(
+            files.iter().any(|file| file.contains("0-1.parquet")),
+            "{files:?}"
+        );
+        assert!(
+            files.iter().all(|file| !file.contains("1-2.parquet")),
+            "{files:?}"
+        );
+        assert_eq!(
+            u64_column(&batches(Arc::clone(&store), equal).await, "wal_sequence"),
+            [0]
+        );
+
+        let nulls = "SELECT wal_sequence FROM logs WHERE severity_number IS NULL";
+        let files = scan_files(&physical_plan(Arc::clone(&store), nulls).await);
+        assert!(
+            files.iter().all(|file| !file.contains("0-1.parquet")),
+            "{files:?}"
+        );
+        assert!(
+            files.iter().any(|file| file.contains("1-2.parquet")),
+            "{files:?}"
+        );
+        assert_eq!(
+            u64_column(&batches(Arc::clone(&store), nulls).await, "wal_sequence"),
+            [1]
+        );
+
+        let outside = "SELECT wal_sequence FROM logs WHERE severity_number = 1";
+        let files = scan_files(&physical_plan(Arc::clone(&store), outside).await);
+        assert!(files.is_empty(), "{files:?}");
+        assert!(u64_column(&batches(store, outside).await, "wal_sequence").is_empty());
+    }
+
+    #[tokio::test]
+    async fn parquet_row_groups_prune_without_changing_rows() {
+        let store = store();
+        store
+            .append(&frame(0, 1, vec![attribute("a", 1)]))
+            .expect("append");
+        store
+            .append(&frame(1, 2, vec![attribute("a", 2)]))
+            .expect("append");
+        store.rotate().expect("rotate");
+        store
+            .publish(&PublishOptions {
+                parquet: ParquetWriteOptions {
+                    max_row_group_rows: Some(1),
+                    ..ParquetWriteOptions::default()
+                },
+                ..PublishOptions::default()
+            })
+            .expect("publish");
+
+        let sql = "SELECT wal_sequence FROM logs WHERE log_a_i64 = 1 ORDER BY wal_sequence";
+        let (rows, plan) = executed_plan(Arc::clone(&store), sql).await;
+        assert_eq!(u64_column(&rows, "wal_sequence"), [0]);
+        assert!(
+            row_groups_pruned(&plan) >= 1,
+            "pruned {}",
+            row_groups_pruned(&plan)
+        );
+        assert_eq!(u64_column(&batches(store, sql).await, "wal_sequence"), [0]);
+    }
+
+    fn scan_files(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
+        scan_shape(plan).files
+    }
+
+    fn publish_row(store: &Store, logs: observer_storage::DecodedLogs) {
+        store.append(&logs).expect("append");
+        store.rotate().expect("rotate");
+        store.publish(&PublishOptions::default()).expect("publish");
+    }
+
+    fn frame_severity(sequence: u64, time: u64, severity: i32) -> observer_storage::DecodedLogs {
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: time,
+                        severity_number: severity,
+                        body: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue(format!("row-{sequence}"))),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        decode_logs_frame(
+            &Frame {
+                sequence,
+                signal: FrameSignal::Logs,
+                received_at_unix_nanos: 1,
+                tenant_id: "tenant-a".to_owned(),
+                payload: Bytes::from(request.encode_to_vec()),
+            },
+            DynamicLimits {
+                max_depth: 4,
+                max_columns: 32,
+            },
+        )
+        .expect("decode")
+    }
+
+    async fn executed_plan(
+        store: Arc<Store>,
+        sql: &str,
+    ) -> (Vec<RecordBatch>, Arc<dyn ExecutionPlan>) {
+        let snapshot = store.snapshot().expect("snapshot");
+        let provider = ObserverTableProvider::new(store, snapshot).expect("provider");
+        let context =
+            SessionContext::new_with_config(super::session_config(&QueryEngineConfig::default()));
+        context
+            .register_table("logs", Arc::new(provider))
+            .expect("register");
+        let frame = context.sql(sql).await.expect("sql");
+        let plan = frame.create_physical_plan().await.expect("plan");
+        let task = context.task_ctx();
+        let mut rows = Vec::new();
+        for partition in 0..plan.output_partitioning().partition_count() {
+            let mut stream = plan.execute(partition, Arc::clone(&task)).expect("execute");
+            while let Some(batch) = stream.next().await {
+                rows.push(batch.expect("batch"));
+            }
+        }
+        (rows, plan)
+    }
+
+    fn row_groups_pruned(plan: &Arc<dyn ExecutionPlan>) -> usize {
+        let mut pruned = 0;
+        let _ = plan.apply(|node| {
+            if let Some(metrics) = node.metrics()
+                && let Some(MetricValue::PruningMetrics {
+                    pruning_metrics, ..
+                }) = metrics.sum_by_name("row_groups_pruned_statistics")
+            {
+                pruned += pruning_metrics.pruned();
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        pruned
     }
 
     #[tokio::test]

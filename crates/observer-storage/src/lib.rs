@@ -75,6 +75,7 @@ mod parquet;
 mod recovery;
 mod schema;
 mod snapshot;
+mod statistics;
 
 pub use canonical_json::{
     CanonicalJsonError, MAX_JSON_DEPTH, canonical_any_value_json, canonical_attributes_json,
@@ -115,5 +116,9 @@ pub use schema::{
     TRACE_ID_BYTES, TRACE_ID_LEN, core_logs_schema, logs_batch_schema,
 };
 pub use snapshot::{
-    HourSources, PublishFault, PublishOptions, Scan, Store, StoreError, StoreSnapshot,
+    HourSources, PublishFault, PublishOptions, PublishedFile, Scan, Store, StoreError,
+    StoreSnapshot,
+};
+pub use statistics::{
+    ColumnStatistics, FileStatistics, StatValue, file_statistics, statistics_usable,
 };

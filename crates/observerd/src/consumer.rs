@@ -1161,7 +1161,10 @@ min_free_bytes = 0
         fn publish_options(self) -> PublishOptions {
             match self {
                 Self::Parquet(fault) => PublishOptions {
-                    parquet: ParquetWriteOptions { fault: Some(fault) },
+                    parquet: ParquetWriteOptions {
+                        fault: Some(fault),
+                        ..ParquetWriteOptions::default()
+                    },
                     ..PublishOptions::default()
                 },
                 Self::Commit(fault) => PublishOptions {

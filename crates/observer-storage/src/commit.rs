@@ -13,6 +13,7 @@ use std::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::layout::{commit_path, hour_end_unix_nano, sync_ancestors, tenant_directory};
+use crate::statistics::{ColumnStatistics, FileStatistics, StatValue, statistics_usable};
 use crate::{EventHour, Generation, PROJECTION_VERSION};
 
 const MAGIC: &[u8; 8] = b"OBS-CMT1";
@@ -47,6 +48,8 @@ pub struct CommitFile {
     pub relative_path: String,
     /// Rows stored in the file.
     pub rows: u64,
+    /// Bounds that a scan may use to skip this file. Absent when the bounds are missing or unusable.
+    pub statistics: Option<FileStatistics>,
 }
 
 /// Durable publication record for one exclusive WAL sequence range.
@@ -148,6 +151,7 @@ pub fn commit_for(
             hour: file.hour,
             relative_path,
             rows: file.rows,
+            statistics: file.statistics.clone(),
         });
     }
     if rows != generation.rows {
@@ -271,6 +275,7 @@ fn encode(commit: &Commit) -> Result<Vec<u8>, CommitError> {
         body.extend_from_slice(&file.hour.start_unix_nano().to_le_bytes());
         body.extend_from_slice(&file.rows.to_le_bytes());
         write_str(&mut body, &file.relative_path);
+        encode_statistics(&mut body, file.statistics.as_ref());
     }
     let mut bytes = Vec::with_capacity(8 + 2 + body.len() + 4);
     bytes.extend_from_slice(MAGIC);
@@ -326,10 +331,22 @@ fn decode(bytes: &[u8]) -> Result<Commit, CommitError> {
                 "commit file path is not relative".to_owned(),
             ));
         }
+        let statistics = reader.statistics()?.filter(|statistics| {
+            statistics_usable(
+                statistics,
+                schema.as_ref(),
+                file_rows,
+                hour.start_unix_nano(),
+                hour_end_unix_nano(hour),
+                first_sequence,
+                next_sequence,
+            )
+        });
         files.push(CommitFile {
             hour,
             relative_path,
             rows: file_rows,
+            statistics,
         });
     }
     if reader.data.len() != reader.pos {
@@ -443,6 +460,71 @@ fn write_str(body: &mut Vec<u8>, value: &str) {
     body.extend_from_slice(value.as_bytes());
 }
 
+fn encode_statistics(body: &mut Vec<u8>, statistics: Option<&FileStatistics>) {
+    let Some(statistics) = statistics else {
+        body.push(0);
+        return;
+    };
+    body.push(1);
+    body.extend_from_slice(&statistics.size_bytes.to_le_bytes());
+    body.extend_from_slice(&statistics.rows.to_le_bytes());
+    body.extend_from_slice(&statistics.event_time_min.to_le_bytes());
+    body.extend_from_slice(&statistics.event_time_max.to_le_bytes());
+    body.extend_from_slice(&statistics.wal_min.to_le_bytes());
+    body.extend_from_slice(&statistics.wal_max.to_le_bytes());
+    let count = u32::try_from(statistics.columns.len()).expect("column statistics count");
+    body.extend_from_slice(&count.to_le_bytes());
+    for column in &statistics.columns {
+        write_str(body, &column.name);
+        body.extend_from_slice(&column.null_count.to_le_bytes());
+        match &column.bounds {
+            None => body.push(0),
+            Some((min, max)) => {
+                body.push(1);
+                encode_stat(body, min);
+                encode_stat(body, max);
+            }
+        }
+    }
+}
+
+fn encode_stat(body: &mut Vec<u8>, value: &StatValue) {
+    match value {
+        StatValue::Bool(value) => {
+            body.push(1);
+            body.push(u8::from(*value));
+        }
+        StatValue::Int32(value) => {
+            body.push(2);
+            body.extend_from_slice(&value.to_le_bytes());
+        }
+        StatValue::Int64(value) => {
+            body.push(3);
+            body.extend_from_slice(&value.to_le_bytes());
+        }
+        StatValue::UInt16(value) => {
+            body.push(4);
+            body.extend_from_slice(&value.to_le_bytes());
+        }
+        StatValue::UInt32(value) => {
+            body.push(5);
+            body.extend_from_slice(&value.to_le_bytes());
+        }
+        StatValue::UInt64(value) => {
+            body.push(6);
+            body.extend_from_slice(&value.to_le_bytes());
+        }
+        StatValue::Float64(value) => {
+            body.push(7);
+            body.extend_from_slice(&value.to_le_bytes());
+        }
+        StatValue::Utf8(value) => {
+            body.push(9);
+            write_str(body, value);
+        }
+    }
+}
+
 struct Reader<'a> {
     data: &'a [u8],
     pos: usize,
@@ -551,6 +633,78 @@ impl Reader<'_> {
     fn i32(&mut self) -> Result<i32, CommitError> {
         Ok(i32::from_le_bytes(self.u32()?.to_le_bytes()))
     }
+
+    fn statistics(&mut self) -> Result<Option<FileStatistics>, CommitError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(FileStatistics {
+                size_bytes: self.u64()?,
+                rows: self.u64()?,
+                event_time_min: self.u64()?,
+                event_time_max: self.u64()?,
+                wal_min: self.u64()?,
+                wal_max: self.u64()?,
+                columns: {
+                    let count = self.u32()?;
+                    let mut columns = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+                    for _ in 0..count {
+                        columns.push(self.column_statistics()?);
+                    }
+                    columns
+                },
+            })),
+            _ => Err(CommitError::Invalid(
+                "file statistics tag is invalid".to_owned(),
+            )),
+        }
+    }
+
+    fn column_statistics(&mut self) -> Result<ColumnStatistics, CommitError> {
+        let name = self.string()?;
+        let null_count = self.u64()?;
+        let bounds = match self.u8()? {
+            0 => None,
+            1 => Some((self.stat_value()?, self.stat_value()?)),
+            _ => {
+                return Err(CommitError::Invalid(
+                    "column bounds tag is invalid".to_owned(),
+                ));
+            }
+        };
+        Ok(ColumnStatistics {
+            name,
+            null_count,
+            bounds,
+        })
+    }
+
+    fn stat_value(&mut self) -> Result<StatValue, CommitError> {
+        Ok(match self.u8()? {
+            1 => StatValue::Bool(match self.u8()? {
+                0 => false,
+                1 => true,
+                _ => {
+                    return Err(CommitError::Invalid(
+                        "boolean statistic is invalid".to_owned(),
+                    ));
+                }
+            }),
+            2 => StatValue::Int32(self.i32()?),
+            3 => StatValue::Int64(i64::from_le_bytes(self.u64()?.to_le_bytes())),
+            4 => StatValue::UInt16(u16::from_le_bytes(
+                self.take(2)?.try_into().expect("u16 width"),
+            )),
+            5 => StatValue::UInt32(self.u32()?),
+            6 => StatValue::UInt64(self.u64()?),
+            7 => StatValue::Float64(f64::from_le_bytes(self.u64()?.to_le_bytes())),
+            9 => StatValue::Utf8(self.string()?),
+            tag => {
+                return Err(CommitError::Invalid(format!(
+                    "unsupported statistic type tag {tag}"
+                )));
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -580,6 +734,7 @@ mod tests {
                 hour: EventHour::containing(0),
                 relative_path: "date=1970-01-01/hour=00/4-6.parquet".to_owned(),
                 rows: 2,
+                statistics: None,
             }],
             start_unix_nano: Some(0),
             end_unix_nano: Some(3_600_000_000_000),
@@ -591,5 +746,41 @@ mod tests {
         let last = corrupt.len() - 1;
         corrupt[last] ^= 0x01;
         assert!(decode(&corrupt).is_err());
+    }
+
+    #[test]
+    fn unusable_file_statistics_stay_with_the_file_but_cannot_prune_it() {
+        let commit = Commit {
+            tenant: "tenant-a".to_owned(),
+            projection_version: 1,
+            fingerprint: "abc".to_owned(),
+            schema: core_logs_schema(),
+            first_sequence: 4,
+            next_sequence: 6,
+            rows: 2,
+            files: vec![CommitFile {
+                hour: EventHour::containing(0),
+                relative_path: "date=1970-01-01/hour=00/4-6.parquet".to_owned(),
+                rows: 2,
+                statistics: Some(crate::FileStatistics {
+                    size_bytes: 8,
+                    rows: 2,
+                    event_time_min: 9,
+                    event_time_max: 1,
+                    wal_min: 4,
+                    wal_max: 4,
+                    columns: Vec::new(),
+                }),
+            }],
+            start_unix_nano: Some(0),
+            end_unix_nano: Some(3_600_000_000_000),
+        };
+        let decoded = decode(&encode(&commit).expect("encode")).expect("decode");
+        assert!(decoded.files[0].statistics.is_none());
+        assert_eq!(decoded.files[0].rows, 2);
+        assert_eq!(
+            decoded.files[0].relative_path,
+            commit.files[0].relative_path
+        );
     }
 }
