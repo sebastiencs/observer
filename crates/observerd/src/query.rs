@@ -1,11 +1,14 @@
-//! Buffered JSON for one query result.
+//! Buffered JSON for one query result, and the authenticated `POST /v1/query` route.
 //!
 //! Values keep the exact Arrow datum: 64-bit integers, decimals, and temporal values are decimal
 //! strings, binary values are standard base64, and smaller integers and finite floats are JSON
 //! numbers. Nulls and non-finite floats are JSON null. Nested lists, structs, and maps stay
 //! nested. A map is a JSON array of `{ "key", "value" }` objects so key types and order survive.
+//!
+//! The route checks the bearer token before it touches a tenant store. A failed query returns
+//! `{ "error": { "code" } }` and no result rows.
 
-use std::{error::Error, fmt, sync::Arc, time::Duration};
+use std::{collections::HashMap, error::Error, fmt, sync::Arc, time::Duration};
 
 use arrow_array::types::{
     ArrowDictionaryKeyType, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type,
@@ -24,14 +27,45 @@ use arrow_array::{
     TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Fields, IntervalUnit, Schema, TimeUnit};
+use axum::Router;
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{Request, Response, StatusCode, header};
+use axum::routing::post;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use observer_query::QueryMetrics;
+use http_body_util::LengthLimitError;
+use observer_query::{QueryEngine, QueryError, QueryMetrics, QueryOptions};
+use observer_storage::Store;
 use serde::{Deserialize, Serialize};
+use tokio_stream::StreamExt;
+use tower_http::cors::{Any, CorsLayer};
+
+use crate::config::QueryConfig;
 
 /// Stable `error.code` when a result column cannot be represented.
 pub const UNSUPPORTED_RESULT_TYPE: &str = "unsupported_result_type";
 /// Stable `error.code` when the buffered JSON would exceed the response cap.
 pub const RESPONSE_TOO_LARGE: &str = "response_too_large";
+/// Stable `error.code` when the bearer token is missing or unknown.
+pub const UNAUTHENTICATED: &str = "unauthenticated";
+/// Stable `error.code` when the JSON body or a requested cap cannot be used.
+pub const INVALID_REQUEST: &str = "invalid_request";
+/// Stable `error.code` when the body exceeds the request cap.
+pub const REQUEST_TOO_LARGE: &str = "request_too_large";
+/// Stable `error.code` when SQL cannot be planned as one `SELECT`.
+pub const INVALID_SQL: &str = "invalid_sql";
+/// Stable `error.code` when the query deadline expires.
+pub const TIMEOUT: &str = "timeout";
+/// Stable `error.code` when admission expires before the query starts.
+pub const BUSY: &str = "busy";
+/// Stable `error.code` when the result exceeds the row cap.
+pub const ROW_LIMIT: &str = "row_limit";
+/// Stable `error.code` when the tenant store cannot be read.
+pub const STORAGE: &str = "storage";
+/// Stable `error.code` when the query runtime cannot run the request.
+pub const RESOURCES: &str = "resources";
+/// Stable `error.code` when execution fails after planning.
+pub const EXECUTION: &str = "execution";
 
 /// `POST /v1/query` body. Unknown fields are rejected.
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -196,6 +230,218 @@ pub fn encode_query_response(
 pub fn encode_error(error: &EncodeError) -> Vec<u8> {
     let body = error.body();
     serde_json::to_vec(&QueryErrorResponse { error: &body }).expect("query error json")
+}
+
+/// Shared engine, tenant stores, and HTTP caps for `POST /v1/query`.
+#[derive(Clone)]
+pub struct QueryService {
+    engine: Arc<QueryEngine>,
+    stores: Arc<HashMap<String, Arc<Store>>>,
+    tokens: observer_ingest::TokenDirectory,
+    timeout: Duration,
+    max_rows: usize,
+    max_request_bytes: usize,
+    max_response_bytes: usize,
+}
+
+impl QueryService {
+    /// `stores` are the live tenant stores. A token whose tenant is absent fails as storage.
+    #[must_use]
+    pub fn new(
+        engine: Arc<QueryEngine>,
+        stores: HashMap<String, Arc<Store>>,
+        tokens: observer_ingest::TokenDirectory,
+        limits: &QueryConfig,
+    ) -> Self {
+        Self {
+            engine,
+            stores: Arc::new(stores),
+            tokens,
+            timeout: limits.timeout,
+            max_rows: limits.max_rows,
+            max_request_bytes: limits.max_request_bytes,
+            max_response_bytes: limits.max_response_bytes,
+        }
+    }
+}
+
+/// Router for `POST /v1/query`, including wildcard CORS without credentials.
+pub fn router(service: QueryService) -> Router {
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([axum::http::Method::POST, axum::http::Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
+    Router::new()
+        .route("/v1/query", post(post_query))
+        .layer(cors)
+        .with_state(service)
+}
+
+async fn post_query(State(service): State<QueryService>, request: Request<Body>) -> Response<Body> {
+    let authorization = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let tenant = match service.tokens.authenticate(authorization.as_deref()) {
+        Ok(tenant) => tenant,
+        Err(_) => {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                UNAUTHENTICATED,
+                None,
+                Some("Bearer"),
+            );
+        }
+    };
+    let bytes = match axum::body::to_bytes(request.into_body(), service.max_request_bytes).await {
+        Ok(bytes) => bytes,
+        Err(error) if length_limit(&error) => {
+            return error_response(StatusCode::BAD_REQUEST, REQUEST_TOO_LARGE, None, None);
+        }
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, INVALID_REQUEST, None, None),
+    };
+    let parsed: QueryRequest = match serde_json::from_slice(&bytes) {
+        Ok(parsed) => parsed,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, INVALID_REQUEST, None, None),
+    };
+    let options = match service.options(&parsed) {
+        Ok(options) => options,
+        Err(()) => return error_response(StatusCode::BAD_REQUEST, INVALID_REQUEST, None, None),
+    };
+    let Some(store) = service.stores.get(&tenant).map(Arc::clone) else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, STORAGE, None, None);
+    };
+    let mut stream = match service.engine.execute(store, &parsed.sql, options).await {
+        Ok(stream) => stream,
+        Err(error) => return query_error(error),
+    };
+    let mut schema = None;
+    let mut batches = Vec::new();
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(batch) => {
+                if schema.is_none() {
+                    schema = Some(batch.schema());
+                }
+                batches.push(batch);
+            }
+            Err(error) => return query_error(error),
+        }
+    }
+    let metrics = stream.metrics();
+    let schema = schema.unwrap_or_else(|| Arc::new(Schema::empty()));
+    match encode_query_response(
+        schema.as_ref(),
+        &batches,
+        metrics,
+        service.max_response_bytes,
+    ) {
+        Ok(body) => json_response(StatusCode::OK, body, None),
+        Err(error) => encode_failure(error),
+    }
+}
+
+impl QueryService {
+    fn options(&self, request: &QueryRequest) -> Result<QueryOptions, ()> {
+        let timeout = match request.timeout_ms {
+            None => self.timeout,
+            Some(millis) => duration_from_millis(millis)
+                .map(|requested| requested.min(self.timeout))
+                .ok_or(())?,
+        };
+        let max_rows = match request.max_rows {
+            None => self.max_rows,
+            Some(rows) => usize::try_from(rows)
+                .map(|rows| rows.min(self.max_rows))
+                .map_err(|_| ())?,
+        };
+        Ok(QueryOptions { timeout, max_rows })
+    }
+}
+
+fn duration_from_millis(millis: u64) -> Option<Duration> {
+    let nanos = millis.checked_mul(1_000_000)?;
+    Some(Duration::new(
+        nanos / 1_000_000_000,
+        (nanos % 1_000_000_000) as u32,
+    ))
+}
+
+fn query_error(error: QueryError) -> Response<Body> {
+    match error {
+        QueryError::Statement(_) | QueryError::Planning(_) => {
+            error_response(StatusCode::BAD_REQUEST, INVALID_SQL, None, None)
+        }
+        QueryError::Timeout => error_response(StatusCode::REQUEST_TIMEOUT, TIMEOUT, None, None),
+        QueryError::Busy => error_response(StatusCode::TOO_MANY_REQUESTS, BUSY, None, None),
+        QueryError::RowLimit { .. } => {
+            error_response(StatusCode::UNPROCESSABLE_ENTITY, ROW_LIMIT, None, None)
+        }
+        QueryError::Storage(_) => {
+            error_response(StatusCode::SERVICE_UNAVAILABLE, STORAGE, None, None)
+        }
+        QueryError::Resources(_) => {
+            error_response(StatusCode::SERVICE_UNAVAILABLE, RESOURCES, None, None)
+        }
+        QueryError::Execution(_) | QueryError::Cancelled => {
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, EXECUTION, None, None)
+        }
+    }
+}
+
+fn encode_failure(error: EncodeError) -> Response<Body> {
+    match error {
+        EncodeError::UnsupportedResultType { data_type } => error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            UNSUPPORTED_RESULT_TYPE,
+            Some(data_type),
+            None,
+        ),
+        EncodeError::ResponseTooLarge { .. } => error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            RESPONSE_TOO_LARGE,
+            None,
+            None,
+        ),
+    }
+}
+
+fn error_response(
+    status: StatusCode,
+    code: &'static str,
+    data_type: Option<String>,
+    authenticate: Option<&'static str>,
+) -> Response<Body> {
+    let body = QueryErrorBody { code, data_type };
+    let bytes = serde_json::to_vec(&QueryErrorResponse { error: &body }).expect("query error json");
+    json_response(status, bytes, authenticate)
+}
+
+fn json_response(status: StatusCode, body: Vec<u8>, authenticate: Option<&str>) -> Response<Body> {
+    let mut response = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("query response");
+    if let Some(authenticate) = authenticate {
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            authenticate.parse().expect("challenge"),
+        );
+    }
+    response
+}
+
+fn length_limit(error: &axum::Error) -> bool {
+    let mut source = Error::source(error);
+    while let Some(current) = source {
+        if current.is::<LengthLimitError>() {
+            return true;
+        }
+        source = current.source();
+    }
+    false
 }
 
 fn schema_fields(schema: &Schema) -> Result<Vec<SchemaField>, EncodeError> {
@@ -1202,6 +1448,399 @@ mod tests {
             encode_error(&error),
             format!(r#"{{"error":{{"code":"{UNSUPPORTED_RESULT_TYPE}","data_type":"ListView"}}}}"#)
                 .into_bytes()
+        );
+    }
+}
+
+#[cfg(test)]
+mod http {
+    use super::{
+        BUSY, EXECUTION, INVALID_REQUEST, INVALID_SQL, QueryService, REQUEST_TOO_LARGE,
+        RESPONSE_TOO_LARGE, ROW_LIMIT, STORAGE, TIMEOUT, UNAUTHENTICATED, query_error, router,
+    };
+    use crate::config::QueryConfig;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use bytes::Bytes;
+    use observer_protocol::otlp::{
+        AnyValue, ExportLogsServiceRequest, LogRecord, ResourceLogs, ScopeLogs, any_value,
+    };
+    use observer_query::{QueryEngine, QueryEngineConfig, QueryError, QueryOptions};
+    use observer_storage::{DynamicLimits, MemtableConfig, Store, SystemClock, decode_logs_frame};
+    use observer_wal::{Frame, FrameSignal};
+    use prost::Message;
+    use std::{sync::Arc, time::Duration};
+    use tower::ServiceExt;
+
+    fn limits(max_rows: usize, max_request_bytes: usize, max_response_bytes: usize) -> QueryConfig {
+        QueryConfig {
+            timeout: Duration::from_secs(30),
+            max_rows,
+            max_request_bytes,
+            max_response_bytes,
+            engine: QueryEngineConfig::default(),
+        }
+    }
+
+    fn memtable() -> MemtableConfig {
+        MemtableConfig {
+            max_rows: 100,
+            max_bytes: u64::MAX,
+            max_age: Duration::from_secs(60),
+            max_frozen: 4,
+            max_dynamic_columns: 32,
+        }
+    }
+
+    struct Fixture {
+        service: QueryService,
+        engine: Arc<QueryEngine>,
+        store_a: Arc<Store>,
+        _directory: tempfile::TempDir,
+    }
+
+    fn fixture(max_rows: usize, max_request_bytes: usize, max_response_bytes: usize) -> Fixture {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store_a = Arc::new(
+            Store::open(
+                directory.path(),
+                "tenant-a",
+                memtable(),
+                Arc::new(SystemClock),
+            )
+            .expect("store a"),
+        );
+        let store_b = Arc::new(
+            Store::open(
+                directory.path(),
+                "tenant-b",
+                memtable(),
+                Arc::new(SystemClock),
+            )
+            .expect("store b"),
+        );
+        append(&store_a, "tenant-a", 0, "hello");
+        append(&store_a, "tenant-a", 1, "again");
+        let engine = Arc::new(
+            QueryEngine::new(QueryEngineConfig {
+                max_concurrent_queries: 1,
+                ..QueryEngineConfig::default()
+            })
+            .expect("engine"),
+        );
+        let tokens = observer_ingest::TokenDirectory::new([
+            ("secret-a", "tenant-a"),
+            ("secret-b", "tenant-b"),
+            ("secret-c", "tenant-c"),
+        ])
+        .expect("tokens");
+        let mut stores = std::collections::HashMap::new();
+        stores.insert("tenant-a".to_owned(), Arc::clone(&store_a));
+        stores.insert("tenant-b".to_owned(), store_b);
+        let service = QueryService::new(
+            Arc::clone(&engine),
+            stores,
+            tokens,
+            &limits(max_rows, max_request_bytes, max_response_bytes),
+        );
+        Fixture {
+            service,
+            engine,
+            store_a,
+            _directory: directory,
+        }
+    }
+
+    fn append(store: &Store, tenant: &str, sequence: u64, body: &str) {
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_700_000_000_000_000_000,
+                        body: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue(body.to_owned())),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let decoded = decode_logs_frame(
+            &Frame {
+                sequence,
+                signal: FrameSignal::Logs,
+                received_at_unix_nanos: 1,
+                tenant_id: tenant.to_owned(),
+                payload: Bytes::from(request.encode_to_vec()),
+            },
+            DynamicLimits {
+                max_depth: 4,
+                max_columns: 32,
+            },
+        )
+        .expect("decode");
+        store.append(&decoded).expect("append");
+    }
+
+    async fn post(
+        service: &QueryService,
+        token: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, String, String) {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/v1/query")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, "https://app.example");
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let response = router(service.clone())
+            .oneshot(builder.body(Body::from(body.to_owned())).expect("request"))
+            .await
+            .expect("response");
+        let status = response.status();
+        let allow_origin = response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        let authenticate = response
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf8");
+        assert_eq!(allow_origin, "*");
+        (status, text, authenticate)
+    }
+
+    #[tokio::test]
+    async fn a_bearer_token_reads_only_its_tenant_rows() {
+        let fixture = fixture(10, 64 * 1024, 16 * 1024 * 1024);
+        let (status, text, _) = post(
+            &fixture.service,
+            Some("secret-a"),
+            r#"{"sql":"SELECT event_time_unix_nano, body FROM logs ORDER BY wal_sequence"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert!(text.contains(
+            r#""rows":[{"event_time_unix_nano":"1700000000000000000","body":"hello"},{"event_time_unix_nano":"1700000000000000000","body":"again"}]"#
+        ));
+        assert!(text.contains(r#""type":"UInt64""#));
+        assert!(text.contains(r#""admission_wait_ns""#));
+        let (status, text, _) = post(
+            &fixture.service,
+            Some("secret-b"),
+            r#"{"sql":"SELECT count(*) AS rows FROM logs"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert!(text.contains(r#""rows":[{"rows":"0"}]"#), "{text}");
+    }
+
+    #[tokio::test]
+    async fn wrong_and_missing_tokens_are_unauthorized() {
+        let fixture = fixture(10, 64 * 1024, 16 * 1024 * 1024);
+        for token in [None, Some("nope")] {
+            let (status, text, authenticate) =
+                post(&fixture.service, token, r#"{"sql":"SELECT 1"}"#).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                text,
+                format!(r#"{{"error":{{"code":"{UNAUTHENTICATED}"}}}}"#)
+            );
+            assert_eq!(authenticate, "Bearer");
+            assert!(!text.contains("secret"));
+            assert!(!text.contains("nope"));
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_and_oversized_bodies_are_rejected() {
+        let opened = fixture(10, 64 * 1024, 16 * 1024 * 1024);
+        let (status, text, _) = post(&opened.service, Some("secret-a"), "{").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            text,
+            format!(r#"{{"error":{{"code":"{INVALID_REQUEST}"}}}}"#)
+        );
+        let (status, text, _) = post(
+            &opened.service,
+            Some("secret-a"),
+            r#"{"sql":"SELECT 1","tenant":"tenant-b"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            text,
+            format!(r#"{{"error":{{"code":"{INVALID_REQUEST}"}}}}"#)
+        );
+        let limited = fixture(10, 16, 16 * 1024 * 1024);
+        let (status, text, _) = post(
+            &limited.service,
+            Some("secret-a"),
+            r#"{"sql":"SELECT body FROM logs"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            text,
+            format!(r#"{{"error":{{"code":"{REQUEST_TOO_LARGE}"}}}}"#)
+        );
+        assert!(!text.contains("logs"));
+    }
+
+    #[tokio::test]
+    async fn a_client_row_cap_cannot_raise_the_server_cap() {
+        let fixture = fixture(1, 64 * 1024, 16 * 1024 * 1024);
+        let (status, text, _) = post(
+            &fixture.service,
+            Some("secret-a"),
+            r#"{"sql":"SELECT wal_sequence FROM logs","max_rows":100}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{text}");
+        assert_eq!(text, format!(r#"{{"error":{{"code":"{ROW_LIMIT}"}}}}"#));
+    }
+
+    #[tokio::test]
+    async fn sql_failures_timeouts_and_a_full_engine_map_to_stable_codes() {
+        let fixture = fixture(10, 64 * 1024, 16 * 1024 * 1024);
+        let (status, text, _) = post(
+            &fixture.service,
+            Some("secret-a"),
+            r#"{"sql":"SELECT missing FROM logs"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(text, format!(r#"{{"error":{{"code":"{INVALID_SQL}"}}}}"#));
+        let (status, text, _) = post(
+            &fixture.service,
+            Some("secret-a"),
+            r#"{"sql":"SELECT count(*) AS rows FROM logs","timeout_ms":0}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(text, format!(r#"{{"error":{{"code":"{TIMEOUT}"}}}}"#));
+        let hold = fixture
+            .engine
+            .execute(
+                Arc::clone(&fixture.store_a),
+                "SELECT count(*) AS rows FROM logs",
+                QueryOptions {
+                    timeout: Duration::from_secs(30),
+                    max_rows: 10,
+                },
+            )
+            .await
+            .expect("hold");
+        let (status, text, _) = post(
+            &fixture.service,
+            Some("secret-a"),
+            r#"{"sql":"SELECT count(*) AS rows FROM logs","timeout_ms":50}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{text}");
+        assert_eq!(text, format!(r#"{{"error":{{"code":"{BUSY}"}}}}"#));
+        drop(hold);
+        let (status, text, _) = post(
+            &fixture.service,
+            Some("secret-c"),
+            r#"{"sql":"SELECT count(*) AS rows FROM logs"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(text, format!(r#"{{"error":{{"code":"{STORAGE}"}}}}"#));
+        let response = query_error(QueryError::Resources("/data/spill exhausted".into()));
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf8");
+        assert_eq!(
+            text,
+            format!(r#"{{"error":{{"code":"{}"}}}}"#, super::RESOURCES)
+        );
+        assert!(!text.contains("/data"));
+        let response = query_error(QueryError::Cancelled);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf8");
+        assert_eq!(text, format!(r#"{{"error":{{"code":"{EXECUTION}"}}}}"#));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_result_is_rejected_without_rows() {
+        let fixture = fixture(10, 64 * 1024, 8);
+        let (status, text, _) = post(
+            &fixture.service,
+            Some("secret-a"),
+            r#"{"sql":"SELECT count(*) AS rows FROM logs"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            text,
+            format!(r#"{{"error":{{"code":"{RESPONSE_TOO_LARGE}"}}}}"#)
+        );
+        assert!(!text.contains("\"rows\""));
+    }
+
+    #[tokio::test]
+    async fn preflight_allows_any_origin_without_credentials() {
+        let fixture = fixture(10, 64 * 1024, 16 * 1024 * 1024);
+        let response = router(fixture.service)
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/v1/query")
+                    .header(header::ORIGIN, "https://app.example")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                    .header(
+                        header::ACCESS_CONTROL_REQUEST_HEADERS,
+                        "authorization,content-type",
+                    )
+                    .body(Body::empty())
+                    .expect("preflight"),
+            )
+            .await
+            .expect("response");
+        assert!(response.status().is_success(), "{}", response.status());
+        let headers = response.headers();
+        assert_eq!(
+            headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+            "*"
+        );
+        let methods = headers
+            .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(methods.contains("post"), "{methods}");
+        assert!(methods.contains("options"), "{methods}");
+        let allowed = headers
+            .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(allowed.contains("authorization"), "{allowed}");
+        assert!(allowed.contains("content-type"), "{allowed}");
+        assert!(
+            headers
+                .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .is_none()
         );
     }
 }

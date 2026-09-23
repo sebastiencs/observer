@@ -16,6 +16,7 @@ observer-query = { path = "../observer-query" }
 observer-storage = { path = "../observer-storage" }
 observer-wal = { path = "../observer-wal" }
 serde.workspace = true
+http-body-util = "0.1"
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
 tokio-stream = { workspace = true, features = ["net"] }
@@ -34,6 +35,7 @@ proptest.workspace = true
 prost.workspace = true
 reqwest.workspace = true
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
 tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread", "time"] }
 
 [lints]
