@@ -47,7 +47,10 @@
 //! that column contributes nulls. An event-time bound can skip whole hours; DataFusion still
 //! applies the nanosecond predicate.
 //!
-//! This crate does not expose an HTTP or gRPC query API.
+//! This crate returns the Arrow stream above. `observerd` buffers one finished stream as JSON on
+//! `POST /v1/query`. That HTTP API has no Arrow or NDJSON negotiation, async job, cancel endpoint,
+//! schema discovery, response compression, query gRPC service, or distributed querier. Dropping
+//! [`QueryBatchStream`] cancels the query and releases its admission permit.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};

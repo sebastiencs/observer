@@ -6,7 +6,9 @@
 //! nested. A map is a JSON array of `{ "key", "value" }` objects so key types and order survive.
 //!
 //! The route checks the bearer token before it touches a tenant store. A failed query returns
-//! `{ "error": { "code" } }` and no result rows.
+//! `{ "error": { "code" } }` and no result rows. The listener has no Arrow or NDJSON body, async
+//! job, cancel route, schema catalog, compressed response, query gRPC method, or distributed
+//! querier.
 
 use std::{collections::HashMap, error::Error, fmt, sync::Arc, time::Duration};
 

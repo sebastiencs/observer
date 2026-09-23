@@ -320,6 +320,21 @@ max_frozen = 4
 max_dynamic_columns = 256
 max_depth = 4
 poll_interval_ms = 50
+
+# Optional. Omitted fields keep these defaults. Spill files use data_directory/query-spill.
+# max_concurrent_queries and target_partitions_per_query default to process parallelism.
+# [query]
+# timeout_ms = 30000
+# max_rows = 10000
+# max_request_bytes = 65536
+# max_response_bytes = 16777216
+# memory_pool_bytes = 268435456
+# max_concurrent_queries = 4
+# target_partitions_per_query = 4
+# batch_size = 8192
+# metadata_cache_bytes = 33554432
+# spill_budget_bytes = 1073741824
+# sort_spill_reservation_bytes = 10485760
 "#;
 
     #[test]
