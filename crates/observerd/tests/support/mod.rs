@@ -70,15 +70,41 @@ pub fn write_tuned(
     max_rows: u64,
     min_free_bytes: u64,
 ) {
+    fs::write(
+        path,
+        config_contents(wal_directory, listen, max_rows, min_free_bytes),
+    )
+    .expect("write config");
+}
+
+/// Daemon config that publishes each row and rejects a normal query response.
+pub fn write_response_cap(
+    path: &Path,
+    wal_directory: &Path,
+    listen: ListenAddrs,
+    max_response_bytes: u64,
+) {
+    let mut contents = config_contents(wal_directory, listen, 0, 1);
+    contents.push_str(&format!(
+        "\n[query]\nmax_response_bytes = {max_response_bytes}\n"
+    ));
+    fs::write(path, contents).expect("write config");
+}
+
+fn config_contents(
+    wal_directory: &Path,
+    listen: ListenAddrs,
+    max_rows: u64,
+    min_free_bytes: u64,
+) -> String {
     let data_directory = data_directory(wal_directory);
-    let contents = format!(
+    format!(
         "wal_directory = {wal_directory:?}\ndata_directory = {data_directory:?}\n\n[listen]\ngrpc = \"{grpc}\"\nhttp = \"{http}\"\nadmin = \"{admin}\"\nquery = \"{query}\"\n\n[tokens]\n\"{SECRET}\" = \"{TENANT}\"\n\"{SECOND_SECRET}\" = \"{SECOND_TENANT}\"\n\n[storage]\nmax_rows = {max_rows}\nmax_bytes = 67108864\nmax_age_ms = 60000\nmax_frozen = 4\nmax_dynamic_columns = 256\nmax_depth = 4\npoll_interval_ms = 20\n\n[readiness]\nmin_free_bytes = {min_free_bytes}\n",
         grpc = listen.grpc,
         http = listen.http,
         admin = listen.admin,
         query = listen.query,
-    );
-    fs::write(path, contents).expect("write config");
+    )
 }
 
 pub struct Observerd {
@@ -182,6 +208,44 @@ pub fn logs_request(marker: &str) -> ExportLogsServiceRequest {
             }),
             ..Default::default()
         }],
+    }
+}
+
+pub struct QueryHttpResponse {
+    pub status: StatusCode,
+    pub headers: reqwest::header::HeaderMap,
+    pub body: String,
+}
+
+impl QueryHttpResponse {
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::from_str(&self.body)
+            .unwrap_or_else(|error| panic!("query response is not json ({error}): {}", self.body))
+    }
+}
+
+pub async fn post_query(
+    address: SocketAddr,
+    bearer: Option<&str>,
+    body: &str,
+) -> QueryHttpResponse {
+    let client = reqwest::Client::new();
+    let mut request = client
+        .post(format!("http://{address}/v1/query"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::ORIGIN, "https://app.example")
+        .body(body.to_owned());
+    if let Some(bearer) = bearer {
+        request = request.header(reqwest::header::AUTHORIZATION, bearer);
+    }
+    let response = request.send().await.expect("post /v1/query");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.text().await.expect("query body");
+    QueryHttpResponse {
+        status,
+        headers,
+        body,
     }
 }
 
