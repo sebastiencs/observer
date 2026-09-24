@@ -8,6 +8,23 @@
 
 A scan sees a generation in memory or in Parquet. The WAL checkpoint advances only after that generation's commit descriptor is durable, and retention removes only sealed segments behind the checkpoint.
 
+Physical retention uses the server receive time stored on each row. A client event time, including a backfilled one, does not shorten or extend how long a Parquet file is kept. The default is 7 days when `[retention]` is omitted. `default_ms = 0`, or a tenant override of `0`, keeps data forever. `[retention.tenants]` may name only configured tenant ids. The janitor runs once before the process is ready, then about once an hour. A failed later pass makes `/ready` fail until a full pass succeeds. It deletes a whole Parquet file only when usable statistics prove `received_time_max` is strictly before the cutoff. The publication commit and the retirement descriptor stay on disk. That deletion is separate from WAL retention, which removes sealed segments only after their commit is durable.
+
+A client event timestamp may be at most 24 hours ahead of that request's receive time. `ingest.max_future_skew_ms` changes the limit. One record past the limit rejects the whole request before the WAL append. HTTP returns 400 with `event timestamp is too far in the future`. gRPC returns `INVALID_ARGUMENT` with the same text.
+
+```toml
+[retention]
+default_ms = 604800000
+janitor_interval_ms = 3600000
+
+[retention.tenants]
+"tenant-a" = 86400000
+"tenant-b" = 0
+
+[ingest]
+max_future_skew_ms = 86400000
+```
+
 `observer-query` runs SQL over one tenant store. The caller chooses the tenant, pins one snapshot, and reads an Arrow stream from a single `logs` table. Results have no order unless the SQL contains `ORDER BY`. `observerd` serves that stream as one buffered JSON document on `POST /v1/query`.
 
 One engine shares a memory pool, a spill directory, a Parquet metadata cache, and a limit on how many queries run at once. Each query has one deadline for planning and reading. A query that cannot start before that deadline is busy. Dropping or cancelling the stream stops the query. Published files and in-memory batches are ordered by event time, then WAL sequence, both descending, so a newest-event `ORDER BY ... LIMIT` with no other predicate can skip older hours and files. An event-time bound can skip hours. Commit statistics can skip Parquet files, and DataFusion can skip row groups and pages. Filters still run on the rows that remain. The stream reports how long the query waited, what it skipped, how many rows it returned, and whether it timed out or was cancelled.
@@ -107,7 +124,7 @@ Deferred: Arrow and NDJSON responses, async jobs, a cancel endpoint, schema disc
 
 `cargo test` runs the workspace. The HTTP conformance tests start a real `observerd` and use `POST /v1/logs` and `POST /v1/query`.
 
-`logs_http_roundtrip` checks accepted ingestion, core columns, dynamic attributes, active and published storage, SQL filters and aggregates, shutdown of the active tail, and a two-tenant burst. `logs_http_errors` checks that rejected posts never become queryable. `query_http` checks authentication, limits, CORS, and queries that run while logs are ingested. Each case asserts the JSON schema and rows for the logs it sent.
+`logs_http_roundtrip` checks accepted ingestion, core columns, dynamic attributes, active and published storage, SQL filters and aggregates, shutdown of the active tail, and a two-tenant burst. `logs_http_errors` checks that rejected posts never become queryable. `query_http` checks authentication, limits, CORS, and queries that run while logs are ingested. `retention_lifecycle` checks receive-time retention, per-tenant overrides, future-timestamp rejection, janitor cleanup across restart, and shutdown of an active tail. The ingest and query cases assert the JSON schema and rows for the logs they sent.
 
 Those process tests do not enumerate every Arrow result type or every generated input. JSON encoding stays covered by the `observerd` unit tests. Projection, dynamic columns, and canonical JSON stay covered by the `observer-storage` unit and property tests. Snapshot isolation under concurrent ingest and publish stays covered by `observer-query`.
 
