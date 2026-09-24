@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     error::Error,
     fmt, fs,
     net::SocketAddr,
@@ -17,6 +17,12 @@ pub const DEFAULT_MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_QUERY_MAX_REQUEST_BYTES: usize = 64 * 1024;
 /// Maximum buffered JSON response produced by `POST /v1/query`.
 pub const DEFAULT_QUERY_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+/// Receive-time retention used when `[retention]` is omitted. Zero means retain forever.
+pub const DEFAULT_RETENTION_MS: u64 = 604_800_000;
+/// How often the janitor applies retention. Zero is rejected.
+pub const DEFAULT_JANITOR_INTERVAL_MS: u64 = 3_600_000;
+/// How far ahead of receive time a client event timestamp may be.
+pub const DEFAULT_MAX_FUTURE_SKEW_MS: u64 = 86_400_000;
 
 /// File-backed daemon configuration.
 #[derive(Clone, Debug)]
@@ -29,6 +35,34 @@ pub struct Config {
     pub storage: StorageConfig,
     /// Query listener caps and runtime.
     pub query: QueryConfig,
+    /// Receive-time retention. `None` durations retain forever.
+    ///
+    /// Read by the janitor once that pass is wired.
+    #[allow(dead_code)]
+    pub retention: RetentionConfig,
+    /// Future event-time limit applied before a request is appended.
+    ///
+    /// Read by ingest validation once that check is wired.
+    #[allow(dead_code)]
+    pub ingest: IngestConfig,
+}
+
+/// How long published files are kept, and how often that policy runs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetentionConfig {
+    /// Default receive-time retention. `None` retains forever.
+    pub default: Option<Duration>,
+    /// Delay between janitor passes.
+    pub janitor_interval: Duration,
+    /// Per-tenant overrides. `None` retains that tenant forever.
+    pub tenants: BTreeMap<String, Option<Duration>>,
+}
+
+/// Limit on client event timestamps relative to server receive time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IngestConfig {
+    /// A record may be at most this far ahead of the request's receive time.
+    pub max_future_skew: Duration,
 }
 
 /// HTTP caps and the shared query runtime.
@@ -90,6 +124,8 @@ struct FileConfig {
     readiness: Option<FileReadiness>,
     storage: FileStorage,
     query: Option<FileQuery>,
+    retention: Option<FileRetention>,
+    ingest: Option<FileIngest>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -121,6 +157,18 @@ struct FileStorage {
 #[derive(Debug, Deserialize)]
 struct FileReadiness {
     min_free_bytes: u64,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FileRetention {
+    default_ms: Option<u64>,
+    janitor_interval_ms: Option<u64>,
+    tenants: Option<BTreeMap<String, u64>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FileIngest {
+    max_future_skew_ms: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -166,6 +214,8 @@ impl Config {
             return Err(ConfigError::Invalid("storage.max_frozen must be non-zero"));
         }
         let query = query_config(file.query.unwrap_or_default(), &file.data_directory)?;
+        let retention = retention_config(file.retention.unwrap_or_default(), &tokens)?;
+        let ingest = ingest_config(file.ingest.unwrap_or_default())?;
         Ok(Self {
             wal_directory: file.wal_directory,
             data_directory: file.data_directory,
@@ -187,8 +237,75 @@ impl Config {
                 poll_interval: Duration::from_millis(file.storage.poll_interval_ms),
             },
             query,
+            retention,
+            ingest,
         })
     }
+}
+
+fn retention_config(
+    file: FileRetention,
+    tokens: &TokenDirectory,
+) -> Result<RetentionConfig, ConfigError> {
+    let default = match file.default_ms.unwrap_or(DEFAULT_RETENTION_MS) {
+        0 => None,
+        millis => Some(duration_from_millis(
+            millis,
+            "retention.default_ms is too large",
+        )?),
+    };
+    let janitor_ms = file
+        .janitor_interval_ms
+        .unwrap_or(DEFAULT_JANITOR_INTERVAL_MS);
+    if janitor_ms == 0 {
+        return Err(ConfigError::Invalid(
+            "retention.janitor_interval_ms must be non-zero",
+        ));
+    }
+    let janitor_interval =
+        duration_from_millis(janitor_ms, "retention.janitor_interval_ms is too large")?;
+    let known = tokens.tenants().collect::<BTreeSet<_>>();
+    let mut tenants = BTreeMap::new();
+    for (tenant, millis) in file.tenants.unwrap_or_default() {
+        if !known.contains(tenant.as_str()) {
+            return Err(ConfigError::Invalid(
+                "retention override names an unknown tenant",
+            ));
+        }
+        let duration = match millis {
+            0 => None,
+            millis => Some(duration_from_millis(
+                millis,
+                "retention.tenants duration is too large",
+            )?),
+        };
+        tenants.insert(tenant, duration);
+    }
+    Ok(RetentionConfig {
+        default,
+        janitor_interval,
+        tenants,
+    })
+}
+
+fn ingest_config(file: FileIngest) -> Result<IngestConfig, ConfigError> {
+    Ok(IngestConfig {
+        max_future_skew: duration_from_millis(
+            file.max_future_skew_ms
+                .unwrap_or(DEFAULT_MAX_FUTURE_SKEW_MS),
+            "ingest.max_future_skew_ms is too large",
+        )?,
+    })
+}
+
+fn duration_from_millis(millis: u64, too_large: &'static str) -> Result<Duration, ConfigError> {
+    let nanos = millis
+        .checked_mul(1_000_000)
+        .ok_or(ConfigError::Invalid(too_large))?;
+    Ok(Duration::new(
+        nanos / 1_000_000_000,
+        (nanos % 1_000_000_000) as u32,
+    ))
 }
 
 fn query_config(file: FileQuery, data_directory: &Path) -> Result<QueryConfig, ConfigError> {
@@ -379,6 +496,19 @@ poll_interval_ms = 50
             "tenant-b"
         );
         assert_eq!(config.readiness.min_free_bytes, DEFAULT_MIN_FREE_BYTES);
+        assert_eq!(
+            config.retention.default,
+            Some(Duration::from_millis(DEFAULT_RETENTION_MS))
+        );
+        assert_eq!(
+            config.retention.janitor_interval,
+            Duration::from_millis(DEFAULT_JANITOR_INTERVAL_MS)
+        );
+        assert!(config.retention.tenants.is_empty());
+        assert_eq!(
+            config.ingest.max_future_skew,
+            Duration::from_millis(DEFAULT_MAX_FUTURE_SKEW_MS)
+        );
     }
 
     #[test]
@@ -668,6 +798,100 @@ poll_interval_ms = 1
         assert!(!rendered.contains("secret-b"));
         assert!(rendered.contains("tenant-a"));
     }
+
+    fn with_policy(policy: &str) -> String {
+        format!("{SAMPLE}\n{policy}")
+    }
+
+    #[test]
+    fn retention_overrides_and_zero_means_forever() {
+        let config = Config::parse(&with_policy(
+            r#"
+[retention]
+default_ms = 0
+janitor_interval_ms = 1000
+
+[retention.tenants]
+"tenant-a" = 86400000
+"tenant-b" = 0
+
+[ingest]
+max_future_skew_ms = 0
+"#,
+        ))
+        .expect("parse");
+        assert_eq!(config.retention.default, None);
+        assert_eq!(config.retention.janitor_interval, Duration::from_secs(1));
+        assert_eq!(
+            config.retention.tenants.get("tenant-a").copied(),
+            Some(Some(Duration::from_millis(86_400_000)))
+        );
+        assert_eq!(
+            config.retention.tenants.get("tenant-b").copied(),
+            Some(None)
+        );
+        assert_eq!(config.ingest.max_future_skew, Duration::ZERO);
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("secret-a"));
+        assert!(!rendered.contains("secret-b"));
+    }
+
+    #[test]
+    fn rejects_an_unknown_tenant_override_and_a_zero_janitor_interval() {
+        let unknown = Config::parse(&with_policy(
+            r#"
+[retention.tenants]
+"tenant-z" = 1
+"#,
+        ))
+        .expect_err("unknown tenant");
+        assert!(matches!(
+            unknown,
+            ConfigError::Invalid("retention override names an unknown tenant")
+        ));
+        assert!(!unknown.to_string().contains("secret-a"));
+
+        let janitor = Config::parse(&with_policy(
+            r#"
+[retention]
+janitor_interval_ms = 0
+"#,
+        ))
+        .expect_err("zero janitor");
+        assert!(matches!(
+            janitor,
+            ConfigError::Invalid("retention.janitor_interval_ms must be non-zero")
+        ));
+    }
+
+    #[test]
+    fn rejects_retention_and_skew_durations_that_overflow() {
+        for (section, detail) in [
+            (
+                "[retention]\ndefault_ms = 9223372036854775807\n",
+                "retention.default_ms is too large",
+            ),
+            (
+                "[retention]\njanitor_interval_ms = 9223372036854775807\n",
+                "retention.janitor_interval_ms is too large",
+            ),
+            (
+                "[retention.tenants]\n\"tenant-a\" = 9223372036854775807\n",
+                "retention.tenants duration is too large",
+            ),
+            (
+                "[ingest]\nmax_future_skew_ms = 9223372036854775807\n",
+                "ingest.max_future_skew_ms is too large",
+            ),
+        ] {
+            let error = Config::parse(&with_policy(section)).expect_err("overflow");
+            assert!(
+                matches!(error, ConfigError::Invalid(message) if message == detail),
+                "{section}: {error}"
+            );
+            assert!(!error.to_string().contains("secret"));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -701,6 +925,10 @@ mod properties {
             max_dynamic_columns in 0_usize..64,
             max_depth in 0_usize..8,
             poll_interval_ms in 0_u64..1_000,
+            default_ms in prop::option::of(0_u64..10_000),
+            janitor_interval_ms in prop::option::of(1_u64..10_000),
+            max_future_skew_ms in prop::option::of(0_u64..10_000),
+            override_ms in prop::option::of(0_u64..10_000),
         ) {
             let mut body = format!(
                 "wal_directory = \"/tmp/observer-{suffix}\"\ndata_directory = \"/tmp/observer-data-{suffix}\"\n\n[listen]\ngrpc = \"{grpc}\"\nhttp = \"{http}\"\nadmin = \"{admin}\"\nquery = \"{query}\"\n\n[tokens]\n"
@@ -714,6 +942,26 @@ mod properties {
             body.push_str(&format!(
                 "\n[storage]\nmax_rows = {max_rows}\nmax_bytes = {max_bytes}\nmax_age_ms = {max_age_ms}\nmax_frozen = {max_frozen}\nmax_dynamic_columns = {max_dynamic_columns}\nmax_depth = {max_depth}\npoll_interval_ms = {poll_interval_ms}\n"
             ));
+            if default_ms.is_some() || janitor_interval_ms.is_some() || override_ms.is_some() {
+                body.push_str("\n[retention]\n");
+                if let Some(default_ms) = default_ms {
+                    body.push_str(&format!("default_ms = {default_ms}\n"));
+                }
+                if let Some(janitor_interval_ms) = janitor_interval_ms {
+                    body.push_str(&format!("janitor_interval_ms = {janitor_interval_ms}\n"));
+                }
+                if let Some(override_ms) = override_ms {
+                    let tenant = tokens.values().next().expect("tenant");
+                    body.push_str(&format!(
+                        "\n[retention.tenants]\n\"{tenant}\" = {override_ms}\n"
+                    ));
+                }
+            }
+            if let Some(max_future_skew_ms) = max_future_skew_ms {
+                body.push_str(&format!(
+                    "\n[ingest]\nmax_future_skew_ms = {max_future_skew_ms}\n"
+                ));
+            }
 
             let config = Config::parse(&body).expect("parse");
             prop_assert_eq!(
@@ -741,6 +989,32 @@ mod properties {
                 config.readiness.min_free_bytes,
                 min_free_bytes.unwrap_or(DEFAULT_MIN_FREE_BYTES)
             );
+            let expected_default = match default_ms.unwrap_or(DEFAULT_RETENTION_MS) {
+                0 => None,
+                millis => Some(Duration::from_millis(millis)),
+            };
+            prop_assert_eq!(config.retention.default, expected_default);
+            prop_assert_eq!(
+                config.retention.janitor_interval,
+                Duration::from_millis(janitor_interval_ms.unwrap_or(DEFAULT_JANITOR_INTERVAL_MS))
+            );
+            prop_assert_eq!(
+                config.ingest.max_future_skew,
+                Duration::from_millis(max_future_skew_ms.unwrap_or(DEFAULT_MAX_FUTURE_SKEW_MS))
+            );
+            if let Some(override_ms) = override_ms {
+                let tenant = tokens.values().next().expect("tenant");
+                let expected = match override_ms {
+                    0 => None,
+                    millis => Some(Duration::from_millis(millis)),
+                };
+                prop_assert_eq!(
+                    config.retention.tenants.get(tenant).copied(),
+                    Some(expected)
+                );
+            } else {
+                prop_assert!(config.retention.tenants.is_empty());
+            }
             for (token, tenant) in &tokens {
                 let header = format!("Bearer {token}");
                 let resolved = config

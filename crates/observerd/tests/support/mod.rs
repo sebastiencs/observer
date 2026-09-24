@@ -123,6 +123,42 @@ pub fn write_storage(
     write_daemon(path, wal_directory, listen, limits, None);
 }
 
+/// Receive-time retention and future-skew settings written into a daemon config.
+#[derive(Clone, Debug)]
+pub struct PolicyLimits {
+    pub default_ms: u64,
+    pub janitor_interval_ms: u64,
+    pub max_future_skew_ms: u64,
+    pub tenants: Vec<(String, u64)>,
+}
+
+/// Write a daemon config that includes `[retention]` and `[ingest]`.
+pub fn write_policy(
+    path: &Path,
+    wal_directory: &Path,
+    listen: ListenAddrs,
+    limits: &StorageLimits,
+    policy: &PolicyLimits,
+) {
+    let mut contents = config_contents(wal_directory, listen, limits);
+    contents.push_str(&format!(
+        "\n[retention]\ndefault_ms = {default_ms}\njanitor_interval_ms = {janitor_interval_ms}\n",
+        default_ms = policy.default_ms,
+        janitor_interval_ms = policy.janitor_interval_ms,
+    ));
+    if !policy.tenants.is_empty() {
+        contents.push_str("\n[retention.tenants]\n");
+        for (tenant, millis) in &policy.tenants {
+            contents.push_str(&format!("\"{tenant}\" = {millis}\n"));
+        }
+    }
+    contents.push_str(&format!(
+        "\n[ingest]\nmax_future_skew_ms = {max_future_skew_ms}\n",
+        max_future_skew_ms = policy.max_future_skew_ms,
+    ));
+    fs::write(path, contents).expect("write config");
+}
+
 /// Daemon config that publishes each row and rejects a normal query response.
 pub fn write_response_cap(
     path: &Path,
