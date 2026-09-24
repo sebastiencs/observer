@@ -10,9 +10,10 @@ use prost::Message;
 use reqwest::header::CONTENT_TYPE;
 use serde_json::{Value, json};
 use support::{
-    BEARER, HttpBytes, QueryCase, StorageLimits, TENANT, TEST_TIMEOUT, assert_cases_across_restart,
-    assert_query_cases, otlp, poll_query, post_logs, post_logs_raw, post_query, reserve_ports,
-    sql_body, start_daemon, start_ready, wait_checkpoint, write_storage,
+    BEARER, HttpBytes, QueryCase, SECOND_BEARER, StorageLimits, TENANT, TEST_TIMEOUT,
+    assert_cases_across_restart, assert_query_cases, otlp, poll_query, post_logs, post_logs_as,
+    post_logs_raw, post_query, reserve_ports, sql_body, start_daemon, start_ready, wait_checkpoint,
+    write_storage,
 };
 use tokio::time::timeout;
 
@@ -562,6 +563,38 @@ async fn deep_maps_and_columns_past_the_cap_stay_in_json() {
         .expect("dynamic limit projection timed out");
 }
 
+#[tokio::test]
+async fn dynamic_attributes_match_while_active_and_after_restart() {
+    timeout(TEST_TIMEOUT * 4, active_dynamic_attributes())
+        .await
+        .expect("active dynamic projection timed out");
+}
+
+#[tokio::test]
+async fn one_query_reads_published_frozen_and_active_hours_once() {
+    timeout(TEST_TIMEOUT * 4, mixed_generations())
+        .await
+        .expect("mixed generation query timed out");
+}
+
+#[tokio::test]
+async fn dynamic_columns_stay_inside_the_token_tenant() {
+    timeout(TEST_TIMEOUT * 4, tenant_dynamic_columns())
+        .await
+        .expect("dynamic tenant isolation timed out");
+}
+
+async fn active_dynamic_attributes() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let config_path = root.path().join("observerd.toml");
+    let (listen, daemon) = start_daemon(&config_path, &root.path().join("wal")).await;
+    post_logs(listen.http, &dynamic_request()).await;
+    post_logs(listen.http, &later_column_request()).await;
+    let mut daemon =
+        assert_cases_across_restart(&config_path, listen, daemon, BEARER, &dynamic_cases()).await;
+    daemon.terminate().await;
+}
+
 async fn dynamic_attributes() {
     let root = tempfile::tempdir().expect("tempdir");
     let wal_directory = root.path().join("wal");
@@ -582,20 +615,185 @@ async fn dynamic_attributes() {
     post_logs(listen.http, &later_column_request()).await;
     wait_checkpoint(&wal_directory, TENANT, 2).await;
 
+    let mut daemon =
+        assert_cases_across_restart(&config_path, listen, daemon, BEARER, &dynamic_cases()).await;
+    daemon.terminate().await;
+}
+
+fn dynamic_cases() -> [QueryCase; 1] {
     let dotted = collision_name(&["http.status"]);
     let nested = collision_name(&["http", "status"]);
     let sql = format!(
         "SELECT wal_sequence, record_index, service_name, resource_attributes, scope_attributes, log_attributes, resource_service_name_string, resource_service_name_i64, scope_lib_string, log_host_string, log_ok_bool, log_status_i64, log_status_string, log_latency_f64, log_nan_f64, log_payload_bytes, log_items_json, log_region_string, log_env_string, {dotted}, {nested} FROM logs ORDER BY wal_sequence, record_index"
     );
-    let cases = [QueryCase {
+    [QueryCase {
         name: "dynamic attributes",
         sql: Box::leak(sql.into_boxed_str()),
         schema: dynamic_schema(&dotted, &nested),
         rows: dynamic_rows(&dotted, &nested),
+    }]
+}
+
+async fn mixed_generations() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let wal_directory = root.path().join("wal");
+    let config_path = root.path().join("observerd.toml");
+    let listen = reserve_ports();
+    write_storage(
+        &config_path,
+        &wal_directory,
+        listen,
+        &StorageLimits {
+            max_rows: 1,
+            ..StorageLimits::default()
+        },
+    );
+    let daemon = start_ready(&config_path, listen).await;
+    let sql = "SELECT body, event_time_unix_nano, wal_sequence, log_marker_string FROM logs ORDER BY wal_sequence, record_index";
+    post_logs(listen.http, &marked_hour("published-a", HOUR_START)).await;
+    post_logs(listen.http, &marked_hour("published-b", HOUR_END)).await;
+    wait_checkpoint(&wal_directory, TENANT, 2).await;
+    post_logs(listen.http, &marked_hour("active-a", NEXT_HOUR)).await;
+    wait_for_rows(listen.query, sql, 3).await;
+    assert_eq!(checkpoint_sequence(&wal_directory, TENANT), 2);
+    post_logs(listen.http, &marked_hour("sealed-b", HOUR_START)).await;
+    post_logs(listen.http, &marked_hour("active-c", HOUR_END)).await;
+    let expected = json!([
+        {"body": "published-a", "event_time_unix_nano": HOUR_START_TEXT, "wal_sequence": "0", "log_marker_string": "published-a"},
+        {"body": "published-b", "event_time_unix_nano": HOUR_END_TEXT, "wal_sequence": "1", "log_marker_string": "published-b"},
+        {"body": "active-a", "event_time_unix_nano": NEXT_HOUR_TEXT, "wal_sequence": "2", "log_marker_string": "active-a"},
+        {"body": "sealed-b", "event_time_unix_nano": HOUR_START_TEXT, "wal_sequence": "3", "log_marker_string": "sealed-b"},
+        {"body": "active-c", "event_time_unix_nano": HOUR_END_TEXT, "wal_sequence": "4", "log_marker_string": "active-c"}
+    ]);
+    let document = poll_query(listen.query, BEARER, sql, |document| {
+        document["rows"] == expected
+    })
+    .await;
+    assert_eq!(document["rows"], expected);
+    let cases = [QueryCase {
+        name: "mixed generations",
+        sql,
+        schema: json!([
+            {"name": "body", "type": "Utf8", "nullable": true},
+            {"name": "event_time_unix_nano", "type": "UInt64", "nullable": false},
+            {"name": "wal_sequence", "type": "UInt64", "nullable": false},
+            {"name": "log_marker_string", "type": "Utf8", "nullable": true}
+        ]),
+        rows: expected,
     }];
     let mut daemon =
         assert_cases_across_restart(&config_path, listen, daemon, BEARER, &cases).await;
     daemon.terminate().await;
+}
+
+fn marked_hour(body: &str, time_unix_nano: u64) -> ExportLogsServiceRequest {
+    otlp::logs(vec![otlp::resource(
+        vec![],
+        vec![otlp::scope(
+            vec![],
+            vec![LogRecord {
+                time_unix_nano,
+                body: Some(otlp::string_value(body)),
+                attributes: vec![otlp::attribute("marker", otlp::string_value(body))],
+                ..Default::default()
+            }],
+        )],
+    )])
+}
+
+async fn wait_for_rows(address: std::net::SocketAddr, sql: &str, count: usize) {
+    poll_query(address, BEARER, sql, |document| {
+        document["rows"]
+            .as_array()
+            .is_some_and(|rows| rows.len() == count)
+    })
+    .await;
+}
+
+fn checkpoint_sequence(wal_directory: &std::path::Path, tenant: &str) -> u64 {
+    observer_wal::WalCheckpoint::load(observer_wal::tenant_wal_directory(wal_directory, tenant))
+        .map(|checkpoint| checkpoint.cursor().next_sequence())
+        .unwrap_or(0)
+}
+
+async fn tenant_dynamic_columns() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let config_path = root.path().join("observerd.toml");
+    let (listen, daemon) = start_daemon(&config_path, &root.path().join("wal")).await;
+    post_logs(listen.http, &tenant_log("alpha-row", "alpha", None)).await;
+    post_logs_as(
+        listen.http,
+        SECOND_BEARER,
+        &tenant_log("beta-row", "beta", Some("eu")),
+    )
+    .await;
+    let own = [QueryCase {
+        name: "tenant a dynamic columns",
+        sql: "SELECT body, log_host_string, log_attributes FROM logs ORDER BY wal_sequence",
+        schema: json!([
+            {"name": "body", "type": "Utf8", "nullable": true},
+            {"name": "log_host_string", "type": "Utf8", "nullable": true},
+            {"name": "log_attributes", "type": "Utf8", "nullable": false}
+        ]),
+        rows: json!([{
+            "body": "alpha-row",
+            "log_host_string": "alpha",
+            "log_attributes": r#"{"host":"alpha"}"#
+        }]),
+    }];
+    let other = [QueryCase {
+        name: "tenant b dynamic columns",
+        sql: "SELECT body, log_host_string, log_region_string, log_attributes FROM logs ORDER BY wal_sequence",
+        schema: json!([
+            {"name": "body", "type": "Utf8", "nullable": true},
+            {"name": "log_host_string", "type": "Utf8", "nullable": true},
+            {"name": "log_region_string", "type": "Utf8", "nullable": true},
+            {"name": "log_attributes", "type": "Utf8", "nullable": false}
+        ]),
+        rows: json!([{
+            "body": "beta-row",
+            "log_host_string": "beta",
+            "log_region_string": "eu",
+            "log_attributes": r#"{"host":"beta","region":"eu"}"#
+        }]),
+    }];
+    assert_query_cases(listen.query, BEARER, &own).await;
+    assert_query_cases(listen.query, SECOND_BEARER, &other).await;
+    let missing = post_query(
+        listen.query,
+        Some(BEARER),
+        &sql_body("SELECT log_region_string FROM logs"),
+    )
+    .await;
+    assert_eq!(
+        missing.status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "{}",
+        missing.body
+    );
+    assert_eq!(missing.body, r#"{"error":{"code":"invalid_sql"}}"#);
+    let mut daemon = assert_cases_across_restart(&config_path, listen, daemon, BEARER, &own).await;
+    assert_query_cases(listen.query, SECOND_BEARER, &other).await;
+    daemon.terminate().await;
+}
+
+fn tenant_log(body: &str, host: &str, region: Option<&str>) -> ExportLogsServiceRequest {
+    let mut attributes = vec![otlp::attribute("host", otlp::string_value(host))];
+    if let Some(region) = region {
+        attributes.push(otlp::attribute("region", otlp::string_value(region)));
+    }
+    otlp::logs(vec![otlp::resource(
+        vec![],
+        vec![otlp::scope(
+            vec![],
+            vec![LogRecord {
+                time_unix_nano: HOUR_START,
+                body: Some(otlp::string_value(body)),
+                attributes,
+                ..Default::default()
+            }],
+        )],
+    )])
 }
 
 fn dynamic_request() -> ExportLogsServiceRequest {
