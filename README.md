@@ -103,6 +103,14 @@ Any browser origin can call the route. Responses carry `Access-Control-Allow-Ori
 
 Deferred: Arrow and NDJSON responses, async jobs, a cancel endpoint, schema discovery, HTTP compression, query gRPC, and distributed queriers.
 
+## Testing
+
+`cargo test` runs the workspace. The HTTP conformance tests start a real `observerd` and use `POST /v1/logs` and `POST /v1/query`.
+
+`logs_http_roundtrip` checks accepted ingestion, core columns, dynamic attributes, active and published storage, SQL filters and aggregates, shutdown of the active tail, and a two-tenant burst. `logs_http_errors` checks that rejected posts never become queryable. `query_http` checks authentication, limits, CORS, and queries that run while logs are ingested. Each case asserts the JSON schema and rows for the logs it sent.
+
+Those process tests do not enumerate every Arrow result type or every generated input. JSON encoding stays covered by the `observerd` unit tests. Projection, dynamic columns, and canonical JSON stay covered by the `observer-storage` unit and property tests. Snapshot isolation under concurrent ingest and publish stays covered by `observer-query`.
+
 ## Git hooks
 
 Pre-commit runs `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings`. Install once per clone:
