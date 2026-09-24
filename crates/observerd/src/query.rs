@@ -318,21 +318,15 @@ async fn post_query(State(service): State<QueryService>, request: Request<Body>)
         Ok(stream) => stream,
         Err(error) => return query_error(error),
     };
-    let mut schema = None;
+    let schema = stream.schema();
     let mut batches = Vec::new();
     while let Some(item) = stream.next().await {
         match item {
-            Ok(batch) => {
-                if schema.is_none() {
-                    schema = Some(batch.schema());
-                }
-                batches.push(batch);
-            }
+            Ok(batch) => batches.push(batch),
             Err(error) => return query_error(error),
         }
     }
     let metrics = stream.metrics();
-    let schema = schema.unwrap_or_else(|| Arc::new(Schema::empty()));
     match encode_query_response(
         schema.as_ref(),
         &batches,

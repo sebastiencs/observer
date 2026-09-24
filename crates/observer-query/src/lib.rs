@@ -441,7 +441,8 @@ impl QueryEngine {
                     let _ = ready_tx.send(Err(error));
                 }
                 Ok((stream, deadline, permit, plan)) => {
-                    if ready_tx.send(Ok(permit)).is_err() {
+                    let schema = stream.schema();
+                    if ready_tx.send(Ok((permit, schema))).is_err() {
                         recorded.mark_cancelled();
                         return;
                     }
@@ -450,7 +451,7 @@ impl QueryEngine {
             }
         })));
         match ready_rx.await {
-            Ok(Ok(permit)) => Ok(QueryBatchStream {
+            Ok(Ok((permit, schema))) => Ok(QueryBatchStream {
                 pull_tx: Some(pull_tx),
                 pending: None,
                 task: task.0.take(),
@@ -459,6 +460,7 @@ impl QueryEngine {
                 permit: Some(permit),
                 threads: Arc::clone(&self.threads),
                 record,
+                schema,
             }),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(query_task_stopped()),
@@ -980,6 +982,7 @@ pub struct QueryBatchStream {
     #[allow(dead_code)]
     threads: Arc<QueryThreads>,
     record: Arc<QueryRecord>,
+    schema: SchemaRef,
 }
 
 impl QueryBatchStream {
@@ -990,6 +993,12 @@ impl QueryBatchStream {
     #[must_use]
     pub fn metrics(&self) -> QueryMetrics {
         *self.record.lock()
+    }
+
+    /// Planned result schema, including when the query returns no batches.
+    #[must_use]
+    pub fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
     }
 
     /// Stop the query. The next poll returns [`QueryError::Cancelled`] and no further batches.

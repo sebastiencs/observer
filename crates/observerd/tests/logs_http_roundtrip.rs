@@ -1116,3 +1116,158 @@ async fn start_limited(
     let daemon = start_ready(&config_path, listen).await;
     (config_path, wal_directory, listen, daemon)
 }
+
+#[tokio::test]
+async fn sql_filters_and_aggregates_keep_exact_json_values() {
+    timeout(TEST_TIMEOUT * 3, sql_over_ingested_logs())
+        .await
+        .expect("sql round trip timed out");
+}
+
+async fn sql_over_ingested_logs() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let (listen, mut daemon) = start_daemon(
+        &root.path().join("observerd.toml"),
+        &root.path().join("wal"),
+    )
+    .await;
+    post_logs(listen.http, &sql_corpus()).await;
+    assert_query_cases(listen.query, BEARER, &sql_cases()).await;
+    daemon.terminate().await;
+}
+
+fn sql_corpus() -> ExportLogsServiceRequest {
+    otlp::logs(vec![otlp::resource(
+        vec![],
+        vec![otlp::scope(
+            vec![],
+            vec![
+                sql_row(
+                    "alpha",
+                    HOUR_START,
+                    Some(10),
+                    Some(1.5),
+                    Some(b"hi"),
+                    Some("web"),
+                ),
+                sql_row("beta", HOUR_END, Some(30), Some(2.5), None, None),
+                sql_row("gamma", NEXT_HOUR, None, None, None, Some("api")),
+            ],
+        )],
+    )])
+}
+
+fn sql_row(
+    body: &str,
+    time_unix_nano: u64,
+    status: Option<i64>,
+    latency: Option<f64>,
+    payload: Option<&[u8]>,
+    host: Option<&str>,
+) -> LogRecord {
+    let mut attributes = Vec::new();
+    if let Some(status) = status {
+        attributes.push(otlp::attribute("status", otlp::int_value(status)));
+    }
+    if let Some(latency) = latency {
+        attributes.push(otlp::attribute("latency", otlp::double_value(latency)));
+    }
+    if let Some(payload) = payload {
+        attributes.push(otlp::attribute("payload", otlp::bytes_value(payload)));
+    }
+    if let Some(host) = host {
+        attributes.push(otlp::attribute("host", otlp::string_value(host)));
+    }
+    LogRecord {
+        time_unix_nano,
+        body: Some(otlp::string_value(body)),
+        attributes,
+        ..Default::default()
+    }
+}
+
+fn sql_cases() -> [QueryCase; 10] {
+    let bytes = STANDARD.encode(b"hi");
+    [
+        QueryCase {
+            name: "time bound",
+            sql: "SELECT body FROM logs WHERE event_time_unix_nano >= 1700002799999999999 ORDER BY wal_sequence",
+            schema: json!([{"name": "body", "type": "Utf8", "nullable": true}]),
+            rows: json!([{"body": "beta"}, {"body": "gamma"}]),
+        },
+        QueryCase {
+            name: "body predicate",
+            sql: "SELECT wal_sequence FROM logs WHERE body = 'alpha'",
+            schema: json!([{"name": "wal_sequence", "type": "UInt64", "nullable": false}]),
+            rows: json!([{"wal_sequence": "0"}]),
+        },
+        QueryCase {
+            name: "typed dynamic filter",
+            sql: "SELECT body, log_status_i64, log_latency_f64, log_payload_bytes FROM logs WHERE log_status_i64 = 10",
+            schema: json!([
+                {"name": "body", "type": "Utf8", "nullable": true},
+                {"name": "log_status_i64", "type": "Int64", "nullable": true},
+                {"name": "log_latency_f64", "type": "Float64", "nullable": true},
+                {"name": "log_payload_bytes", "type": "Binary", "nullable": true}
+            ]),
+            rows: json!([{
+                "body": "alpha",
+                "log_status_i64": "10",
+                "log_latency_f64": 1.5,
+                "log_payload_bytes": bytes
+            }]),
+        },
+        QueryCase {
+            name: "null predicate",
+            sql: "SELECT body FROM logs WHERE log_host_string IS NULL ORDER BY wal_sequence",
+            schema: json!([{"name": "body", "type": "Utf8", "nullable": true}]),
+            rows: json!([{"body": "beta"}]),
+        },
+        QueryCase {
+            name: "alias order and limit",
+            sql: "SELECT body AS message FROM logs ORDER BY event_time_unix_nano DESC LIMIT 1",
+            schema: json!([{"name": "message", "type": "Utf8", "nullable": true}]),
+            rows: json!([{"message": "gamma"}]),
+        },
+        QueryCase {
+            name: "count",
+            sql: "SELECT count(*) AS rows_counted FROM logs",
+            schema: json!([{"name": "rows_counted", "type": "Int64", "nullable": false}]),
+            rows: json!([{"rows_counted": "3"}]),
+        },
+        QueryCase {
+            name: "grouped count",
+            sql: "SELECT body, count(*) AS rows_counted FROM logs GROUP BY body ORDER BY body",
+            schema: json!([
+                {"name": "body", "type": "Utf8", "nullable": true},
+                {"name": "rows_counted", "type": "Int64", "nullable": false}
+            ]),
+            rows: json!([
+                {"body": "alpha", "rows_counted": "1"},
+                {"body": "beta", "rows_counted": "1"},
+                {"body": "gamma", "rows_counted": "1"}
+            ]),
+        },
+        QueryCase {
+            name: "sum",
+            sql: "SELECT sum(log_status_i64) AS total FROM logs",
+            schema: json!([{"name": "total", "type": "Int64", "nullable": true}]),
+            rows: json!([{"total": "40"}]),
+        },
+        QueryCase {
+            name: "average",
+            sql: "SELECT avg(log_latency_f64) AS mean FROM logs",
+            schema: json!([{"name": "mean", "type": "Float64", "nullable": true}]),
+            rows: json!([{"mean": 2}]),
+        },
+        QueryCase {
+            name: "empty filter",
+            sql: "SELECT body, event_time_unix_nano FROM logs WHERE body = 'missing'",
+            schema: json!([
+                {"name": "body", "type": "Utf8", "nullable": true},
+                {"name": "event_time_unix_nano", "type": "UInt64", "nullable": false}
+            ]),
+            rows: json!([]),
+        },
+    ]
+}
