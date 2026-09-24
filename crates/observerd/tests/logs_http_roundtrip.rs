@@ -10,8 +10,9 @@ use prost::Message;
 use reqwest::header::CONTENT_TYPE;
 use serde_json::{Value, json};
 use support::{
-    BEARER, HttpBytes, QueryCase, TENANT, TEST_TIMEOUT, assert_cases_across_restart,
-    assert_query_cases, otlp, poll_query, post_logs, post_logs_raw, start_daemon,
+    BEARER, HttpBytes, QueryCase, StorageLimits, TENANT, TEST_TIMEOUT, assert_cases_across_restart,
+    assert_query_cases, otlp, poll_query, post_logs, post_logs_raw, post_query, reserve_ports,
+    sql_body, start_daemon, start_ready, wait_checkpoint, write_storage,
 };
 use tokio::time::timeout;
 
@@ -545,4 +546,375 @@ fn expected_row(row: Expected<'_>) -> Value {
         "scope_attributes": row.scope_attributes,
         "log_attributes": row.log_attributes,
     })
+}
+
+#[tokio::test]
+async fn dynamic_attributes_survive_new_columns_hours_and_restart() {
+    timeout(TEST_TIMEOUT * 4, dynamic_attributes())
+        .await
+        .expect("dynamic attribute projection timed out");
+}
+
+#[tokio::test]
+async fn deep_maps_and_columns_past_the_cap_stay_in_json() {
+    timeout(TEST_TIMEOUT * 4, limited_dynamic_columns())
+        .await
+        .expect("dynamic limit projection timed out");
+}
+
+async fn dynamic_attributes() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let wal_directory = root.path().join("wal");
+    let config_path = root.path().join("observerd.toml");
+    let listen = reserve_ports();
+    write_storage(
+        &config_path,
+        &wal_directory,
+        listen,
+        &StorageLimits {
+            max_rows: 0,
+            ..StorageLimits::default()
+        },
+    );
+    let daemon = start_ready(&config_path, listen).await;
+    post_logs(listen.http, &dynamic_request()).await;
+    wait_checkpoint(&wal_directory, TENANT, 1).await;
+    post_logs(listen.http, &later_column_request()).await;
+    wait_checkpoint(&wal_directory, TENANT, 2).await;
+
+    let dotted = collision_name(&["http.status"]);
+    let nested = collision_name(&["http", "status"]);
+    let sql = format!(
+        "SELECT wal_sequence, record_index, service_name, resource_attributes, scope_attributes, log_attributes, resource_service_name_string, resource_service_name_i64, scope_lib_string, log_host_string, log_ok_bool, log_status_i64, log_status_string, log_latency_f64, log_nan_f64, log_payload_bytes, log_items_json, log_region_string, log_env_string, {dotted}, {nested} FROM logs ORDER BY wal_sequence, record_index"
+    );
+    let cases = [QueryCase {
+        name: "dynamic attributes",
+        sql: Box::leak(sql.into_boxed_str()),
+        schema: dynamic_schema(&dotted, &nested),
+        rows: dynamic_rows(&dotted, &nested),
+    }];
+    let mut daemon =
+        assert_cases_across_restart(&config_path, listen, daemon, BEARER, &cases).await;
+    daemon.terminate().await;
+}
+
+fn dynamic_request() -> ExportLogsServiceRequest {
+    let first = LogRecord {
+        time_unix_nano: HOUR_END,
+        attributes: vec![
+            otlp::attribute("host", otlp::string_value("one")),
+            otlp::attribute("status", otlp::int_value(500)),
+            otlp::attribute("host", otlp::string_value("two")),
+            otlp::attribute("ok", otlp::bool_value(true)),
+            otlp::attribute("latency", otlp::double_value(1.5)),
+            otlp::attribute("nan", otlp::double_value(f64::NAN)),
+            otlp::attribute("payload", otlp::bytes_value(b"hi")),
+            otlp::attribute(
+                "items",
+                otlp::array_value(vec![otlp::int_value(1), otlp::string_value("x")]),
+            ),
+            otlp::attribute("http.status", otlp::int_value(1)),
+            otlp::attribute(
+                "http",
+                otlp::kv_value(vec![otlp::attribute("status", otlp::int_value(2))]),
+            ),
+        ],
+        ..Default::default()
+    };
+    let second = LogRecord {
+        time_unix_nano: NEXT_HOUR,
+        attributes: vec![
+            otlp::attribute("status", otlp::string_value("ok")),
+            otlp::attribute("region", otlp::string_value("eu")),
+        ],
+        ..Default::default()
+    };
+    let primary = otlp::resource(
+        vec![
+            otlp::attribute("service.name", otlp::string_value("api")),
+            otlp::attribute("zone", otlp::string_value("eu")),
+            otlp::attribute("service.name", otlp::string_value("edge")),
+        ],
+        vec![otlp::scope(
+            vec![otlp::attribute("lib", otlp::string_value("probe"))],
+            vec![first],
+        )],
+    );
+    let secondary = otlp::resource(
+        vec![otlp::attribute("service.name", otlp::int_value(5))],
+        vec![otlp::scope(vec![], vec![second])],
+    );
+    otlp::logs(vec![primary, secondary])
+}
+
+fn later_column_request() -> ExportLogsServiceRequest {
+    otlp::logs(vec![otlp::resource(
+        vec![],
+        vec![otlp::scope(
+            vec![],
+            vec![LogRecord {
+                time_unix_nano: HOUR_START,
+                attributes: vec![otlp::attribute("env", otlp::string_value("prod"))],
+                ..Default::default()
+            }],
+        )],
+    )])
+}
+
+fn collision_name(path: &[&str]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&[3]);
+    hasher.update(&u64::try_from(path.len()).expect("path").to_be_bytes());
+    for segment in path {
+        hasher.update(&u64::try_from(segment.len()).expect("segment").to_be_bytes());
+        hasher.update(segment.as_bytes());
+    }
+    hasher.update(&[2]);
+    let hex = hasher.finalize().to_hex();
+    format!("log_http_status_i64__{}", &hex[..8])
+}
+
+fn dynamic_schema(dotted: &str, nested: &str) -> Value {
+    let mut schema = vec![
+        json!({"name": "wal_sequence", "type": "UInt64", "nullable": false}),
+        json!({"name": "record_index", "type": "UInt32", "nullable": false}),
+        json!({"name": "service_name", "type": "Utf8", "nullable": true}),
+        json!({"name": "resource_attributes", "type": "Utf8", "nullable": false}),
+        json!({"name": "scope_attributes", "type": "Utf8", "nullable": false}),
+        json!({"name": "log_attributes", "type": "Utf8", "nullable": false}),
+        json!({"name": "resource_service_name_string", "type": "Utf8", "nullable": true}),
+        json!({"name": "resource_service_name_i64", "type": "Int64", "nullable": true}),
+        json!({"name": "scope_lib_string", "type": "Utf8", "nullable": true}),
+        json!({"name": "log_host_string", "type": "Utf8", "nullable": true}),
+        json!({"name": "log_ok_bool", "type": "Boolean", "nullable": true}),
+        json!({"name": "log_status_i64", "type": "Int64", "nullable": true}),
+        json!({"name": "log_status_string", "type": "Utf8", "nullable": true}),
+        json!({"name": "log_latency_f64", "type": "Float64", "nullable": true}),
+        json!({"name": "log_nan_f64", "type": "Float64", "nullable": true}),
+        json!({"name": "log_payload_bytes", "type": "Binary", "nullable": true}),
+        json!({"name": "log_items_json", "type": "Utf8", "nullable": true}),
+        json!({"name": "log_region_string", "type": "Utf8", "nullable": true}),
+        json!({"name": "log_env_string", "type": "Utf8", "nullable": true}),
+    ];
+    for name in [dotted, nested] {
+        schema.push(json!({"name": name, "type": "Int64", "nullable": true}));
+    }
+    Value::Array(schema)
+}
+
+fn dynamic_rows(dotted: &str, nested: &str) -> Value {
+    json!([
+        {
+            "wal_sequence": "0",
+            "record_index": 0,
+            "service_name": "edge",
+            "resource_attributes": r#"{"service.name":"edge","zone":"eu"}"#,
+            "scope_attributes": r#"{"lib":"probe"}"#,
+            "log_attributes": r#"{"host":"two","http":{"status":2},"http.status":1,"items":[1,"x"],"latency":1.5,"nan":{"$float":"NaN"},"ok":true,"payload":{"$bytes":"aGk="},"status":500}"#,
+            "resource_service_name_string": "edge",
+            "resource_service_name_i64": null,
+            "scope_lib_string": "probe",
+            "log_host_string": "two",
+            "log_ok_bool": true,
+            "log_status_i64": "500",
+            "log_status_string": null,
+            "log_latency_f64": 1.5,
+            "log_nan_f64": null,
+            "log_payload_bytes": STANDARD.encode(b"hi"),
+            "log_items_json": "[1,\"x\"]",
+            "log_region_string": null,
+            "log_env_string": null,
+            dotted: "1",
+            nested: "2"
+        },
+        {
+            "wal_sequence": "0",
+            "record_index": 1,
+            "service_name": null,
+            "resource_attributes": r#"{"service.name":5}"#,
+            "scope_attributes": "{}",
+            "log_attributes": r#"{"region":"eu","status":"ok"}"#,
+            "resource_service_name_string": null,
+            "resource_service_name_i64": "5",
+            "scope_lib_string": null,
+            "log_host_string": null,
+            "log_ok_bool": null,
+            "log_status_i64": null,
+            "log_status_string": "ok",
+            "log_latency_f64": null,
+            "log_nan_f64": null,
+            "log_payload_bytes": null,
+            "log_items_json": null,
+            "log_region_string": "eu",
+            "log_env_string": null,
+            dotted: null,
+            nested: null
+        },
+        {
+            "wal_sequence": "1",
+            "record_index": 0,
+            "service_name": null,
+            "resource_attributes": "{}",
+            "scope_attributes": "{}",
+            "log_attributes": r#"{"env":"prod"}"#,
+            "resource_service_name_string": null,
+            "resource_service_name_i64": null,
+            "scope_lib_string": null,
+            "log_host_string": null,
+            "log_ok_bool": null,
+            "log_status_i64": null,
+            "log_status_string": null,
+            "log_latency_f64": null,
+            "log_nan_f64": null,
+            "log_payload_bytes": null,
+            "log_items_json": null,
+            "log_region_string": null,
+            "log_env_string": "prod",
+            dotted: null,
+            nested: null
+        }
+    ])
+}
+
+async fn limited_dynamic_columns() {
+    depth_fallback().await;
+    column_cap().await;
+}
+
+async fn depth_fallback() {
+    let (config_path, wal_directory, listen, daemon) = start_limited(StorageLimits {
+        max_rows: 0,
+        max_depth: 1,
+        ..StorageLimits::default()
+    })
+    .await;
+    post_logs(
+        listen.http,
+        &otlp::logs(vec![otlp::resource(
+            vec![],
+            vec![otlp::scope(
+                vec![],
+                vec![LogRecord {
+                    time_unix_nano: HOUR_END,
+                    attributes: vec![otlp::attribute(
+                        "http",
+                        otlp::kv_value(vec![
+                            otlp::attribute("status", otlp::int_value(200)),
+                            otlp::attribute(
+                                "request",
+                                otlp::kv_value(vec![otlp::attribute(
+                                    "id",
+                                    otlp::string_value("abc"),
+                                )]),
+                            ),
+                        ]),
+                    )],
+                    ..Default::default()
+                }],
+            )],
+        )]),
+    )
+    .await;
+    wait_checkpoint(&wal_directory, TENANT, 1).await;
+    let cases = [QueryCase {
+        name: "nested map depth",
+        sql: "SELECT log_http_status_i64, log_http_request_json, log_attributes FROM logs",
+        schema: json!([
+            {"name": "log_http_status_i64", "type": "Int64", "nullable": true},
+            {"name": "log_http_request_json", "type": "Utf8", "nullable": true},
+            {"name": "log_attributes", "type": "Utf8", "nullable": false}
+        ]),
+        rows: json!([{
+            "log_http_status_i64": "200",
+            "log_http_request_json": r#"{"id":"abc"}"#,
+            "log_attributes": r#"{"http":{"request":{"id":"abc"},"status":200}}"#
+        }]),
+    }];
+    let mut daemon =
+        assert_cases_across_restart(&config_path, listen, daemon, BEARER, &cases).await;
+    daemon.terminate().await;
+}
+
+async fn column_cap() {
+    let (config_path, wal_directory, listen, daemon) = start_limited(StorageLimits {
+        max_rows: 0,
+        max_dynamic_columns: 1,
+        ..StorageLimits::default()
+    })
+    .await;
+    post_logs(
+        listen.http,
+        &otlp::logs(vec![otlp::resource(
+            vec![],
+            vec![otlp::scope(
+                vec![],
+                vec![LogRecord {
+                    time_unix_nano: HOUR_END,
+                    attributes: vec![
+                        otlp::attribute("c", otlp::int_value(3)),
+                        otlp::attribute("a", otlp::int_value(1)),
+                        otlp::attribute("b", otlp::int_value(2)),
+                    ],
+                    ..Default::default()
+                }],
+            )],
+        )]),
+    )
+    .await;
+    wait_checkpoint(&wal_directory, TENANT, 1).await;
+    let missing = post_query(
+        listen.query,
+        Some(BEARER),
+        &sql_body("SELECT log_b_i64 FROM logs"),
+    )
+    .await;
+    assert_eq!(
+        missing.status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "{}",
+        missing.body
+    );
+    assert_eq!(missing.body, r#"{"error":{"code":"invalid_sql"}}"#);
+    let cases = [QueryCase {
+        name: "column cap",
+        sql: "SELECT log_a_i64, log_attributes FROM logs",
+        schema: json!([
+            {"name": "log_a_i64", "type": "Int64", "nullable": true},
+            {"name": "log_attributes", "type": "Utf8", "nullable": false}
+        ]),
+        rows: json!([{
+            "log_a_i64": "1",
+            "log_attributes": r#"{"a":1,"b":2,"c":3}"#
+        }]),
+    }];
+    let mut daemon =
+        assert_cases_across_restart(&config_path, listen, daemon, BEARER, &cases).await;
+    let missing_after_restart = post_query(
+        listen.query,
+        Some(BEARER),
+        &sql_body("SELECT log_c_i64 FROM logs"),
+    )
+    .await;
+    assert_eq!(
+        missing_after_restart.status,
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    daemon.terminate().await;
+}
+
+async fn start_limited(
+    limits: StorageLimits,
+) -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    support::ListenAddrs,
+    support::Observerd,
+) {
+    let root = tempfile::tempdir().expect("tempdir").keep();
+    let wal_directory = root.join("wal");
+    let config_path = root.join("observerd.toml");
+    let listen = reserve_ports();
+    write_storage(&config_path, &wal_directory, listen, &limits);
+    let daemon = start_ready(&config_path, listen).await;
+    (config_path, wal_directory, listen, daemon)
 }
