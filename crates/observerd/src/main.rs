@@ -1,5 +1,6 @@
 mod config;
 mod consumer;
+mod janitor;
 mod query;
 mod readiness;
 
@@ -29,6 +30,7 @@ const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 struct AdminState {
     wal: Arc<TenantWalRouter>,
     consumers_failed: Arc<AtomicBool>,
+    janitor_failed: Arc<AtomicBool>,
     serving: Arc<AtomicBool>,
     wal_directory: PathBuf,
     data_directory: PathBuf,
@@ -79,9 +81,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Err(error.into());
         }
     };
+    let janitor = match janitor::Janitor::start(
+        consumers.stores(),
+        config.retention.clone(),
+        Arc::new(observer_storage::SystemClock),
+    ) {
+        Ok(janitor) => janitor,
+        Err(error) => {
+            let _ = consumers.shutdown();
+            let _ = wal.shutdown().await;
+            return Err(error.into());
+        }
+    };
     let engine = match QueryEngine::new(config.query.engine.clone()) {
         Ok(engine) => Arc::new(engine),
         Err(error) => {
+            janitor.shutdown();
             let _ = consumers.shutdown();
             let _ = wal.shutdown().await;
             return Err(error.into());
@@ -117,6 +132,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         AdminState {
             wal: Arc::clone(&wal),
             consumers_failed: consumers.failed_flag(),
+            janitor_failed: janitor.failed_flag(),
             serving: Arc::clone(&serving),
             wal_directory: config.wal_directory.clone(),
             data_directory: config.data_directory.clone(),
@@ -128,6 +144,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     serving.store(true, Ordering::SeqCst);
     wait_for_shutdown().await;
     serving.store(false, Ordering::SeqCst);
+    janitor.shutdown();
     let _ = shutdown_tx.send(true);
 
     // Stop accepting queries and finish in-flight requests before the WAL consumers drain.
@@ -221,7 +238,9 @@ async fn live() -> StatusCode {
 async fn ready(State(state): State<AdminState>) -> StatusCode {
     if state.readiness.is_ready(
         state.serving.load(Ordering::SeqCst),
-        state.wal.is_failed() || state.consumers_failed.load(Ordering::SeqCst),
+        state.wal.is_failed()
+            || state.consumers_failed.load(Ordering::SeqCst)
+            || state.janitor_failed.load(Ordering::SeqCst),
         &[&state.wal_directory, &state.data_directory],
     ) {
         StatusCode::OK

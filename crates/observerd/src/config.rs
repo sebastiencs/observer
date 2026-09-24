@@ -36,9 +36,6 @@ pub struct Config {
     /// Query listener caps and runtime.
     pub query: QueryConfig,
     /// Receive-time retention. `None` durations retain forever.
-    ///
-    /// Read by the janitor once that pass is wired.
-    #[allow(dead_code)]
     pub retention: RetentionConfig,
     /// Future event-time limit applied before a request is appended.
     ///
