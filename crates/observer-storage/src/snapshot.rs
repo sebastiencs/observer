@@ -7,7 +7,7 @@
 //! the absolute paths of files named by published commits.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
 };
@@ -90,6 +90,8 @@ pub struct StoreSnapshot {
     pub frozen: Vec<Generation>,
     /// Published commits, oldest range first.
     pub published: Vec<Commit>,
+    /// Tenant-relative Parquet paths hidden by durable retirement descriptors.
+    pub retired: BTreeSet<String>,
 }
 
 impl StoreSnapshot {
@@ -196,6 +198,7 @@ impl From<RecoveryError> for StoreError {
 struct State {
     memtable: Memtable,
     catalog: Catalog,
+    retired: BTreeSet<String>,
     epoch: u64,
 }
 
@@ -231,6 +234,16 @@ impl Store {
             state: Mutex::new(State {
                 memtable,
                 catalog: recovered.catalog,
+                retired: recovered
+                    .retirements
+                    .iter()
+                    .flat_map(|retirement| {
+                        retirement
+                            .files
+                            .iter()
+                            .map(|file| file.relative_path.clone())
+                    })
+                    .collect(),
                 epoch: 0,
             }),
         })
@@ -326,6 +339,7 @@ impl Store {
             active: memory.active,
             frozen: memory.frozen,
             published: state.catalog.commits().to_vec(),
+            retired: state.retired.clone(),
         })
     }
 
@@ -450,6 +464,9 @@ fn visible_sources<'a>(snapshot: &'a StoreSnapshot, scan: &Scan) -> Vec<Visible<
     let mut sources = Vec::new();
     for commit in &snapshot.published {
         for file in &commit.files {
+            if snapshot.retired.contains(&file.relative_path) {
+                continue;
+            }
             if hour_selected(file.hour, scan) {
                 sources.push(Visible::File {
                     hour: file.hour,

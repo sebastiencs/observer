@@ -81,6 +81,7 @@ mod layout;
 mod memtable;
 mod parquet;
 mod recovery;
+mod retirement;
 mod schema;
 mod snapshot;
 mod statistics;
@@ -102,7 +103,7 @@ pub use dynamic::{
 };
 pub use layout::{
     commit_file_name, commit_path, commits_directory, hour_directory, parquet_file_name,
-    parquet_path, tenant_directory,
+    parquet_path, retirement_file_name, retirement_path, retirements_directory, tenant_directory,
 };
 pub use memtable::{
     Appended, Clock, Generation, GenerationPartition, ManualClock, Memtable, MemtableConfig,
@@ -115,6 +116,10 @@ pub use parquet::{
     sort_by_newest_event, write_generation,
 };
 pub use recovery::{Recovered, RecoveryError, recover};
+pub use retirement::{
+    RetiredFile, Retirement, RetirementError, RetirementFault, RetirementWriteOptions,
+    read_retirement, write_retirement,
+};
 pub use schema::{
     COLUMN_BODY, COLUMN_EVENT_TIME_UNIX_NANO, COLUMN_LOG_ATTRIBUTES,
     COLUMN_OBSERVED_TIME_UNIX_NANO, COLUMN_RECEIVED_TIME_UNIX_NANO, COLUMN_RECORD_INDEX,

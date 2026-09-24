@@ -2,7 +2,8 @@
 //!
 //! `data_directory/tenants/<tenant>/date=YYYY-MM-DD/hour=HH/<first>-<next>.parquet`
 //!
-//! Commit descriptors live at `tenants/<tenant>/commits/<first>-<next>.commit`. `<first>-<next>` is
+//! Commit descriptors live at `tenants/<tenant>/commits/<first>-<next>.commit`. Retirement
+//! descriptors live at `tenants/<tenant>/retirements/<first>-<next>.retire`. `<first>-<next>` is
 //! the generation's exclusive WAL sequence range. Replaying that range writes the same paths.
 
 use std::{
@@ -38,6 +39,29 @@ pub fn commit_file_name(first_sequence: u64, next_sequence: u64) -> String {
 #[must_use]
 pub fn commit_path(root: &Path, tenant: &str, first_sequence: u64, next_sequence: u64) -> PathBuf {
     commits_directory(root, tenant).join(commit_file_name(first_sequence, next_sequence))
+}
+
+/// Directory of retirement descriptors for one tenant.
+#[must_use]
+pub fn retirements_directory(root: &Path, tenant: &str) -> PathBuf {
+    tenant_directory(root, tenant).join("retirements")
+}
+
+/// File name for one generation's retirement descriptor.
+#[must_use]
+pub fn retirement_file_name(first_sequence: u64, next_sequence: u64) -> String {
+    format!("{first_sequence}-{next_sequence}.retire")
+}
+
+/// Full path of one generation's retirement descriptor.
+#[must_use]
+pub fn retirement_path(
+    root: &Path,
+    tenant: &str,
+    first_sequence: u64,
+    next_sequence: u64,
+) -> PathBuf {
+    retirements_directory(root, tenant).join(retirement_file_name(first_sequence, next_sequence))
 }
 
 /// Directory that holds every Parquet file for one tenant hour.
