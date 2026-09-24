@@ -565,7 +565,7 @@ min_free_bytes = 0
             Arc::new(SystemClock),
         )
         .expect("store");
-        let snapshot = store.snapshot().expect("snapshot");
+        let snapshot = store.pin().expect("snapshot");
         let batches = store.scan(&snapshot, &Scan::default()).expect("scan");
         batches
             .iter()
@@ -596,7 +596,7 @@ min_free_bytes = 0
             Arc::new(SystemClock),
         )
         .expect("store");
-        let snapshot = store.snapshot().expect("snapshot");
+        let snapshot = store.pin().expect("snapshot");
         let batches = store.scan(&snapshot, &Scan::default()).expect("scan");
         batches
             .iter()
@@ -683,7 +683,7 @@ min_free_bytes = 0
     }
 
     fn live_bodies(store: &Store) -> Vec<Option<String>> {
-        let snapshot = store.snapshot().expect("snapshot");
+        let snapshot = store.pin().expect("snapshot");
         let batches = store.scan(&snapshot, &Scan::default()).expect("scan");
         batches
             .iter()
@@ -1065,7 +1065,7 @@ min_free_bytes = 0
             Arc::new(SystemClock),
         )
         .expect("store");
-        let snapshot = store.snapshot().expect("snapshot");
+        let snapshot = store.pin().expect("snapshot");
         let late = store
             .scan(
                 &snapshot,

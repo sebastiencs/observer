@@ -199,14 +199,92 @@ struct State {
     memtable: Memtable,
     catalog: Catalog,
     retired: BTreeSet<String>,
+    leases: BTreeMap<String, u64>,
+    collectible: BTreeSet<String>,
     epoch: u64,
+}
+
+/// One pin of the Parquet files visible in a snapshot.
+///
+/// Clones share the pin. The last drop decrements each path under the store lock and, when a
+/// retired path reaches zero, marks it collectible.
+#[derive(Clone)]
+pub struct SnapshotLease {
+    inner: Arc<LeaseInner>,
+}
+
+impl std::fmt::Debug for SnapshotLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SnapshotLease")
+            .field("paths", &self.inner.paths)
+            .finish()
+    }
+}
+
+struct LeaseInner {
+    state: Arc<Mutex<State>>,
+    paths: Vec<String>,
+}
+
+impl std::fmt::Debug for LeaseInner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LeaseInner")
+            .field("paths", &self.paths)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for LeaseInner {
+    fn drop(&mut self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        for path in &self.paths {
+            let Some(count) = state.leases.get_mut(path) else {
+                continue;
+            };
+            *count = count.saturating_sub(1);
+            if *count > 0 {
+                continue;
+            }
+            state.leases.remove(path);
+            if state.retired.contains(path) {
+                state.collectible.insert(path.clone());
+            }
+        }
+    }
+}
+
+/// Snapshot whose visible Parquet files stay leased until the last lease handle is dropped.
+#[derive(Clone, Debug)]
+pub struct PinnedSnapshot {
+    snapshot: StoreSnapshot,
+    lease: SnapshotLease,
+}
+
+impl std::ops::Deref for PinnedSnapshot {
+    type Target = StoreSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+impl PinnedSnapshot {
+    /// Lease handle for this pin. Clones keep the same files leased.
+    #[must_use]
+    pub fn lease(&self) -> SnapshotLease {
+        self.lease.clone()
+    }
 }
 
 /// Memtable plus the durable catalog for one tenant.
 pub struct Store {
     root: PathBuf,
     tenant: String,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
 }
 
 impl Store {
@@ -231,7 +309,7 @@ impl Store {
         Ok(Self {
             root,
             tenant,
-            state: Mutex::new(State {
+            state: Arc::new(Mutex::new(State {
                 memtable,
                 catalog: recovered.catalog,
                 retired: recovered
@@ -244,8 +322,10 @@ impl Store {
                             .map(|file| file.relative_path.clone())
                     })
                     .collect(),
+                leases: BTreeMap::new(),
+                collectible: BTreeSet::new(),
                 epoch: 0,
-            }),
+            })),
         })
     }
 
@@ -326,21 +406,64 @@ impl Store {
         Ok(Some(commit))
     }
 
-    /// Clone the visible generations and published commits at one epoch.
+    /// Pin the visible generations and the Parquet files a scan of them can read.
+    ///
+    /// Retired files are omitted and are not leased. Each leased path's count increases by one.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::Poisoned`] when the store lock is poisoned.
-    pub fn snapshot(&self) -> Result<StoreSnapshot, StoreError> {
-        let state = self.lock()?;
+    pub fn pin(&self) -> Result<PinnedSnapshot, StoreError> {
+        let mut state = self.lock()?;
         let memory = state.memtable.snapshot();
-        Ok(StoreSnapshot {
-            epoch: state.epoch,
-            active: memory.active,
-            frozen: memory.frozen,
-            published: state.catalog.commits().to_vec(),
-            retired: state.retired.clone(),
+        let published = state.catalog.commits().to_vec();
+        let retired = state.retired.clone();
+        let mut paths = BTreeSet::new();
+        for commit in &published {
+            for file in &commit.files {
+                if !retired.contains(&file.relative_path) {
+                    paths.insert(file.relative_path.clone());
+                }
+            }
+        }
+        for path in &paths {
+            *state.leases.entry(path.clone()).or_insert(0) += 1;
+            state.collectible.remove(path);
+        }
+        let lease = SnapshotLease {
+            inner: Arc::new(LeaseInner {
+                state: Arc::clone(&self.state),
+                paths: paths.into_iter().collect(),
+            }),
+        };
+        Ok(PinnedSnapshot {
+            snapshot: StoreSnapshot {
+                epoch: state.epoch,
+                active: memory.active,
+                frozen: memory.frozen,
+                published,
+                retired,
+            },
+            lease,
         })
+    }
+
+    /// Relative paths retired and held by no snapshot lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Poisoned`] when the store lock is poisoned.
+    pub fn collectible(&self) -> Result<BTreeSet<String>, StoreError> {
+        Ok(self.lock()?.collectible.clone())
+    }
+
+    /// Relative Parquet paths pinned by at least one snapshot, with their pin counts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Poisoned`] when the store lock is poisoned.
+    pub fn leased_paths(&self) -> Result<BTreeMap<String, u64>, StoreError> {
+        Ok(self.lock()?.leases.clone())
     }
 
     /// Read `snapshot` as one `RecordBatch` stream in WAL order.
@@ -353,7 +476,7 @@ impl Store {
     /// Returns [`StoreError`] when a Parquet file or a projected column cannot be read.
     pub fn scan(
         &self,
-        snapshot: &StoreSnapshot,
+        snapshot: &PinnedSnapshot,
         scan: &Scan,
     ) -> Result<Vec<RecordBatch>, StoreError> {
         let sources = visible_sources(snapshot, scan);
@@ -392,7 +515,7 @@ impl Store {
     ///
     /// Hours outside `scan` are omitted. Paths are absolute and come only from published commits.
     #[must_use]
-    pub fn sources(&self, snapshot: &StoreSnapshot, scan: &Scan) -> Vec<HourSources> {
+    pub fn sources(&self, snapshot: &PinnedSnapshot, scan: &Scan) -> Vec<HourSources> {
         let mut hours = BTreeMap::<EventHour, HourSources>::new();
         for source in visible_sources(snapshot, scan) {
             match source {
@@ -424,6 +547,20 @@ impl Store {
 
     fn lock(&self) -> Result<MutexGuard<'_, State>, StoreError> {
         self.state.lock().map_err(|_| StoreError::Poisoned)
+    }
+
+    /// Hide `relative_paths` from new pins. A path with no lease becomes collectible.
+    #[cfg(test)]
+    fn conceal(&self, relative_paths: &[String]) -> Result<(), StoreError> {
+        let mut state = self.lock()?;
+        for path in relative_paths {
+            state.retired.insert(path.clone());
+            let leased = state.leases.get(path).copied().unwrap_or(0) > 0;
+            if !leased {
+                state.collectible.insert(path.clone());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -763,7 +900,7 @@ mod tests {
         store.publish(&PublishOptions::default()).expect("publish");
         seal(&store, frame(1, 0, Vec::new()));
         store.append(&frame(2, 0, Vec::new())).expect("active");
-        let snapshot = store.snapshot().expect("snapshot");
+        let snapshot = store.pin().expect("snapshot");
         assert_eq!(snapshot.published.len(), 1);
         assert_eq!(snapshot.frozen.len(), 1);
         assert!(snapshot.active.is_some());
@@ -779,14 +916,14 @@ mod tests {
         let store = open_store(&directory);
         seal(&store, frame(0, 0, vec![attribute("a", 1)]));
         seal(&store, frame(1, 1, vec![attribute("b", 2)]));
-        let before = store.snapshot().expect("snapshot");
+        let before = store.pin().expect("snapshot");
         assert!(before.published.is_empty());
         assert_eq!(before.frozen.len(), 2);
         let before_rows = store.scan(&before, &Scan::default()).expect("scan memory");
         assert_eq!(sequences(&before_rows), [0, 1]);
 
         store.publish(&PublishOptions::default()).expect("publish");
-        let after = store.snapshot().expect("snapshot");
+        let after = store.pin().expect("snapshot");
         assert_eq!(after.frozen.len(), 1);
         assert_eq!(after.published.len(), 1);
         assert!(after.epoch > before.epoch);
@@ -801,7 +938,7 @@ mod tests {
 
         let restarted = open_store(&directory);
         assert_eq!(restarted.durable_sequence().expect("durable"), Some(1));
-        let visible = restarted.snapshot().expect("recovered");
+        let visible = restarted.pin().expect("recovered");
         assert!(visible.frozen.is_empty());
         assert!(visible.active.is_none());
         assert_eq!(
@@ -830,7 +967,7 @@ mod tests {
         seal(&store, frame(0, 0, vec![attribute("a", 1)]));
         store.publish(&PublishOptions::default()).expect("publish");
         seal(&store, frame(1, HOUR, vec![attribute("b", 2)]));
-        let snapshot = store.snapshot().expect("snapshot");
+        let snapshot = store.pin().expect("snapshot");
         let pruned = store
             .scan(
                 &snapshot,
@@ -857,7 +994,7 @@ mod tests {
         let store = open_store(&directory);
 
         store.append(&frame(0, 0, Vec::new())).expect("active");
-        let active = store.snapshot().expect("active snapshot");
+        let active = store.pin().expect("active snapshot");
         let active_sources = store.sources(&active, &Scan::default());
         assert_eq!(active_sources.len(), 1);
         assert!(active_sources[0].files.is_empty());
@@ -865,7 +1002,7 @@ mod tests {
         assert_eq!(sequences(&active_sources[0].batches), [0]);
 
         seal(&store, frame(1, 0, Vec::new()));
-        let frozen = store.snapshot().expect("frozen snapshot");
+        let frozen = store.pin().expect("frozen snapshot");
         let frozen_sources = store.sources(&frozen, &Scan::default());
         assert_eq!(frozen_sources.len(), 1);
         assert!(frozen_sources[0].files.is_empty());
@@ -875,7 +1012,7 @@ mod tests {
         store
             .append(&frame(2, HOUR, Vec::new()))
             .expect("later active");
-        let mixed = store.snapshot().expect("mixed snapshot");
+        let mixed = store.pin().expect("mixed snapshot");
         let mixed_sources = store.sources(&mixed, &Scan::default());
         assert_eq!(mixed_sources.len(), 2);
         assert!(mixed_sources[0].batches.is_empty());
@@ -921,7 +1058,7 @@ mod tests {
         seal(&store, frame(0, 0, vec![attribute("a", 1)]));
         store.publish(&PublishOptions::default()).expect("publish");
         seal(&store, frame(1, 0, vec![attribute("b", 2)]));
-        let snapshot = store.snapshot().expect("snapshot");
+        let snapshot = store.pin().expect("snapshot");
         let schema = snapshot.schema().expect("schema");
         assert!(schema.field_with_name("log_a_i64").is_ok());
         assert!(schema.field_with_name("log_b_i64").is_ok());
@@ -964,7 +1101,7 @@ mod tests {
         assert_eq!(restarted.durable_sequence().expect("durable"), Some(5));
         assert!(
             restarted
-                .scan(&restarted.snapshot().expect("snapshot"), &Scan::default())
+                .scan(&restarted.pin().expect("snapshot"), &Scan::default())
                 .expect("scan")
                 .is_empty()
         );
@@ -982,11 +1119,11 @@ mod tests {
             })
             .expect_err("swap");
         assert!(matches!(error, StoreError::Fault(PublishFault::Swap)));
-        let during = store.snapshot().expect("during");
+        let during = store.pin().expect("during");
         assert!(during.published.is_empty());
         assert_eq!(during.frozen.len(), 1);
         store.publish(&PublishOptions::default()).expect("retry");
-        let after = store.snapshot().expect("after");
+        let after = store.pin().expect("after");
         assert!(after.frozen.is_empty());
         assert_eq!(after.published.len(), 1);
         assert_eq!(
@@ -994,7 +1131,7 @@ mod tests {
             [0]
         );
         store.publish(&PublishOptions::default()).expect("idle");
-        assert_eq!(store.snapshot().expect("still").published.len(), 1);
+        assert_eq!(store.pin().expect("still").published.len(), 1);
     }
 
     #[test]
@@ -1028,7 +1165,7 @@ mod tests {
             assert!(error.to_string().contains("fault"));
             drop(store);
             let recovered = open_store(&directory);
-            let snapshot = recovered.snapshot().expect("snapshot");
+            let snapshot = recovered.pin().expect("snapshot");
             let rows = recovered.scan(&snapshot, &Scan::default()).expect("scan");
             let path = commit_path(directory.path(), "tenant-a", 0, 1);
             if published {
@@ -1061,7 +1198,7 @@ mod tests {
         let recovered = open_store(&directory);
         assert_eq!(recovered.durable_sequence().expect("durable"), Some(1));
         let rows = recovered
-            .scan(&recovered.snapshot().expect("snapshot"), &Scan::default())
+            .scan(&recovered.pin().expect("snapshot"), &Scan::default())
             .expect("scan");
         assert_eq!(sequences(&rows), [0]);
         assert!(!path.exists());
@@ -1114,5 +1251,64 @@ mod tests {
         let empty = super::align_projected(&batch, full.schema(), Some(&[])).expect("empty");
         assert_eq!(empty.num_columns(), 0);
         assert_eq!(empty.num_rows(), batch.num_rows());
+    }
+
+    #[test]
+    fn a_retired_file_stays_leased_until_the_last_pin_drops() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = open_store(&directory);
+        store.append(&frame(0, 0, Vec::new())).expect("append");
+        store.append(&frame(1, HOUR, Vec::new())).expect("append");
+        store.rotate().expect("rotate");
+        let commit = store
+            .publish(&PublishOptions::default())
+            .expect("publish")
+            .expect("commit");
+        assert_eq!(commit.files.len(), 2);
+        let hidden = commit.files[0].relative_path.clone();
+        let kept = commit.files[1].relative_path.clone();
+        let first = store.pin().expect("first");
+        let second = store.pin().expect("second");
+        assert_eq!(
+            store.leased_paths().expect("leases").get(&hidden).copied(),
+            Some(2)
+        );
+        store
+            .conceal(std::slice::from_ref(&hidden))
+            .expect("conceal");
+        let later = store.pin().expect("later");
+        let later_paths: Vec<_> = store
+            .sources(&later, &Scan::default())
+            .into_iter()
+            .flat_map(|hour| hour.files)
+            .map(|file| file.path)
+            .collect();
+        assert!(later_paths.iter().all(|path| !path.ends_with(&hidden)));
+        assert!(
+            store
+                .sources(&first, &Scan::default())
+                .iter()
+                .flat_map(|hour| &hour.files)
+                .any(|file| file.path.ends_with(&hidden))
+        );
+        assert!(store.collectible().expect("collectible").is_empty());
+        drop(first);
+        assert!(store.collectible().expect("collectible").is_empty());
+        assert_eq!(
+            store.leased_paths().expect("leases").get(&hidden).copied(),
+            Some(1)
+        );
+        drop(second);
+        let collectible = store.collectible().expect("collectible");
+        assert!(collectible.contains(&hidden));
+        assert!(!collectible.contains(&kept));
+        drop(later);
+        assert!(
+            directory
+                .path()
+                .join("tenants/tenant-a")
+                .join(&hidden)
+                .exists()
+        );
     }
 }

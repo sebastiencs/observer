@@ -97,8 +97,8 @@ use datafusion::sql::sqlparser::ast::Statement;
 use futures::{Stream, StreamExt};
 use observer_storage::{
     COLUMN_EVENT_TIME_UNIX_NANO, COLUMN_WAL_SEQUENCE, ColumnStatistics, EventHour, FileStatistics,
-    PublishedFile, Scan, StatValue, Store, StoreError, StoreSnapshot, align_projected,
-    sort_by_newest_event,
+    PinnedSnapshot, PublishedFile, Scan, SnapshotLease, StatValue, Store, StoreError,
+    align_projected, sort_by_newest_event,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -440,18 +440,19 @@ impl QueryEngine {
                 Err(error) => {
                     let _ = ready_tx.send(Err(error));
                 }
-                Ok((stream, deadline, permit, plan)) => {
+                Ok((stream, deadline, permit, plan, lease)) => {
                     let schema = stream.schema();
-                    if ready_tx.send(Ok((permit, schema))).is_err() {
+                    if ready_tx.send(Ok((permit, schema, lease.clone()))).is_err() {
                         recorded.mark_cancelled();
                         return;
                     }
                     forward(stream, pull_rx, deadline, max_rows, plan, recorded, runtime).await;
+                    drop(lease);
                 }
             }
         })));
         match ready_rx.await {
-            Ok(Ok((permit, schema))) => Ok(QueryBatchStream {
+            Ok(Ok((permit, schema, lease))) => Ok(QueryBatchStream {
                 pull_tx: Some(pull_tx),
                 pending: None,
                 task: task.0.take(),
@@ -461,6 +462,7 @@ impl QueryEngine {
                 threads: Arc::clone(&self.threads),
                 record,
                 schema,
+                lease,
             }),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(query_task_stopped()),
@@ -601,6 +603,7 @@ async fn prepare(
         tokio::time::Instant,
         OwnedSemaphorePermit,
         Arc<dyn ExecutionPlan>,
+        Option<SnapshotLease>,
     ),
     QueryError,
 > {
@@ -618,7 +621,7 @@ async fn prepare(
     let admitted = tokio::time::Instant::now();
     let admission_wait = admitted.saturating_duration_since(started);
     let prepared = tokio::time::timeout_at(deadline, async move {
-        let (provider, files) = table_provider(input)?;
+        let (provider, files, lease) = table_provider(input)?;
         let context = SessionContext::new_with_config_rt(session, runtime);
         context.add_optimizer_rule(Arc::new(NewestEventLimit));
         context
@@ -636,11 +639,11 @@ async fn prepare(
         .map_err(execution_error)?;
         let (scanned, pruned) = files.snapshot();
         record.set_planned(admission_wait, admitted.elapsed(), scanned, pruned);
-        Ok((stream, plan))
+        Ok((stream, plan, lease))
     })
     .await;
     match prepared {
-        Ok(Ok((stream, plan))) => Ok((stream, deadline, permit, plan)),
+        Ok(Ok((stream, plan, lease))) => Ok((stream, deadline, permit, plan, lease)),
         Ok(Err(error)) => Err(error),
         Err(_elapsed) => Err(QueryError::Timeout),
     }
@@ -690,18 +693,23 @@ fn session_config(config: &QueryEngineConfig) -> SessionConfig {
     session
 }
 
-fn table_provider(
-    input: QueryInput,
-) -> Result<(Arc<dyn TableProvider>, Arc<FileCounts>), QueryError> {
+type PreparedTable = (
+    Arc<dyn TableProvider>,
+    Arc<FileCounts>,
+    Option<SnapshotLease>,
+);
+
+fn table_provider(input: QueryInput) -> Result<PreparedTable, QueryError> {
     match input {
         QueryInput::Store(store) => {
-            let snapshot = store.snapshot().map_err(QueryError::Storage)?;
+            let snapshot = store.pin().map_err(QueryError::Storage)?;
+            let lease = snapshot.lease();
             let provider = ObserverTableProvider::new(store, snapshot)?;
             let files = Arc::clone(&provider.files);
-            Ok((Arc::new(provider), files))
+            Ok((Arc::new(provider), files, Some(lease)))
         }
         #[cfg(test)]
-        QueryInput::Provider(provider) => Ok((provider, Arc::new(FileCounts::default()))),
+        QueryInput::Provider(provider) => Ok((provider, Arc::new(FileCounts::default()), None)),
     }
 }
 
@@ -983,6 +991,7 @@ pub struct QueryBatchStream {
     threads: Arc<QueryThreads>,
     record: Arc<QueryRecord>,
     schema: SchemaRef,
+    lease: Option<SnapshotLease>,
 }
 
 impl QueryBatchStream {
@@ -1009,6 +1018,7 @@ impl QueryBatchStream {
         self.record.mark_cancelled();
         self.terminal = Some(QueryError::Cancelled);
         self.permit.take();
+        self.lease.take();
         self.stop_task();
     }
 
@@ -1022,6 +1032,7 @@ impl QueryBatchStream {
     fn finish(&mut self) {
         self.finished = true;
         self.permit.take();
+        self.lease.take();
         self.stop_task();
     }
 }
@@ -1031,6 +1042,7 @@ impl Drop for QueryBatchStream {
         if !self.finished && self.terminal.is_none() {
             self.record.mark_cancelled();
         }
+        self.lease.take();
         self.stop_task();
     }
 }
@@ -1125,7 +1137,7 @@ struct HourPartition {
 /// files that cannot match have been dropped.
 pub struct ObserverTableProvider {
     store: Arc<Store>,
-    snapshot: StoreSnapshot,
+    snapshot: PinnedSnapshot,
     schema: SchemaRef,
     hours: Vec<HourPartition>,
     files: Arc<FileCounts>,
@@ -1148,7 +1160,7 @@ impl ObserverTableProvider {
     /// # Errors
     ///
     /// Returns [`QueryError::Storage`] when the snapshot schema is incompatible.
-    pub fn new(store: Arc<Store>, snapshot: StoreSnapshot) -> Result<Self, QueryError> {
+    pub fn new(store: Arc<Store>, snapshot: PinnedSnapshot) -> Result<Self, QueryError> {
         let schema = snapshot.schema().map_err(QueryError::Storage)?;
         let mut hours = Vec::new();
         for hour in store.sources(&snapshot, &Scan::default()) {
@@ -2503,6 +2515,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_query_leases_published_files_until_cancel_or_timeout() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = open_at(directory.path());
+        store.append(&frame(0, 0, Vec::new())).expect("append");
+        store.rotate().expect("rotate");
+        store.publish(&PublishOptions::default()).expect("publish");
+        let engine = engine();
+        let mut stream = engine
+            .execute(
+                Arc::clone(&store),
+                "SELECT wal_sequence FROM logs",
+                QueryOptions::default(),
+            )
+            .await
+            .expect("execute");
+        assert!(!store.leased_paths().expect("leased").is_empty());
+        stream.cancel();
+        let error = stream.next().await.expect("item").expect_err("cancelled");
+        assert!(matches!(error, QueryError::Cancelled));
+        drop(stream);
+        wait_until_unleased(&store).await;
+
+        let timed_out = engine
+            .execute(
+                Arc::clone(&store),
+                "SELECT wal_sequence FROM logs",
+                QueryOptions {
+                    timeout: Duration::from_nanos(1),
+                    max_rows: QueryOptions::MAX_ROWS,
+                },
+            )
+            .await;
+        drop(timed_out);
+        wait_until_unleased(&store).await;
+    }
+
+    async fn wait_until_unleased(store: &Store) {
+        for _ in 0..200 {
+            if store.leased_paths().expect("leased").is_empty() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("published files stayed leased: {:?}", store.leased_paths());
+    }
+
+    #[tokio::test]
     async fn sql_reads_each_snapshot_row_once() {
         let directory = tempfile::tempdir().expect("tempdir");
         let store = open_at(directory.path());
@@ -2526,7 +2585,7 @@ mod tests {
         assert_eq!(i64_column(&rows, "log_a_i64"), vec![None, Some(1), None]);
         assert_eq!(i64_column(&rows, "log_b_i64"), vec![None, None, Some(2)]);
 
-        let published = store.sources(&store.snapshot().expect("snapshot"), &Scan::default());
+        let published = store.sources(&store.pin().expect("snapshot"), &Scan::default());
         let committed = &published[0].files[0].path;
         std::fs::copy(committed, committed.with_file_name("stray.parquet")).expect("stray");
         let once = batches(Arc::clone(&store), "SELECT wal_sequence FROM logs").await;
@@ -2563,7 +2622,7 @@ mod tests {
     }
 
     async fn physical_plan(store: Arc<Store>, sql: &str) -> Arc<dyn ExecutionPlan> {
-        let snapshot = store.snapshot().expect("snapshot");
+        let snapshot = store.pin().expect("snapshot");
         let provider = ObserverTableProvider::new(store, snapshot).expect("provider");
         let context = SessionContext::new();
         context.add_optimizer_rule(Arc::new(super::NewestEventLimit));
@@ -3130,7 +3189,7 @@ mod tests {
         store: Arc<Store>,
         sql: &str,
     ) -> (Vec<RecordBatch>, Arc<dyn ExecutionPlan>) {
-        let snapshot = store.snapshot().expect("snapshot");
+        let snapshot = store.pin().expect("snapshot");
         let provider = ObserverTableProvider::new(store, snapshot).expect("provider");
         let context =
             SessionContext::new_with_config(super::session_config(&QueryEngineConfig::default()));
@@ -3264,7 +3323,7 @@ mod tests {
         store
             .append(&frame_body(1, HOUR + 1, "new", vec![attribute("keep", 2)]))
             .expect("active");
-        let snapshot = store.snapshot().expect("snapshot");
+        let snapshot = store.pin().expect("snapshot");
         let original = Arc::clone(
             &snapshot
                 .frozen

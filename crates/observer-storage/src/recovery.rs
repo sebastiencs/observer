@@ -491,7 +491,7 @@ mod tests {
         )
         .expect("reopen");
         assert_eq!(store.durable_sequence().expect("sequence"), Some(1));
-        let snapshot = store.snapshot().expect("snapshot");
+        let snapshot = store.pin().expect("snapshot");
         assert_eq!(snapshot.published.len(), 1);
         assert!(
             snapshot

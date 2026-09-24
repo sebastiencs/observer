@@ -199,7 +199,7 @@ fn bodies(data: &Path, tenant: &str) -> Vec<Option<String>> {
         std::sync::Arc::new(SystemClock),
     )
     .expect("store");
-    let snapshot = store.snapshot().expect("snapshot");
+    let snapshot = store.pin().expect("snapshot");
     let batches = store.scan(&snapshot, &Scan::default()).expect("scan");
     batches
         .iter()

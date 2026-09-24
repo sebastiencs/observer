@@ -130,8 +130,8 @@ pub use schema::{
     TRACE_ID_BYTES, TRACE_ID_LEN, core_logs_schema, logs_batch_schema,
 };
 pub use snapshot::{
-    HourSources, PublishFault, PublishOptions, PublishedFile, Scan, Store, StoreError,
-    StoreSnapshot, align_projected,
+    HourSources, PinnedSnapshot, PublishFault, PublishOptions, PublishedFile, Scan, SnapshotLease,
+    Store, StoreError, StoreSnapshot, align_projected,
 };
 pub use statistics::{
     ColumnStatistics, FileStatistics, StatValue, eligible_for_received_retention, file_statistics,
