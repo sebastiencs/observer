@@ -129,5 +129,6 @@ pub use snapshot::{
     StoreSnapshot, align_projected,
 };
 pub use statistics::{
-    ColumnStatistics, FileStatistics, StatValue, file_statistics, statistics_usable,
+    ColumnStatistics, FileStatistics, StatValue, eligible_for_received_retention, file_statistics,
+    statistics_usable,
 };

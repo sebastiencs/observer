@@ -2727,6 +2727,8 @@ mod tests {
             rows: 1,
             event_time_min: 1,
             event_time_max: 1,
+            received_time_min: 1,
+            received_time_max: 1,
             wal_min: 0,
             wal_max: 0,
             ordered: true,

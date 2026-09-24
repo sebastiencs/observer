@@ -2,7 +2,9 @@
 //!
 //! Bounds cover scalar core columns and typed dynamic columns. Binary values, canonical JSON,
 //! dynamic JSON, and any column that contains a non-finite float have a null count and no bounds.
-//! A file whose statistics are missing or fail [`statistics_usable`] must be scanned.
+//! A file whose statistics are missing or fail [`statistics_usable`] must be scanned. Receive-time
+//! retention may retire that file only when those same statistics prove every row was received
+//! strictly before the cutoff.
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float64Type, Int32Type, Int64Type, UInt16Type, UInt32Type, UInt64Type};
@@ -10,9 +12,10 @@ use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 
 use crate::dynamic::{DynamicKind, FIELD_KIND};
+use crate::layout::hour_end_unix_nano;
 use crate::{
-    COLUMN_EVENT_TIME_UNIX_NANO, COLUMN_LOG_ATTRIBUTES, COLUMN_RESOURCE_ATTRIBUTES,
-    COLUMN_SCOPE_ATTRIBUTES, COLUMN_WAL_SEQUENCE,
+    COLUMN_EVENT_TIME_UNIX_NANO, COLUMN_LOG_ATTRIBUTES, COLUMN_RECEIVED_TIME_UNIX_NANO,
+    COLUMN_RESOURCE_ATTRIBUTES, COLUMN_SCOPE_ATTRIBUTES, COLUMN_WAL_SEQUENCE, EventHour,
 };
 
 /// Inclusive bounds for one non-null scalar value.
@@ -109,6 +112,10 @@ pub struct FileStatistics {
     pub event_time_min: u64,
     /// Inclusive maximum `event_time_unix_nano`.
     pub event_time_max: u64,
+    /// Inclusive minimum `received_time_unix_nano`.
+    pub received_time_min: u64,
+    /// Inclusive maximum `received_time_unix_nano`.
+    pub received_time_max: u64,
     /// Inclusive minimum `wal_sequence`.
     pub wal_min: u64,
     /// Inclusive maximum `wal_sequence`.
@@ -121,7 +128,7 @@ pub struct FileStatistics {
 
 /// Summarize `batches`, which already share `schema`.
 ///
-/// Returns [`None`] when event time or WAL sequence has no finite bounds.
+/// Returns [`None`] when event time, receive time, or WAL sequence has no finite bounds.
 #[must_use]
 pub fn file_statistics(
     schema: &Schema,
@@ -133,6 +140,7 @@ pub fn file_statistics(
         columns.push(column_statistics(field.as_ref(), batches)?);
     }
     let event_time = u64_bounds(&columns, COLUMN_EVENT_TIME_UNIX_NANO)?;
+    let received = u64_bounds(&columns, COLUMN_RECEIVED_TIME_UNIX_NANO)?;
     let wal = u64_bounds(&columns, COLUMN_WAL_SEQUENCE)?;
     let rows = batches.iter().try_fold(0_u64, |total, batch| {
         total.checked_add(u64::try_from(batch.num_rows()).ok()?)
@@ -142,6 +150,8 @@ pub fn file_statistics(
         rows,
         event_time_min: event_time.0,
         event_time_max: event_time.1,
+        received_time_min: received.0,
+        received_time_max: received.1,
         wal_min: wal.0,
         wal_max: wal.1,
         ordered: false,
@@ -163,6 +173,7 @@ pub fn statistics_usable(
     if statistics.size_bytes == 0
         || statistics.rows != rows
         || statistics.event_time_min > statistics.event_time_max
+        || statistics.received_time_min > statistics.received_time_max
         || statistics.wal_min > statistics.wal_max
         || statistics.event_time_min < hour_start
         || statistics.event_time_max >= hour_end
@@ -203,10 +214,41 @@ pub fn statistics_usable(
         statistics.event_time_max,
     ) && bounds_match(
         &statistics.columns,
+        COLUMN_RECEIVED_TIME_UNIX_NANO,
+        statistics.received_time_min,
+        statistics.received_time_max,
+    ) && bounds_match(
+        &statistics.columns,
         COLUMN_WAL_SEQUENCE,
         statistics.wal_min,
         statistics.wal_max,
     )
+}
+
+/// A whole file may be retired only when usable statistics prove its newest receive time is older
+/// than `cutoff_unix_nano`.
+#[must_use]
+pub fn eligible_for_received_retention(
+    statistics: Option<&FileStatistics>,
+    schema: &Schema,
+    rows: u64,
+    hour: EventHour,
+    first_sequence: u64,
+    next_sequence: u64,
+    cutoff_unix_nano: u64,
+) -> bool {
+    let Some(statistics) = statistics else {
+        return false;
+    };
+    statistics_usable(
+        statistics,
+        schema,
+        rows,
+        hour.start_unix_nano(),
+        hour_end_unix_nano(hour),
+        first_sequence,
+        next_sequence,
+    ) && statistics.received_time_max < cutoff_unix_nano
 }
 
 fn bounds_match(columns: &[ColumnStatistics], name: &str, min: u64, max: u64) -> bool {
@@ -328,8 +370,11 @@ fn bounds_supported(field: &Field) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{StatValue, file_statistics, statistics_usable};
-    use crate::{COLUMN_EVENT_TIME_UNIX_NANO, COLUMN_LOG_ATTRIBUTES, COLUMN_WAL_SEQUENCE};
+    use super::{StatValue, eligible_for_received_retention, file_statistics, statistics_usable};
+    use crate::{
+        COLUMN_EVENT_TIME_UNIX_NANO, COLUMN_LOG_ATTRIBUTES, COLUMN_RECEIVED_TIME_UNIX_NANO,
+        COLUMN_WAL_SEQUENCE, EventHour,
+    };
     use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
@@ -338,6 +383,7 @@ mod tests {
     fn bounds_cover_scalars_and_skip_json_and_non_finite_floats() {
         let schema = Arc::new(Schema::new(vec![
             Field::new(COLUMN_EVENT_TIME_UNIX_NANO, DataType::UInt64, false),
+            Field::new(COLUMN_RECEIVED_TIME_UNIX_NANO, DataType::UInt64, false),
             Field::new(COLUMN_WAL_SEQUENCE, DataType::UInt64, false),
             Field::new("log_a_i64", DataType::Int64, true),
             Field::new(COLUMN_LOG_ATTRIBUTES, DataType::Utf8, false),
@@ -352,6 +398,7 @@ mod tests {
             Arc::clone(&schema),
             vec![
                 Arc::new(UInt64Array::from(vec![5_u64, 8])),
+                Arc::new(UInt64Array::from(vec![20_u64, 10])),
                 Arc::new(UInt64Array::from(vec![3_u64, 4])),
                 Arc::new(Int64Array::from(vec![Some(4), None])),
                 Arc::new(StringArray::from(vec!["{}", "{}"])),
@@ -365,6 +412,8 @@ mod tests {
         assert_eq!(stats.rows, 2);
         assert_eq!(stats.event_time_min, 5);
         assert_eq!(stats.event_time_max, 8);
+        assert_eq!(stats.received_time_min, 10);
+        assert_eq!(stats.received_time_max, 20);
         assert_eq!(stats.wal_min, 3);
         assert_eq!(stats.wal_max, 4);
         let value = stats
@@ -424,5 +473,76 @@ mod tests {
             0,
             5
         ));
+    }
+
+    const HOUR: u64 = 3_600_000_000_000;
+
+    fn timed_file(event: [u64; 2], received: [u64; 2]) -> (Schema, super::FileStatistics) {
+        let schema = Schema::new(vec![
+            Field::new(COLUMN_EVENT_TIME_UNIX_NANO, DataType::UInt64, false),
+            Field::new(COLUMN_RECEIVED_TIME_UNIX_NANO, DataType::UInt64, false),
+            Field::new(COLUMN_WAL_SEQUENCE, DataType::UInt64, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(UInt64Array::from(event.to_vec())),
+                Arc::new(UInt64Array::from(received.to_vec())),
+                Arc::new(UInt64Array::from(vec![1_u64, 2])),
+            ],
+        )
+        .expect("batch");
+        let statistics = file_statistics(&schema, std::slice::from_ref(&batch), 8).expect("stats");
+        (schema, statistics)
+    }
+
+    fn eligible(schema: &Schema, statistics: Option<&super::FileStatistics>, cutoff: u64) -> bool {
+        let hour = EventHour::containing(statistics.map_or(0, |stats| stats.event_time_min));
+        eligible_for_received_retention(
+            statistics,
+            schema,
+            statistics.map_or(0, |stats| stats.rows),
+            hour,
+            1,
+            3,
+            cutoff,
+        )
+    }
+
+    #[test]
+    fn receive_time_bounds_ignore_the_event_timestamp() {
+        let (ancient_schema, ancient) = timed_file([5, 8], [1_700_000_000_000_000_000; 2]);
+        assert!(!eligible(
+            &ancient_schema,
+            Some(&ancient),
+            1_700_000_000_000_000_000
+        ));
+        assert!(eligible(
+            &ancient_schema,
+            Some(&ancient),
+            1_700_000_000_000_000_001
+        ));
+
+        let (future_schema, future) = timed_file([HOUR, HOUR + 1], [10, 10]);
+        assert!(eligible(&future_schema, Some(&future), 11));
+        assert!(!eligible(&future_schema, Some(&future), 10));
+    }
+
+    #[test]
+    fn mixed_receive_times_use_the_newest_row() {
+        let (schema, statistics) = timed_file([5, 8], [100, 300]);
+        assert_eq!(statistics.received_time_min, 100);
+        assert_eq!(statistics.received_time_max, 300);
+        assert!(!eligible(&schema, Some(&statistics), 300));
+        assert!(eligible(&schema, Some(&statistics), 301));
+    }
+
+    #[test]
+    fn missing_or_unusable_receive_bounds_keep_the_file() {
+        let (schema, statistics) = timed_file([5, 8], [10, 20]);
+        assert!(!eligible(&schema, None, u64::MAX));
+        let mut reversed = statistics.clone();
+        reversed.received_time_min = 21;
+        assert!(!eligible(&schema, Some(&reversed), u64::MAX));
     }
 }

@@ -470,6 +470,8 @@ fn encode_statistics(body: &mut Vec<u8>, statistics: Option<&FileStatistics>) {
     body.extend_from_slice(&statistics.rows.to_le_bytes());
     body.extend_from_slice(&statistics.event_time_min.to_le_bytes());
     body.extend_from_slice(&statistics.event_time_max.to_le_bytes());
+    body.extend_from_slice(&statistics.received_time_min.to_le_bytes());
+    body.extend_from_slice(&statistics.received_time_max.to_le_bytes());
     body.extend_from_slice(&statistics.wal_min.to_le_bytes());
     body.extend_from_slice(&statistics.wal_max.to_le_bytes());
     body.push(u8::from(statistics.ordered));
@@ -643,6 +645,8 @@ impl Reader<'_> {
                 rows: self.u64()?,
                 event_time_min: self.u64()?,
                 event_time_max: self.u64()?,
+                received_time_min: self.u64()?,
+                received_time_max: self.u64()?,
                 wal_min: self.u64()?,
                 wal_max: self.u64()?,
                 ordered: self.u8()? != 0,
@@ -769,6 +773,8 @@ mod tests {
                     rows: 2,
                     event_time_min: 9,
                     event_time_max: 1,
+                    received_time_min: 4,
+                    received_time_max: 4,
                     wal_min: 4,
                     wal_max: 4,
                     ordered: true,
@@ -785,5 +791,53 @@ mod tests {
             decoded.files[0].relative_path,
             commit.files[0].relative_path
         );
+    }
+
+    #[test]
+    fn received_time_bounds_round_trip_when_statistics_are_usable() {
+        use crate::{
+            COLUMN_EVENT_TIME_UNIX_NANO, COLUMN_RECEIVED_TIME_UNIX_NANO, COLUMN_WAL_SEQUENCE,
+            file_statistics,
+        };
+        use arrow_array::{RecordBatch, UInt64Array};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(COLUMN_EVENT_TIME_UNIX_NANO, DataType::UInt64, false),
+            Field::new(COLUMN_RECEIVED_TIME_UNIX_NANO, DataType::UInt64, false),
+            Field::new(COLUMN_WAL_SEQUENCE, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(UInt64Array::from(vec![5_u64, 8])),
+                Arc::new(UInt64Array::from(vec![50_u64, 100])),
+                Arc::new(UInt64Array::from(vec![4_u64, 5])),
+            ],
+        )
+        .expect("batch");
+        let statistics = file_statistics(schema.as_ref(), std::slice::from_ref(&batch), 12);
+        let commit = Commit {
+            tenant: "tenant-a".to_owned(),
+            projection_version: 1,
+            fingerprint: "abc".to_owned(),
+            schema,
+            first_sequence: 4,
+            next_sequence: 6,
+            rows: 2,
+            files: vec![CommitFile {
+                hour: EventHour::containing(5),
+                relative_path: "date=1970-01-01/hour=00/4-6.parquet".to_owned(),
+                rows: 2,
+                statistics,
+            }],
+            start_unix_nano: Some(0),
+            end_unix_nano: Some(3_600_000_000_000),
+        };
+        let decoded = decode(&encode(&commit).expect("encode")).expect("decode");
+        let statistics = decoded.files[0].statistics.as_ref().expect("statistics");
+        assert_eq!(statistics.received_time_min, 50);
+        assert_eq!(statistics.received_time_max, 100);
+        assert_eq!(statistics.event_time_min, 5);
+        assert_eq!(statistics.event_time_max, 8);
     }
 }
