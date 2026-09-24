@@ -8,11 +8,12 @@ use std::{
 };
 
 use observer_ingest::{
-    AcceptedBatch, AppendError, IngestSink, LogsHttpService, LogsIngestService, Signal,
-    TokenDirectory,
+    AcceptedBatch, AppendError, FUTURE_TIMESTAMP, IngestOptions, IngestSink, LogsHttpService,
+    LogsIngestService, Signal, TokenDirectory,
 };
 use observer_protocol::otlp::{
-    ExportLogsServiceRequest, ExportLogsServiceResponse, LogsServiceClient,
+    ExportLogsServiceRequest, ExportLogsServiceResponse, LogRecord, LogsServiceClient,
+    ResourceLogs, ScopeLogs,
 };
 use prost::Message;
 use reqwest::StatusCode;
@@ -96,12 +97,19 @@ async fn spawn_http<S>(sink: Arc<S>, max_body_bytes: usize) -> TestServer
 where
     S: IngestSink,
 {
+    spawn_http_at(sink, max_body_bytes, IngestOptions::default()).await
+}
+
+async fn spawn_http_at<S>(sink: Arc<S>, max_body_bytes: usize, options: IngestOptions) -> TestServer
+where
+    S: IngestSink,
+{
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind test listener");
     let address = listener.local_addr().expect("read listener address");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let router = LogsHttpService::new(sink, test_tokens(), max_body_bytes).into_router();
+    let router = LogsHttpService::new(sink, test_tokens(), max_body_bytes, options).into_router();
     let task = tokio::spawn(async move {
         axum::serve(listener, router)
             .with_graceful_shutdown(async {
@@ -127,7 +135,8 @@ where
         .expect("bind test listener");
     let address = listener.local_addr().expect("read listener address");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let service = LogsIngestService::new(sink, test_tokens()).into_server(MAX_MESSAGE_SIZE);
+    let service = LogsIngestService::new(sink, test_tokens(), IngestOptions::default())
+        .into_server(MAX_MESSAGE_SIZE);
     let task = tokio::spawn(async move {
         Server::builder()
             .add_service(service)
@@ -370,5 +379,123 @@ async fn missing_malformed_and_unknown_tokens_are_rejected_before_the_sink() {
     }
     assert_eq!(sink.append_calls.load(Ordering::SeqCst), 0);
 
+    server.shutdown().await;
+}
+
+fn timed_request(records: Vec<LogRecord>) -> ExportLogsServiceRequest {
+    ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: records,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
+fn at(time: u64, observed: u64) -> LogRecord {
+    LogRecord {
+        time_unix_nano: time,
+        observed_time_unix_nano: observed,
+        ..Default::default()
+    }
+}
+
+fn fixed(received: u64, skew: Duration) -> IngestOptions {
+    IngestOptions {
+        max_future_skew: skew,
+        receive_time_unix_nano: Some(received),
+    }
+}
+
+#[tokio::test]
+async fn http_rejects_a_future_event_timestamp_before_append() {
+    let sink = Arc::new(RecordingSink::default());
+    let server = spawn_http_at(
+        Arc::clone(&sink),
+        MAX_MESSAGE_SIZE,
+        fixed(1_000, Duration::from_nanos(100)),
+    )
+    .await;
+    let response = post_logs(
+        server.address,
+        "application/x-protobuf",
+        timed_request(vec![at(1_100, 0)]).encode_to_vec(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        sink.batches.lock().expect("lock")[0].received_at_unix_nanos,
+        1_000
+    );
+
+    let response = post_logs(
+        server.address,
+        "application/x-protobuf",
+        timed_request(vec![at(1, 0), at(1_101, 0)]).encode_to_vec(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.text().await.expect("body"), FUTURE_TIMESTAMP);
+    assert_eq!(sink.append_calls.load(Ordering::SeqCst), 1);
+
+    let response = post_logs(
+        server.address,
+        "application/x-protobuf",
+        timed_request(vec![at(0, 1_101)]).encode_to_vec(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(sink.append_calls.load(Ordering::SeqCst), 1);
+
+    let response = post_logs(
+        server.address,
+        "application/x-protobuf",
+        timed_request(vec![at(1, 0), at(0, 0)]).encode_to_vec(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let unauthenticated = post_logs_with_auth(
+        server.address,
+        None,
+        "application/x-protobuf",
+        timed_request(vec![at(u64::MAX, 0)]).encode_to_vec(),
+    )
+    .await;
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(sink.append_calls.load(Ordering::SeqCst), 2);
+    server.shutdown().await;
+
+    let sink = Arc::new(RecordingSink::default());
+    let server = spawn_http_at(
+        Arc::clone(&sink),
+        MAX_MESSAGE_SIZE,
+        fixed(u64::MAX, Duration::from_nanos(1)),
+    )
+    .await;
+    let response = post_logs(
+        server.address,
+        "application/x-protobuf",
+        timed_request(vec![at(u64::MAX, 0)]).encode_to_vec(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    server.shutdown().await;
+
+    let server = spawn_http_at(
+        Arc::new(RecordingSink::default()),
+        MAX_MESSAGE_SIZE,
+        fixed(u64::MAX - 5, Duration::from_nanos(u64::MAX)),
+    )
+    .await;
+    let response = post_logs(
+        server.address,
+        "application/x-protobuf",
+        timed_request(vec![at(u64::MAX, 0)]).encode_to_vec(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
     server.shutdown().await;
 }

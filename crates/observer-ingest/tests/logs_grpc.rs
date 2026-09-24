@@ -8,11 +8,12 @@ use std::{
 };
 
 use observer_ingest::{
-    AcceptedBatch, AppendError, IngestSink, LogsIngestService, Signal, TokenDirectory,
+    AcceptedBatch, AppendError, FUTURE_TIMESTAMP, IngestOptions, IngestSink, LogsIngestService,
+    Signal, TokenDirectory,
 };
 use observer_protocol::otlp::{
-    AnyValue, ExportLogsServiceRequest, KeyValue, LogsServiceClient, Resource, ResourceLogs,
-    any_value,
+    AnyValue, ExportLogsServiceRequest, KeyValue, LogRecord, LogsServiceClient, Resource,
+    ResourceLogs, ScopeLogs, any_value,
 };
 use prost::Message;
 use tokio::{
@@ -95,12 +96,20 @@ async fn spawn_server<S>(sink: Arc<S>) -> TestServer
 where
     S: IngestSink,
 {
+    spawn_server_at(sink, IngestOptions::default()).await
+}
+
+async fn spawn_server_at<S>(sink: Arc<S>, options: IngestOptions) -> TestServer
+where
+    S: IngestSink,
+{
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind test listener");
     let address = listener.local_addr().expect("read listener address");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let service = LogsIngestService::new(sink, test_tokens()).into_server(MAX_MESSAGE_SIZE);
+    let service =
+        LogsIngestService::new(sink, test_tokens(), options).into_server(MAX_MESSAGE_SIZE);
     let task = tokio::spawn(async move {
         Server::builder()
             .add_service(service)
@@ -288,5 +297,85 @@ async fn telemetry_attributes_cannot_override_authenticated_tenant() {
         assert_ne!(batches[0].tenant_id, "attacker");
     }
 
+    server.shutdown().await;
+}
+
+fn at(time: u64, observed: u64) -> LogRecord {
+    LogRecord {
+        time_unix_nano: time,
+        observed_time_unix_nano: observed,
+        ..Default::default()
+    }
+}
+
+fn timed_request(records: Vec<LogRecord>) -> ExportLogsServiceRequest {
+    ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: records,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
+#[tokio::test]
+async fn grpc_rejects_a_future_event_timestamp_before_append() {
+    let sink = Arc::new(RecordingSink::default());
+    let server = spawn_server_at(
+        Arc::clone(&sink),
+        IngestOptions {
+            max_future_skew: Duration::from_nanos(100),
+            receive_time_unix_nano: Some(1_000),
+        },
+    )
+    .await;
+    let mut client = connect(server.address).await;
+    client
+        .export(export_request(
+            Some(BEARER),
+            timed_request(vec![at(1_100, 0)]),
+        ))
+        .await
+        .expect("boundary");
+    let error = client
+        .export(export_request(
+            Some(BEARER),
+            timed_request(vec![at(1, 0), at(1_101, 0)]),
+        ))
+        .await
+        .expect_err("one nanosecond over");
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert_eq!(error.message(), FUTURE_TIMESTAMP);
+    assert_eq!(sink.append_calls.load(Ordering::SeqCst), 1);
+    client
+        .export(export_request(Some(BEARER), timed_request(vec![at(1, 0)])))
+        .await
+        .expect("old timestamp");
+    let unauthenticated = client
+        .export(export_request(None, timed_request(vec![at(u64::MAX, 0)])))
+        .await
+        .expect_err("auth");
+    assert_eq!(unauthenticated.code(), Code::Unauthenticated);
+    assert_eq!(sink.append_calls.load(Ordering::SeqCst), 2);
+    server.shutdown().await;
+
+    let server = spawn_server_at(
+        Arc::new(RecordingSink::default()),
+        IngestOptions {
+            max_future_skew: Duration::from_nanos(1),
+            receive_time_unix_nano: Some(u64::MAX),
+        },
+    )
+    .await;
+    let mut client = connect(server.address).await;
+    client
+        .export(export_request(
+            Some(BEARER),
+            timed_request(vec![at(u64::MAX, 0)]),
+        ))
+        .await
+        .expect("saturated limit");
     server.shutdown().await;
 }

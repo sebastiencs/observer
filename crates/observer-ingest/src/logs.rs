@@ -7,7 +7,7 @@ use observer_protocol::{
 use tonic::{Request, Response, Status};
 
 use crate::{
-    accept::{IngestLogsError, ingest_logs},
+    accept::{FUTURE_TIMESTAMP, IngestLogsError, IngestOptions, ingest_logs},
     auth::{AuthError, TokenDirectory},
 };
 
@@ -16,12 +16,17 @@ use crate::{
 pub struct LogsIngestService<S> {
     sink: Arc<S>,
     tokens: TokenDirectory,
+    options: IngestOptions,
 }
 
 impl<S> LogsIngestService<S> {
     #[must_use]
-    pub fn new(sink: Arc<S>, tokens: TokenDirectory) -> Self {
-        Self { sink, tokens }
+    pub fn new(sink: Arc<S>, tokens: TokenDirectory, options: IngestOptions) -> Self {
+        Self {
+            sink,
+            tokens,
+            options,
+        }
     }
 }
 
@@ -52,7 +57,7 @@ where
             .tokens
             .authenticate(authorization)
             .map_err(status_from_auth)?;
-        ingest_logs(&*self.sink, tenant_id, request.into_inner())
+        ingest_logs(&*self.sink, tenant_id, request.into_inner(), self.options)
             .await
             .map(Response::new)
             .map_err(status_from_ingest)
@@ -66,6 +71,7 @@ fn status_from_auth(error: AuthError) -> Status {
 fn status_from_ingest(error: IngestLogsError) -> Status {
     match error {
         IngestLogsError::Clock(message) => Status::internal(message),
+        IngestLogsError::FutureTimestamp => Status::invalid_argument(FUTURE_TIMESTAMP),
         IngestLogsError::Append(error) => match error.kind() {
             AppendErrorKind::InvalidArgument => Status::invalid_argument(error.to_string()),
             AppendErrorKind::ResourceExhausted => Status::resource_exhausted(error.to_string()),

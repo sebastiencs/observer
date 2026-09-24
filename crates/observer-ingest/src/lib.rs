@@ -5,6 +5,7 @@ mod auth;
 mod http;
 mod logs;
 
+pub use accept::{FUTURE_TIMESTAMP, IngestOptions};
 pub use auth::{AuthConfigError, AuthError, TokenDirectory};
 pub use http::LogsHttpService;
 pub use logs::LogsIngestService;

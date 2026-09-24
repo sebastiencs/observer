@@ -15,7 +15,7 @@ use observer_protocol::{AppendErrorKind, IngestSink, otlp::ExportLogsServiceRequ
 use prost::Message;
 
 use crate::{
-    accept::{IngestLogsError, ingest_logs},
+    accept::{FUTURE_TIMESTAMP, IngestLogsError, IngestOptions, ingest_logs},
     auth::{AuthError, TokenDirectory},
 };
 
@@ -26,6 +26,7 @@ pub struct LogsHttpService<S> {
     sink: Arc<S>,
     tokens: TokenDirectory,
     max_body_bytes: usize,
+    options: IngestOptions,
 }
 
 impl<S> Clone for LogsHttpService<S> {
@@ -34,6 +35,7 @@ impl<S> Clone for LogsHttpService<S> {
             sink: Arc::clone(&self.sink),
             tokens: self.tokens.clone(),
             max_body_bytes: self.max_body_bytes,
+            options: self.options,
         }
     }
 }
@@ -44,6 +46,7 @@ impl<S> fmt::Debug for LogsHttpService<S> {
             .debug_struct("LogsHttpService")
             .field("tokens", &self.tokens)
             .field("max_body_bytes", &self.max_body_bytes)
+            .field("max_future_skew", &self.options.max_future_skew)
             .finish_non_exhaustive()
     }
 }
@@ -53,11 +56,17 @@ where
     S: IngestSink,
 {
     #[must_use]
-    pub fn new(sink: Arc<S>, tokens: TokenDirectory, max_body_bytes: usize) -> Self {
+    pub fn new(
+        sink: Arc<S>,
+        tokens: TokenDirectory,
+        max_body_bytes: usize,
+        options: IngestOptions,
+    ) -> Self {
         Self {
             sink,
             tokens,
             max_body_bytes,
+            options,
         }
     }
 
@@ -93,7 +102,7 @@ where
     let request =
         ExportLogsServiceRequest::decode(body).map_err(|_| HttpIngestError::InvalidProtobuf)?;
 
-    let response = ingest_logs(&*service.sink, tenant_id, request)
+    let response = ingest_logs(&*service.sink, tenant_id, request, service.options)
         .await
         .map_err(HttpIngestError::from)?;
 
@@ -131,6 +140,7 @@ enum HttpIngestError {
     UnsupportedMediaType,
     InvalidProtobuf,
     Clock(&'static str),
+    FutureTimestamp,
     Append(observer_protocol::AppendError),
 }
 
@@ -146,6 +156,7 @@ impl From<IngestLogsError> for HttpIngestError {
     fn from(error: IngestLogsError) -> Self {
         match error {
             IngestLogsError::Clock(message) => Self::Clock(message),
+            IngestLogsError::FutureTimestamp => Self::FutureTimestamp,
             IngestLogsError::Append(error) => Self::Append(error),
         }
     }
@@ -164,6 +175,7 @@ impl IntoResponse for HttpIngestError {
             ),
             Self::InvalidProtobuf => (StatusCode::BAD_REQUEST, "invalid protobuf".to_owned()),
             Self::Clock(message) => (StatusCode::INTERNAL_SERVER_ERROR, message.to_owned()),
+            Self::FutureTimestamp => (StatusCode::BAD_REQUEST, FUTURE_TIMESTAMP.to_owned()),
             Self::Append(error) => {
                 let status = match error.kind() {
                     // Admission pressure is a client-visible retry signal, not WAL failure.

@@ -16,7 +16,7 @@ use std::{
 
 use axum::{Router, extract::State, http::StatusCode, routing::get};
 use config::Config;
-use observer_ingest::{LogsHttpService, LogsIngestService};
+use observer_ingest::{IngestOptions, LogsHttpService, LogsIngestService};
 use observer_query::QueryEngine;
 use observer_wal::{TenantWalRouter, WalWriterConfig};
 use readiness::{FilesystemFreeSpace, Readiness};
@@ -109,12 +109,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         grpc_listener,
         Arc::clone(&wal),
         config.tokens.clone(),
+        ingest_options(&config),
         shutdown_rx.clone(),
     );
     let http = spawn_http(
         http_listener,
         Arc::clone(&wal),
         config.tokens.clone(),
+        ingest_options(&config),
         shutdown_rx.clone(),
     );
     let query = spawn_query(
@@ -165,13 +167,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn ingest_options(config: &Config) -> IngestOptions {
+    IngestOptions {
+        max_future_skew: config.ingest.max_future_skew,
+        receive_time_unix_nano: None,
+    }
+}
+
 fn spawn_grpc(
     listener: TcpListener,
     wal: Arc<TenantWalRouter>,
     tokens: observer_ingest::TokenDirectory,
+    options: IngestOptions,
     mut shutdown: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<Result<(), tonic::transport::Error>> {
-    let service = LogsIngestService::new(wal, tokens).into_server(MAX_MESSAGE_SIZE);
+    let service = LogsIngestService::new(wal, tokens, options).into_server(MAX_MESSAGE_SIZE);
     tokio::spawn(async move {
         Server::builder()
             .add_service(service)
@@ -186,9 +196,10 @@ fn spawn_http(
     listener: TcpListener,
     wal: Arc<TenantWalRouter>,
     tokens: observer_ingest::TokenDirectory,
+    options: IngestOptions,
     mut shutdown: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<Result<(), std::io::Error>> {
-    let router = LogsHttpService::new(wal, tokens, MAX_MESSAGE_SIZE).into_router();
+    let router = LogsHttpService::new(wal, tokens, MAX_MESSAGE_SIZE, options).into_router();
     tokio::spawn(async move {
         axum::serve(listener, router)
             .with_graceful_shutdown(async move {

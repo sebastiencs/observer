@@ -38,9 +38,6 @@ pub struct Config {
     /// Receive-time retention. `None` durations retain forever.
     pub retention: RetentionConfig,
     /// Future event-time limit applied before a request is appended.
-    ///
-    /// Read by ingest validation once that check is wired.
-    #[allow(dead_code)]
     pub ingest: IngestConfig,
 }
 

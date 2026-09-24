@@ -40,7 +40,12 @@ where
         .expect("bind test listener");
     let address = listener.local_addr().expect("read listener address");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let service = LogsIngestService::new(sink, test_tokens()).into_server(MAX_MESSAGE_SIZE);
+    let service = LogsIngestService::new(
+        sink,
+        test_tokens(),
+        observer_ingest::IngestOptions::default(),
+    )
+    .into_server(MAX_MESSAGE_SIZE);
     let task = tokio::spawn(async move {
         Server::builder()
             .add_service(service)
