@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 use support::{
     BEARER, HttpBytes, QueryCase, SECOND_BEARER, StorageLimits, TENANT, TEST_TIMEOUT,
     assert_cases_across_restart, assert_query_cases, otlp, poll_query, post_logs, post_logs_as,
-    post_logs_raw, post_query, reserve_ports, sql_body, start_daemon, start_ready, wait_checkpoint,
-    write_storage,
+    post_logs_raw, post_query, reserve_ports, restart_daemon, sql_body, start_daemon, start_ready,
+    wait_checkpoint, write_storage,
 };
 use tokio::time::timeout;
 
@@ -1115,6 +1115,213 @@ async fn start_limited(
     write_storage(&config_path, &wal_directory, listen, &limits);
     let daemon = start_ready(&config_path, listen).await;
     (config_path, wal_directory, listen, daemon)
+}
+
+#[tokio::test]
+async fn graceful_shutdown_publishes_the_active_tail_once() {
+    timeout(TEST_TIMEOUT * 4, active_tail_survives_shutdown())
+        .await
+        .expect("active tail scenario timed out");
+}
+
+async fn active_tail_survives_shutdown() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let wal_directory = root.path().join("wal");
+    let config_path = root.path().join("observerd.toml");
+    let (listen, mut daemon) = start_daemon(&config_path, &wal_directory).await;
+    post_logs(listen.http, &tail_request(0, "tail-a", "tail-b")).await;
+    post_logs(listen.http, &tail_request(1, "tail-c", "tail-d")).await;
+    let cases = [QueryCase {
+        name: "active tail",
+        sql: "SELECT wal_sequence, record_index, body FROM logs ORDER BY wal_sequence, record_index",
+        schema: json!([
+            {"name": "wal_sequence", "type": "UInt64", "nullable": false},
+            {"name": "record_index", "type": "UInt32", "nullable": false},
+            {"name": "body", "type": "Utf8", "nullable": true}
+        ]),
+        rows: json!([
+            {"wal_sequence": "0", "record_index": 0, "body": "tail-a"},
+            {"wal_sequence": "0", "record_index": 1, "body": "tail-b"},
+            {"wal_sequence": "1", "record_index": 0, "body": "tail-c"},
+            {"wal_sequence": "1", "record_index": 1, "body": "tail-d"}
+        ]),
+    }];
+    assert_query_cases(listen.query, BEARER, &cases).await;
+    assert_eq!(checkpoint_sequence(&wal_directory, TENANT), 0);
+    daemon.terminate().await;
+    assert_eq!(checkpoint_sequence(&wal_directory, TENANT), 2);
+    let mut daemon = restart_daemon(&config_path, listen).await;
+    assert_query_cases(listen.query, BEARER, &cases).await;
+    daemon.terminate().await;
+}
+
+fn tail_request(sequence: u64, first: &str, second: &str) -> ExportLogsServiceRequest {
+    otlp::logs(vec![otlp::resource(
+        vec![],
+        vec![otlp::scope(
+            vec![],
+            vec![
+                otlp::text_record(first, HOUR_START + sequence),
+                otlp::text_record(second, HOUR_START + sequence + 1),
+            ],
+        )],
+    )])
+}
+
+#[tokio::test]
+async fn burst_ingest_keeps_each_tenants_rows_in_wal_order() {
+    timeout(TEST_TIMEOUT * 4, burst_both_tenants())
+        .await
+        .expect("burst tenant scenario timed out");
+}
+
+async fn burst_both_tenants() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let (listen, mut daemon) = start_daemon(
+        &root.path().join("observerd.toml"),
+        &root.path().join("wal"),
+    )
+    .await;
+    let http = listen.http;
+    let query = listen.query;
+    let alpha: Vec<String> = (0..8).map(|index| format!("alpha-{index}")).collect();
+    let beta: Vec<String> = (0..8).map(|index| format!("beta-{index}")).collect();
+    let alpha_posts = alpha.clone();
+    let beta_posts = beta.clone();
+    let ingest_alpha = tokio::spawn(async move {
+        let mut posts = Vec::new();
+        for body in alpha_posts {
+            let address = http;
+            posts.push(tokio::spawn(async move {
+                post_logs(address, &burst_log(&body, "host", "alpha")).await;
+            }));
+        }
+        for post in posts {
+            post.await.expect("alpha post");
+        }
+    });
+    let ingest_beta = tokio::spawn(async move {
+        let mut posts = Vec::new();
+        for body in beta_posts {
+            let address = http;
+            posts.push(tokio::spawn(async move {
+                post_logs_as(address, SECOND_BEARER, &burst_log(&body, "region", "eu")).await;
+            }));
+        }
+        for post in posts {
+            post.await.expect("beta post");
+        }
+    });
+    let read_alpha = tokio::spawn(async move {
+        wait_tenant_rows(
+            query,
+            BEARER,
+            BURST_ALPHA_SQL,
+            &alpha,
+            "log_host_string",
+            "alpha",
+        )
+        .await;
+    });
+    let beta_query = query;
+    let read_beta = tokio::spawn(async move {
+        wait_tenant_rows(
+            beta_query,
+            SECOND_BEARER,
+            BURST_BETA_SQL,
+            &beta,
+            "log_region_string",
+            "eu",
+        )
+        .await;
+    });
+    ingest_alpha.await.expect("alpha ingest");
+    ingest_beta.await.expect("beta ingest");
+    read_alpha.await.expect("alpha query");
+    read_beta.await.expect("beta query");
+    let crossed = post_query(
+        listen.query,
+        Some(BEARER),
+        &sql_body("SELECT log_region_string FROM logs"),
+    )
+    .await;
+    assert_eq!(crossed.status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(crossed.body, r#"{"error":{"code":"invalid_sql"}}"#);
+    let crossed = post_query(
+        listen.query,
+        Some(SECOND_BEARER),
+        &sql_body("SELECT log_host_string FROM logs"),
+    )
+    .await;
+    assert_eq!(crossed.status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(crossed.body, r#"{"error":{"code":"invalid_sql"}}"#);
+    daemon.terminate().await;
+}
+
+const BURST_ALPHA_SQL: &str = "SELECT wal_sequence, record_index, body, log_host_string FROM logs ORDER BY wal_sequence, record_index";
+const BURST_BETA_SQL: &str = "SELECT wal_sequence, record_index, body, log_region_string FROM logs ORDER BY wal_sequence, record_index";
+
+fn burst_log(body: &str, key: &str, value: &str) -> ExportLogsServiceRequest {
+    otlp::logs(vec![otlp::resource(
+        vec![],
+        vec![otlp::scope(
+            vec![],
+            vec![LogRecord {
+                time_unix_nano: HOUR_START,
+                body: Some(otlp::string_value(body)),
+                attributes: vec![otlp::attribute(key, otlp::string_value(value))],
+                ..Default::default()
+            }],
+        )],
+    )])
+}
+
+async fn wait_tenant_rows(
+    address: std::net::SocketAddr,
+    bearer: &str,
+    sql: &str,
+    expected: &[String],
+    column: &str,
+    value: &str,
+) {
+    let deadline = std::time::Instant::now() + TEST_TIMEOUT;
+    let mut last = String::new();
+    while std::time::Instant::now() < deadline {
+        let response = post_query(address, Some(bearer), &sql_body(sql)).await;
+        last = response.body;
+        if response.status != reqwest::StatusCode::OK {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            continue;
+        }
+        let document = serde_json::from_str::<Value>(&last).expect("query json");
+        let rows = document["rows"].as_array().expect("rows");
+        let mut bodies = Vec::new();
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row["wal_sequence"], index.to_string(), "{last}");
+            assert_eq!(row["record_index"], 0, "{last}");
+            assert_eq!(row[column], value, "{last}");
+            bodies.push(row["body"].as_str().expect("body").to_owned());
+        }
+        assert_eq!(
+            bodies.len(),
+            bodies
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            "{last}"
+        );
+        assert!(
+            bodies
+                .iter()
+                .all(|body| expected.iter().any(|own| own == body)),
+            "{last}"
+        );
+        if bodies.len() == expected.len() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("tenant rows did not arrive\nexpected: {expected:?}\nlast: {last}");
 }
 
 #[tokio::test]

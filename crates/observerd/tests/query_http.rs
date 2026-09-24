@@ -9,8 +9,8 @@ use observer_protocol::otlp::{
 };
 use serde_json::{Value, json};
 use support::{
-    BEARER, SECOND_BEARER, TENANT, TEST_TIMEOUT, assert_metrics, column_strings, post_logs,
-    post_logs_as, post_query, reserve_ports, restart_daemon, sql_body, start_daemon, start_ready,
+    BEARER, SECOND_BEARER, TENANT, TEST_TIMEOUT, assert_metrics, otlp, post_logs, post_logs_as,
+    post_query, reserve_ports, restart_daemon, sql_body, start_daemon, start_ready,
     wait_checkpoint, wait_for_bodies, write_response_cap,
 };
 use tokio::time::timeout;
@@ -251,35 +251,26 @@ async fn ingest_and_query() {
     let wal_directory = root.path().join("wal");
     let config_path = root.path().join("observerd.toml");
     let (listen, mut daemon) = start_daemon(&config_path, &wal_directory).await;
-    let expected = [
-        "row-0", "row-1", "row-2", "row-3", "row-4", "row-5", "row-6", "row-7",
-    ];
+    let expected = concurrent_rows();
     let query_address = listen.query;
     let http_address = listen.http;
-    let rows = expected;
+    let rows = expected.clone();
     let reader = tokio::spawn(async move {
         let deadline = Instant::now() + TEST_TIMEOUT;
         let mut last = String::new();
         while Instant::now() < deadline {
-            let response = post_query(query_address, Some(BEARER), &sql_body(PROJECTION)).await;
-            assert_eq!(
-                response.status,
-                reqwest::StatusCode::OK,
-                "{}",
-                response.body
-            );
+            let response = post_query(query_address, Some(BEARER), &sql_body(SNAPSHOT_SQL)).await;
             last = response.body;
+            if response.status != reqwest::StatusCode::OK {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
             let document = serde_json::from_str::<Value>(&last).expect("query json");
-            let bodies = column_strings(&document, "body");
-            assert!(
-                bodies.windows(2).all(|pair| pair[0] <= pair[1]),
-                "rows were not ordered: {bodies:?}"
-            );
-            assert!(
-                bodies.iter().all(|body| rows.contains(&body.as_str())),
-                "unexpected row in {bodies:?}"
-            );
-            if bodies.iter().map(String::as_str).eq(rows.iter().copied()) {
+            assert_pinned_prefix(&document, &rows);
+            if document["rows"]
+                .as_array()
+                .is_some_and(|seen| seen.len() == rows.len())
+            {
                 assert_metrics(
                     &document["metrics"],
                     u64::try_from(rows.len()).expect("len"),
@@ -288,17 +279,102 @@ async fn ingest_and_query() {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("concurrent query never saw {rows:?}: {last}");
+        panic!("concurrent query never saw the full snapshot: {last}");
     });
-    for (index, body) in expected.iter().enumerate() {
-        post_logs(
-            http_address,
-            &marked(body, 1_700_000_000_000_000_000 + index as u64),
-        )
-        .await;
+    for request in concurrent_requests() {
+        post_logs(http_address, &request).await;
     }
     reader.await.expect("query task");
+    let evolved = post_query(listen.query, Some(BEARER), &sql_body(EVOLVED_SQL)).await;
+    assert_eq!(evolved.status, reqwest::StatusCode::OK, "{}", evolved.body);
+    let document = evolved.json();
+    assert_eq!(document["rows"], evolved_rows());
+    assert_metrics(
+        &document["metrics"],
+        u64::try_from(expected.len()).expect("len"),
+    );
     daemon.terminate().await;
+}
+
+const SNAPSHOT_SQL: &str = "SELECT wal_sequence, record_index, body, log_kind_string FROM logs ORDER BY wal_sequence, record_index";
+const EVOLVED_SQL: &str = "SELECT wal_sequence, record_index, body, log_extra_i64, log_region_string FROM logs ORDER BY wal_sequence, record_index";
+
+fn concurrent_requests() -> [ExportLogsServiceRequest; 3] {
+    [
+        frame(0, &[("a0", "alpha"), ("a1", "alpha")], None, None),
+        frame(1, &[("b0", "beta"), ("b1", "beta")], Some(1), None),
+        frame(2, &[("c0", "gamma"), ("c1", "gamma")], Some(2), Some("eu")),
+    ]
+}
+
+fn frame(
+    sequence: u64,
+    records: &[(&str, &str)],
+    extra: Option<i64>,
+    region: Option<&str>,
+) -> ExportLogsServiceRequest {
+    let mut log_records = Vec::new();
+    for (index, (body, kind)) in records.iter().enumerate() {
+        let mut attributes = vec![otlp::attribute("kind", otlp::string_value(kind))];
+        if let Some(extra) = extra {
+            attributes.push(otlp::attribute("extra", otlp::int_value(extra)));
+        }
+        if let Some(region) = region {
+            attributes.push(otlp::attribute("region", otlp::string_value(region)));
+        }
+        log_records.push(LogRecord {
+            time_unix_nano: 1_700_000_000_000_000_000 + sequence * 10 + index as u64,
+            body: Some(otlp::string_value(body)),
+            attributes,
+            ..Default::default()
+        });
+    }
+    otlp::logs(vec![otlp::resource(
+        vec![],
+        vec![otlp::scope(vec![], log_records)],
+    )])
+}
+
+fn concurrent_rows() -> Vec<Value> {
+    let mut rows = Vec::new();
+    for (sequence, (bodies, kind)) in [
+        (["a0", "a1"], "alpha"),
+        (["b0", "b1"], "beta"),
+        (["c0", "c1"], "gamma"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (index, body) in bodies.into_iter().enumerate() {
+            rows.push(json!({
+                "wal_sequence": sequence.to_string(),
+                "record_index": index,
+                "body": body,
+                "log_kind_string": kind,
+            }));
+        }
+    }
+    rows
+}
+
+fn evolved_rows() -> Value {
+    json!([
+        {"wal_sequence": "0", "record_index": 0, "body": "a0", "log_extra_i64": null, "log_region_string": null},
+        {"wal_sequence": "0", "record_index": 1, "body": "a1", "log_extra_i64": null, "log_region_string": null},
+        {"wal_sequence": "1", "record_index": 0, "body": "b0", "log_extra_i64": "1", "log_region_string": null},
+        {"wal_sequence": "1", "record_index": 1, "body": "b1", "log_extra_i64": "1", "log_region_string": null},
+        {"wal_sequence": "2", "record_index": 0, "body": "c0", "log_extra_i64": "2", "log_region_string": "eu"},
+        {"wal_sequence": "2", "record_index": 1, "body": "c1", "log_extra_i64": "2", "log_region_string": "eu"}
+    ])
+}
+
+fn assert_pinned_prefix(document: &Value, expected: &[Value]) {
+    let rows = document["rows"].as_array().expect("rows");
+    assert!(
+        rows.len() <= expected.len() && rows.len().is_multiple_of(2),
+        "snapshot split a frame: {rows:?}"
+    );
+    assert_eq!(&rows[..], &expected[..rows.len()]);
 }
 
 fn marked(body: &str, time_unix_nano: u64) -> ExportLogsServiceRequest {
