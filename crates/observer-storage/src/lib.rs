@@ -81,6 +81,7 @@ mod layout;
 mod memtable;
 mod parquet;
 mod recovery;
+mod retention;
 mod retirement;
 mod schema;
 mod snapshot;
@@ -116,6 +117,9 @@ pub use parquet::{
     sort_by_newest_event, write_generation,
 };
 pub use recovery::{Recovered, RecoveryError, recover};
+pub use retention::{
+    CollectError, CollectFault, CollectOptions, CollectReport, RetentionReport, RetireOptions,
+};
 pub use retirement::{
     RetiredFile, Retirement, RetirementError, RetirementFault, RetirementWriteOptions,
     read_retirement, write_retirement,

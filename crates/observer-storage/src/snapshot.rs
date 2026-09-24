@@ -130,6 +130,10 @@ pub enum StoreError {
     Incompatible(String),
     /// [`PublishOptions::fault`] stopped the publication after the descriptor was durable.
     Fault(PublishFault),
+    /// A retirement descriptor could not be written.
+    Retirement(crate::RetirementError),
+    /// Garbage collection could not unlink a retired file.
+    Collect(crate::CollectError),
 }
 
 impl std::fmt::Display for StoreError {
@@ -146,6 +150,8 @@ impl std::fmt::Display for StoreError {
             }
             Self::Incompatible(detail) => write!(formatter, "scan schema: {detail}"),
             Self::Fault(step) => write!(formatter, "injected publish fault at {step:?}"),
+            Self::Retirement(error) => write!(formatter, "{error}"),
+            Self::Collect(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -158,6 +164,8 @@ impl std::error::Error for StoreError {
             Self::Commit(error) => Some(error),
             Self::Catalog(error) => Some(error),
             Self::Recovery(error) => Some(error),
+            Self::Retirement(error) => Some(error),
+            Self::Collect(error) => Some(error),
             Self::Poisoned | Self::MissingColumn(_) | Self::Incompatible(_) | Self::Fault(_) => {
                 None
             }
@@ -195,13 +203,25 @@ impl From<RecoveryError> for StoreError {
     }
 }
 
-struct State {
-    memtable: Memtable,
-    catalog: Catalog,
-    retired: BTreeSet<String>,
-    leases: BTreeMap<String, u64>,
-    collectible: BTreeSet<String>,
-    epoch: u64,
+impl From<crate::RetirementError> for StoreError {
+    fn from(error: crate::RetirementError) -> Self {
+        Self::Retirement(error)
+    }
+}
+
+impl From<crate::CollectError> for StoreError {
+    fn from(error: crate::CollectError) -> Self {
+        Self::Collect(error)
+    }
+}
+
+pub(crate) struct State {
+    pub(crate) memtable: Memtable,
+    pub(crate) catalog: Catalog,
+    pub(crate) retired: BTreeSet<String>,
+    pub(crate) leases: BTreeMap<String, u64>,
+    pub(crate) collectible: BTreeSet<String>,
+    pub(crate) epoch: u64,
 }
 
 /// One pin of the Parquet files visible in a snapshot.
@@ -282,9 +302,9 @@ impl PinnedSnapshot {
 
 /// Memtable plus the durable catalog for one tenant.
 pub struct Store {
-    root: PathBuf,
-    tenant: String,
-    state: Arc<Mutex<State>>,
+    pub(crate) root: PathBuf,
+    pub(crate) tenant: String,
+    pub(crate) state: Arc<Mutex<State>>,
 }
 
 impl Store {
@@ -309,10 +329,8 @@ impl Store {
         Ok(Self {
             root,
             tenant,
-            state: Arc::new(Mutex::new(State {
-                memtable,
-                catalog: recovered.catalog,
-                retired: recovered
+            state: Arc::new(Mutex::new({
+                let retired = recovered
                     .retirements
                     .iter()
                     .flat_map(|retirement| {
@@ -321,10 +339,15 @@ impl Store {
                             .iter()
                             .map(|file| file.relative_path.clone())
                     })
-                    .collect(),
-                leases: BTreeMap::new(),
-                collectible: BTreeSet::new(),
-                epoch: 0,
+                    .collect::<BTreeSet<_>>();
+                State {
+                    memtable,
+                    catalog: recovered.catalog,
+                    collectible: retired.clone(),
+                    retired,
+                    leases: BTreeMap::new(),
+                    epoch: 0,
+                }
             })),
         })
     }
@@ -545,7 +568,7 @@ impl Store {
         hours.into_values().collect()
     }
 
-    fn lock(&self) -> Result<MutexGuard<'_, State>, StoreError> {
+    pub(crate) fn lock(&self) -> Result<MutexGuard<'_, State>, StoreError> {
         self.state.lock().map_err(|_| StoreError::Poisoned)
     }
 
